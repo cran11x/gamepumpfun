@@ -8,7 +8,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import { WebSocket, WebSocketServer, type RawData } from 'ws';
 import { GAME_NAME } from '../shared/constants';
 import type { C2S, S2C } from '../shared/protocol';
-import { createApiRouter } from './api';
+import { clientKey, createApiRouter } from './api';
 import { parseC2S } from './game/validate';
 import { RoomManager, type Binding, type Conn } from './rooms';
 
@@ -28,6 +28,14 @@ const HEARTBEAT_TIMEOUT_MS = 30_000;
 const SNAPSHOT_SKIP_BUFFER = 256 * 1024;
 const TERMINATE_BUFFER = 4 * 1024 * 1024;
 const MAX_PAYLOAD = 4096;
+/**
+ * Concurrent sockets per client IP (IPv6 grouped by /64). A socket holds at most one seat, so this also
+ * bounds the rooms one IP can keep open. Override with MAX_SOCKETS_PER_IP (e.g. for load tests).
+ */
+const MAX_SOCKETS_PER_IP = (() => {
+  const n = Number(process.env.MAX_SOCKETS_PER_IP);
+  return Number.isInteger(n) && n > 0 ? n : 20;
+})();
 
 class SocketConn implements Conn {
   binding: Binding | null = null;
@@ -39,7 +47,10 @@ class SocketConn implements Conn {
   private windowDrops = 0;
   private badMessages = 0;
 
-  constructor(readonly ws: WebSocket) {}
+  constructor(
+    readonly ws: WebSocket,
+    readonly ip: string,
+  ) {}
 
   send(msg: S2C): void {
     const ws = this.ws;
@@ -84,6 +95,23 @@ function rawToString(data: RawData): string | null {
   if (Array.isArray(data)) return Buffer.concat(data).toString('utf8');
   if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8');
   return null;
+}
+
+/**
+ * Client key for an upgrade request, computed exactly like the HTTP API's: express's own `req.ip`
+ * (so TRUST_PROXY applies) through api.ts `clientKey`.
+ */
+function upgradeClientKey(app: express.Express, req: http.IncomingMessage): string {
+  try {
+    const view = Object.create(app.request) as Request;
+    Object.defineProperties(view, {
+      headers: { value: req.headers },
+      socket: { value: req.socket },
+    });
+    return clientKey(view);
+  } catch {
+    return req.socket.remoteAddress ?? 'unknown';
+  }
 }
 
 function main(): void {
@@ -136,9 +164,20 @@ function main(): void {
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_PAYLOAD });
   const conns = new Map<WebSocket, SocketConn>();
+  const socketsPerIp = new Map<string, number>();
 
-  wss.on('connection', (ws) => {
-    const conn = new SocketConn(ws);
+  wss.on('connection', (ws, req) => {
+    const ip = upgradeClientKey(app, req);
+    const open = socketsPerIp.get(ip) ?? 0;
+    if (open >= MAX_SOCKETS_PER_IP) {
+      ws.on('error', () => {});
+      ws.close(1008, 'too many connections');
+      // Don't wait the full closing handshake on a client that never answers it.
+      setTimeout(() => ws.terminate(), 2000).unref();
+      return;
+    }
+    socketsPerIp.set(ip, open + 1);
+    const conn = new SocketConn(ws, ip);
     conns.set(ws, conn);
     manager.connect(conn);
 
@@ -168,6 +207,9 @@ function main(): void {
 
     ws.on('close', () => {
       conns.delete(ws);
+      const left = (socketsPerIp.get(ip) ?? 1) - 1;
+      if (left > 0) socketsPerIp.set(ip, left);
+      else socketsPerIp.delete(ip);
       try {
         manager.disconnect(conn);
       } catch (err) {

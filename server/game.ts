@@ -8,12 +8,14 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import {
   BASE_SPEED,
+  BASE_VISION,
   CHAT_RATE_LIMIT_MS,
   DEFAULT_SETTINGS,
   DEFAULT_TICKER,
   DEV_DUMP_DURATION_MS,
   EJECTION_MS,
   EMERGENCY_RANGE,
+  FUD_VISION_MULT,
   GHOST_SPEED_MULT,
   KILL_RANGE,
   MAX_PLAYERS,
@@ -31,7 +33,7 @@ import {
   maxRuggersFor,
   type GameSettings,
 } from '../shared/constants';
-import { circleFree, dist } from '../shared/geometry';
+import { circleFree, dist, lineOfSight } from '../shared/geometry';
 import {
   EMERGENCY_BUTTON,
   SABOTAGE_STATIONS,
@@ -77,9 +79,13 @@ import { parseC2S } from './game/validate';
 
 /** Moves that arrive faster than this after the previous one are ignored. */
 const MOVE_MIN_INTERVAL_MS = 25;
-/** `dt` since the last accepted move is clamped to this range. */
-const MOVE_DT_MIN_MS = 50;
-const MOVE_DT_MAX_MS = 1000;
+/**
+ * Movement budget (a token bucket in px): it refills at `speed * MOVE_SPEED_TOLERANCE` per second,
+ * holds at most MOVE_BUDGET_WINDOW_MS worth of that plus MOVE_SLACK_PX, and every accepted move spends
+ * the distance it covers. Sustained speed is capped at 1.5x however often moves are sent, while a
+ * client that stalled for up to a second can still catch up in one message.
+ */
+const MOVE_BUDGET_WINDOW_MS = 1000;
 const MOVE_SPEED_TOLERANCE = 1.5;
 const MOVE_SLACK_PX = 24;
 /**
@@ -94,10 +100,32 @@ const SWEEP_STEP_PX = 4;
 const MOVING_TIMEOUT_MS = 300;
 /** Outside `playing`, snapshots go out on change and at least this often. */
 const IDLE_SNAPSHOT_MS = 500;
+/**
+ * Interest management while playing: a living viewer only receives another player within its vision
+ * radius plus this margin (covers position lag and the client's smoothed fog), and in line of sight.
+ */
+const INTEREST_MARGIN_PX = 120;
+/** FUD shrinks holders' interest radius only after this long, while the client's fog closes in. */
+const FUD_INTEREST_DELAY_MS = 500;
+/** Chat lines kept for a disconnected player and re-sent when they rejoin. */
+const MISSED_CHAT_MAX = 100;
 /** Color index used for system chat lines that are not about a specific player (Gold Bag). */
 const SYSTEM_COLOR = 8;
 const BOT_QUEUE_MAX = 256;
 const BOT_ERROR_LOG_LIMIT = 5;
+/** Gameplay messages; a DEV DUMP whose timer ran out ends the game before any of them is applied. */
+const GAMEPLAY_MESSAGES: ReadonlySet<C2S['t']> = new Set<C2S['t']>([
+  'move',
+  'taskOpen',
+  'taskClose',
+  'taskDone',
+  'kill',
+  'report',
+  'emergency',
+  'vent',
+  'sabotage',
+  'fix',
+]);
 
 // ---------- Injected collaborators (structural, so tests need none of the other server modules) ----------
 
@@ -196,6 +224,9 @@ export interface PlayerState {
   lastMoveAt: number;
   /** Server time of the last move message that passed the rate limit. */
   lastMoveMsgAt: number;
+  /** Movement budget in px (see MOVE_BUDGET_WINDOW_MS) and when it was last refilled. */
+  moveBudget: number;
+  budgetAt: number;
   teleportSeq: number;
   tasks: TaskAssignment[];
   activeStationId: string | null;
@@ -204,11 +235,14 @@ export interface PlayerState {
   ventId: string | null;
   emergencyLeft: number;
   lastChatAt: number;
+  /** Chat delivered while the socket was disconnected, re-sent on rejoin. */
+  missedChat: ChatMessage[];
   stats: PlayerStats;
 }
 
 interface ActiveSabotage {
   kind: SabotageKind;
+  startedAt: number;
   /** devDump only. */
   endsAt?: number;
   stations: string[];
@@ -254,10 +288,6 @@ function freshStats(): PlayerStats {
 
 function round1(v: number): number {
   return Math.round(v * 10) / 10;
-}
-
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
 }
 
 /** Timing-safe string comparison (hashing first equalizes lengths). */
@@ -432,7 +462,7 @@ export class Room {
     p.disconnectedAt = null;
     // The reloaded client starts from scratch: make it snap to the server position.
     p.teleportSeq++;
-    p.lastMoveAt = now;
+    this.resetMoveBudget(p, now);
     p.lastMoveMsgAt = -Infinity;
     if (!this.players.has(this.hostId)) this.migrateHost();
     this.dirty = true;
@@ -479,6 +509,8 @@ export class Room {
   }
 
   private dispatch(p: PlayerState, msg: C2S): void {
+    // A DEV DUMP timer that ran out since the last tick wins before any late action can count.
+    if (GAMEPLAY_MESSAGES.has(msg.t) && this.expireDevDump(this.now())) return;
     switch (msg.t) {
       case 'leave':
         this.removePlayer(p.id, 'left');
@@ -694,7 +726,7 @@ export class Room {
     const killDelay = afterMeeting ? this._settings.killCooldown * 1000 : POST_MEETING_COOLDOWN_MS;
     for (const p of this.players.values()) {
       p.killReadyAt = now + killDelay;
-      p.lastMoveAt = now;
+      this.resetMoveBudget(p, now);
       p.lastMoveMsgAt = -Infinity;
       p.moving = false;
     }
@@ -709,18 +741,22 @@ export class Room {
     const now = this.now();
     if (now - p.lastMoveMsgAt < MOVE_MIN_INTERVAL_MS) return;
     p.lastMoveMsgAt = now;
-    const dt = clamp(now - p.lastMoveAt, MOVE_DT_MIN_MS, MOVE_DT_MAX_MS) / 1000;
     const speed = BASE_SPEED * this._settings.playerSpeed * (p.alive ? 1 : GHOST_SPEED_MULT);
-    const maxDist = speed * dt * MOVE_SPEED_TOLERANCE + MOVE_SLACK_PX;
-    let ok = Math.hypot(x - p.x, y - p.y) <= maxDist;
+    const rate = (speed * MOVE_SPEED_TOLERANCE) / 1000; // px per ms
+    const cap = rate * MOVE_BUDGET_WINDOW_MS + MOVE_SLACK_PX;
+    p.moveBudget = Math.min(cap, p.moveBudget + rate * Math.max(0, now - p.budgetAt));
+    p.budgetAt = now;
+    const d = Math.hypot(x - p.x, y - p.y);
+    let ok = d <= p.moveBudget;
     if (ok) ok = p.alive ? circleFree(x, y) && segmentClear(p.x, p.y, x, y) : inWorld(x, y);
     if (!ok) {
-      // Keep the old position; the client snaps back when it sees teleportSeq change.
+      // Keep the old position (and the budget); the client snaps back when it sees teleportSeq change.
       p.teleportSeq++;
       p.moving = false;
       this.dirty = true;
       return;
     }
+    p.moveBudget -= d;
     p.x = x;
     p.y = y;
     p.facing = facing;
@@ -738,7 +774,14 @@ export class Room {
     p.y = y;
     p.moving = false;
     p.teleportSeq++;
+    this.resetMoveBudget(p, now);
+  }
+
+  /** After a teleport or a pause in play the client starts over from the server position. */
+  private resetMoveBudget(p: PlayerState, now: number): void {
     p.lastMoveAt = now;
+    p.moveBudget = MOVE_SLACK_PX;
+    p.budgetAt = now;
   }
 
   // ---------- Tasks ----------
@@ -934,7 +977,9 @@ export class Room {
         }
       }
     }
-    const view: EjectionView = { ejectedId: ejected ? ejected.id : null, tie: m?.tie ?? false, ruggersLeft: this.livingCount('rugger') };
+    const view: EjectionView = { ejectedId: ejected ? ejected.id : null, tie: m?.tie ?? false };
+    // Without confirmed blacklists the remaining count would give the ejected player's role away.
+    if (this._settings.confirmEjects) view.ruggersLeft = this.livingCount('rugger');
     if (ejected) {
       view.ejectedName = ejected.name;
       view.ejectedColor = ejected.color;
@@ -970,7 +1015,7 @@ export class Room {
     const now = this.now();
     if (now < this.sabotageReadyAt) return this.err(p, 'INVALID_ACTION', 'Sabotage is on cooldown');
     const stations = SABOTAGE_STATIONS.filter((s) => s.sabotage === kind).map((s) => s.id);
-    const sab: ActiveSabotage = { kind, stations, holds: new Map(stations.map((id) => [id, new Set<string>()])) };
+    const sab: ActiveSabotage = { kind, startedAt: now, stations, holds: new Map(stations.map((id) => [id, new Set<string>()])) };
     if (kind === 'devDump') sab.endsAt = now + DEV_DUMP_DURATION_MS;
     this.sabotage = sab;
     this.emit({ kind: 'sabotageStarted', sabotage: kind });
@@ -993,6 +1038,8 @@ export class Room {
       this.dropHolds(p.id);
       s.holds.get(stationId)?.add(p.id);
       this.dirty = true;
+      // Fixed the moment both BUY WALLs are held, so a hold made in time never loses to tick timing.
+      if (this.bothWallsHeld(s)) this.fixSabotage();
       return;
     }
     if (action !== 'done') return;
@@ -1016,10 +1063,16 @@ export class Room {
     for (const set of s.holds.values()) if (set.delete(playerId)) this.dirty = true;
   }
 
-  /** devDump upkeep, every tick in `playing`. */
+  /** devDump upkeep, every tick in `playing`. The timer is checked first: holds after endsAt are too late. */
   private updateSabotage(now: number): void {
     const s = this.sabotage;
     if (!s || s.kind !== 'devDump') return;
+    if (this.expireDevDump(now)) return;
+    if (this.bothWallsHeld(s)) this.fixSabotage();
+  }
+
+  /** Drop holders who left, died, disconnected or bridged; then true when every BUY WALL is held. */
+  private bothWallsHeld(s: ActiveSabotage): boolean {
     for (const [stationId, holders] of s.holds) {
       const station = sabotageStationById(stationId);
       for (const pid of [...holders]) {
@@ -1030,11 +1083,14 @@ export class Room {
         }
       }
     }
-    if (s.stations.length > 0 && s.stations.every((id) => (s.holds.get(id)?.size ?? 0) > 0)) {
-      this.fixSabotage();
-      return;
-    }
-    if (s.endsAt !== undefined && now >= s.endsAt) this.checkWin();
+    return s.stations.length > 0 && s.stations.every((id) => (s.holds.get(id)?.size ?? 0) > 0);
+  }
+
+  /** SPEC: if endsAt passes before the fix, ruggers win with reason devDump. Returns true when the game ended. */
+  private expireDevDump(now: number): boolean {
+    const s = this.sabotage;
+    if (this._phase !== 'playing' || !s || s.kind !== 'devDump' || s.endsAt === undefined || now < s.endsAt) return false;
+    return this.endGame('ruggers', 'devDump');
   }
 
   // ---------- Bridges (vents) ----------
@@ -1066,7 +1122,7 @@ export class Room {
     if (this._phase !== 'playing' || p.ventId === null) return;
     // The player stays at the vent position.
     p.ventId = null;
-    p.lastMoveAt = this.now();
+    this.resetMoveBudget(p, this.now());
     p.moving = false;
     this.dirty = true;
   }
@@ -1418,21 +1474,68 @@ export class Room {
     const viewerIsRugger = viewer.role === 'rugger';
     // Meeting cards show who is dead; outside meetings the living never receive ghosts.
     const includeDead = phase === 'meeting';
+    // While playing, the living only receive the players they could plausibly see (interest management),
+    // so a player out of view and a rugger inside a bridge look the same to a holder: simply absent.
+    const reach = phase === 'playing' && !seeAll ? this.visionRadius(viewer) + INTEREST_MARGIN_PX : -1;
     for (const p of this.players.values()) {
       const vented = p.ventId !== null;
       if (seeAll) {
         out.push(this.playerView(p, p.role === 'rugger', vented));
         continue;
       }
-      if (!p.alive && !includeDead) continue;
-      if (viewerIsRugger) {
-        out.push(this.playerView(p, p.role === 'rugger', vented));
+      const fellow = viewerIsRugger && p.role === 'rugger';
+      if (!p.alive) {
+        if (includeDead) out.push(this.meetingGhostView(p, fellow));
+        continue;
+      }
+      // Fellow ruggers always see each other, inside bridges too.
+      if (fellow) {
+        out.push(this.playerView(p, true, vented));
         continue;
       }
       if (vented) continue;
+      if (reach >= 0 && p.id !== viewer.id && !this.inInterest(viewer, p, reach)) continue;
       out.push(this.playerView(p, false, false));
     }
     return out;
+  }
+
+  /** Vision radius as the client draws it (SPEC: crewVision / ruggerVision; FUD shrinks holders'). */
+  private visionRadius(viewer: PlayerState): number {
+    const s = this._settings;
+    if (viewer.role === 'rugger') return BASE_VISION * s.ruggerVision;
+    const fud = this.sabotage;
+    const fudActive = fud?.kind === 'fud' && this.now() - fud.startedAt >= FUD_INTEREST_DELAY_MS;
+    return BASE_VISION * s.crewVision * (fudActive ? FUD_VISION_MULT : 1);
+  }
+
+  /**
+   * Within `reach` and in line of sight. Lenient so players don't pop at wall edges: the center or any
+   * of four points one player radius off it counts.
+   */
+  private inInterest(viewer: PlayerState, p: PlayerState, reach: number): boolean {
+    const dx = p.x - viewer.x;
+    const dy = p.y - viewer.y;
+    if (dx * dx + dy * dy > reach * reach) return false;
+    if (lineOfSight(viewer, p)) return true;
+    const r = PLAYER_RADIUS;
+    return (
+      lineOfSight(viewer, { x: p.x + r, y: p.y }) ||
+      lineOfSight(viewer, { x: p.x - r, y: p.y }) ||
+      lineOfSight(viewer, { x: p.x, y: p.y + r }) ||
+      lineOfSight(viewer, { x: p.x, y: p.y - r })
+    );
+  }
+
+  /** A ghost on a living viewer's meeting card: who and dead, never where the ghost is floating. */
+  private meetingGhostView(p: PlayerState, isRugger: boolean): PlayerView {
+    const v = this.playerView(p, isRugger, false);
+    const sp = SPAWN_POINTS[((p.slot % SPAWN_POINTS.length) + SPAWN_POINTS.length) % SPAWN_POINTS.length];
+    v.x = sp.x;
+    v.y = sp.y;
+    v.facing = 1;
+    v.moving = false;
+    return v;
   }
 
   private playerView(p: PlayerState, isRugger: boolean, inVent: boolean): PlayerView {
@@ -1536,8 +1639,20 @@ export class Room {
   private deliverChat(msg: ChatMessage, to: Iterable<PlayerState>): void {
     for (const p of to) {
       if (p.isBot) this.queueBot(p.id, { type: 'chat', msg: { ...msg } });
-      else this.safeSend(p.id, msg);
+      else if (p.connected) this.safeSend(p.id, msg);
+      else {
+        // Nobody is listening on that seat right now: keep the line for the rejoin.
+        p.missedChat.push(msg);
+        if (p.missedChat.length > MISSED_CHAT_MAX) p.missedChat.shift();
+      }
     }
+  }
+
+  /** Re-send the chat a player missed while disconnected (call after the rejoin welcome + snapshot). */
+  sendMissedChatTo(playerId: string): void {
+    const p = this.players.get(playerId);
+    if (!p || p.isBot || !p.connected) return;
+    for (const msg of p.missedChat.splice(0)) this.safeSend(p.id, msg);
   }
 
   private system(text: string, color: number = SYSTEM_COLOR): void {
@@ -1591,6 +1706,8 @@ export class Room {
       moving: false,
       lastMoveAt: now,
       lastMoveMsgAt: -Infinity,
+      moveBudget: MOVE_SLACK_PX,
+      budgetAt: now,
       teleportSeq: 0,
       tasks: [],
       activeStationId: null,
@@ -1599,6 +1716,7 @@ export class Room {
       ventId: null,
       emergencyLeft: this._settings.emergencyMeetings,
       lastChatAt: -Infinity,
+      missedChat: [],
       stats: freshStats(),
     };
   }

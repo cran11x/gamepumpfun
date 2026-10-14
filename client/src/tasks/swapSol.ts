@@ -21,6 +21,8 @@ const STEP = 0.01;
 const TOLERANCE = 0.05;
 const REPEAT_DELAY_MS = 380;
 const REPEAT_EVERY_MS = 70;
+/** A click this soon after a touch/pen swap is the same tap; ignore it. */
+const CLICK_DEDUPE_MS = 600;
 
 const round2 = (v: number): number => Math.round(v * 100) / 100;
 
@@ -181,7 +183,7 @@ export const swapSol: MinigameDef = {
       });
     }
 
-    scope.on(go, 'click', () => {
+    const trySwap = (): void => {
       if (ctx.won) return;
       if (inRange()) {
         ctx.win('SWAPPED');
@@ -197,6 +199,31 @@ export const swapSol: MinigameDef = {
           card,
         );
       restartClass(amt, 'is-bad');
+    };
+
+    // Touch/pen taps fire on pointerup: right after a quick slider drag, Chromium can treat the
+    // drag as a fling and swallow the next tap's click, and a second-finger tap (thumb still on
+    // the slider) gets no click at all. Mouse and keyboard keep using click; a click right after
+    // a pointer-fired swap is the same tap and is ignored.
+    let goPid: number | null = null;
+    let goFiredAt = -Infinity;
+    scope.on<PointerEvent>(go, 'pointerdown', (e) => {
+      if (e.pointerType !== 'mouse') goPid = e.pointerId;
+    });
+    scope.on<PointerEvent>(go, 'pointerup', (e) => {
+      if (e.pointerId !== goPid) return;
+      goPid = null;
+      const r = go.getBoundingClientRect();
+      if (e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom) return;
+      goFiredAt = performance.now();
+      trySwap();
+    });
+    scope.on<PointerEvent>(go, 'pointercancel', (e) => {
+      if (e.pointerId === goPid) goPid = null;
+    });
+    scope.on(go, 'click', () => {
+      if (performance.now() - goFiredAt < CLICK_DEDUPE_MS) return;
+      trySwap();
     });
 
     render();

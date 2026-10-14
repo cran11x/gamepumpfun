@@ -13,7 +13,7 @@ import { createHud, type Hud } from './hud';
 import { createLobby } from './lobby';
 import { createRoleReveal } from './roleReveal';
 import { copyText, detectTouch, h, icon, isTextInput } from './dom';
-import { showRuggedCutscene } from './cutscene';
+import { dismissRuggedCutscene, showRuggedCutscene } from './cutscene';
 import { createFullMap } from './fullMap';
 import { createMinigameHost } from './minigame';
 import { createModalLayer, openHowTo, openLeaderboard, openManualCopy, openRename } from './modals';
@@ -299,6 +299,8 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
         sound(won ? 'win' : 'lose');
       }
     }
+    // The victim's cutscene belongs to the round; never let it cover a meeting or the game-over screen.
+    if (to !== 'playing') dismissRuggedCutscene(cutLayer);
     if (!snap) minigame.onSnapshot(null);
     route();
   });
@@ -322,7 +324,8 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
           const victimColor = snap?.players.find((p) => p.id === me)?.color ?? roster.get(ev.victimId)?.color ?? 0;
           minigame.onSnapshot(snap);
           if (minigame.isOpen()) minigame.close();
-          showRuggedCutscene(cutLayer, killer, victimColor);
+          // A game-ending (or meeting-interrupted) kill: the round is already over, so skip "finish your tasks".
+          if (snap?.phase === 'playing') showRuggedCutscene(cutLayer, killer, victimColor);
           sound('kill');
         } else if (ev.killerId === me) {
           sound('kill');

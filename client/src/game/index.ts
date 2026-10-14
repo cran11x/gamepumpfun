@@ -5,7 +5,6 @@
 import {
   BASE_SPEED,
   BASE_VISION,
-  CLIENT_SEND_HZ,
   FUD_VISION_MULT,
   GHOST_SPEED_MULT,
   INTERP_DELAY_MS,
@@ -15,21 +14,26 @@ import {
 import { moveWithCollision, type Vec } from '../../../shared/geometry';
 import { SABOTAGE_STATIONS, stationById, ventById, VENTS, WORLD_H, WORLD_W, type Vent } from '../../../shared/map';
 import type { GameEvent, MeView, PlayerView, SabotageKind, Snapshot } from '../../../shared/protocol';
-import type { AppContext, AudioApi, GameApi, Interactions, SoundName, UiApi } from '../context';
+import type { AppContext, AudioApi, GameApi, Interactions, MinigameTarget, SoundName, UiApi } from '../context';
 import { Renderer, type RenderPlayer, type WorldView } from '../render/index';
 import { COLORS } from '../render/palette';
 import { hashString } from '../render/util';
+import { vanishedInView } from './bridgeSight';
 import { Input, type InputVector } from './input';
 import { computeInteractions, NO_INTERACTIONS } from './interactions';
-import { RemoteInterpolator } from './interp';
+import { InterpClock, RemoteInterpolator } from './interp';
+import { MoveSync } from './moveSync';
 
 /** Fixed simulation step (seconds). */
 const SIM_DT = 1 / 60;
 /** Never simulate more than this many steps per frame (tab was hidden, long GC, ...). */
 const MAX_SIM_STEPS = 8;
-const SEND_INTERVAL_MS = 1000 / CLIENT_SEND_HZ;
 /** After asking to enter a bridge, freeze movement until the server confirms (or this passes). */
 const VENT_PENDING_MS = 700;
+/** Phases whose DOM screen covers the canvas completely: the world isn't drawn under them... */
+const COVERED_PHASES: ReadonlySet<string> = new Set(['meeting', 'ejection', 'gameOver']);
+/** ...once their fade-in (0.28 s screen-in animation) is over. */
+const COVER_FADE_MS = 450;
 /** Tolerance for client/server clock skew when checking cooldowns locally. */
 const COOLDOWN_SLACK_MS = 150;
 const NO_COLORS: readonly number[] = [];
@@ -61,6 +65,7 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
   const renderer = new Renderer(canvas);
   const input = new Input();
   const remotes = new RemoteInterpolator();
+  const clock = new InterpClock();
 
   // ctx.ui (and in principle ctx.audio) are attached after createGame returns: read lazily.
   const ui = (): UiApi | undefined => (ctx as Partial<AppContext>).ui;
@@ -95,11 +100,17 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
   let snapCamera = true;
   let blocked = false;
   let acc = 0;
-  let lastSendAt = -Infinity;
-  let sentMoving = false;
+  const moves = new MoveSync();
+  /** Actions waiting for a position flush (see syncThen). */
+  let flushTimer: number | null = null;
+  const flushQueue: Array<() => void> = [];
+  /** When the current covered phase (COVERED_PHASES) began, or -1. */
+  let coveredSince = -1;
   let ventPendingUntil = 0;
   let interactions: Interactions = NO_INTERACTIONS;
   let prevSnap: Snapshot | null = null;
+  /** The snapshot before prevSnap (bridge detection extrapolates where a vanished player was heading). */
+  let prevPrevSnap: Snapshot | null = null;
   let backdropSnap: Snapshot | null = null;
   let backdropColors: readonly number[] = NO_COLORS;
   const guards = new Map<string, number>();
@@ -157,9 +168,15 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
     sim.x = prevX = self.x = x;
     sim.y = prevY = self.y = y;
     self.moving = false;
-    sentMoving = false;
+    moves.placed(x, y);
     acc = 0;
     snapCamera = true;
+  }
+
+  function cancelFlush(): void {
+    if (flushTimer !== null) window.clearTimeout(flushTimer);
+    flushTimer = null;
+    flushQueue.length = 0;
   }
 
   function resetLocal(): void {
@@ -168,11 +185,14 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
     teleportSeq = -1;
     selfId = null;
     self.moving = false;
-    sentMoving = false;
+    moves.idle();
+    cancelFlush();
     ventPendingUntil = 0;
     interactions = NO_INTERACTIONS;
     remotes.clear();
+    clock.reset();
     prevSnap = null;
+    prevPrevSnap = null;
   }
 
   /** Stop local movement right now (the stop is reported on the next send slot). */
@@ -186,10 +206,12 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
   // ---------- network: snapshots, phases, events ----------
 
   store.onSnapshot((snap) => {
+    clock.onSnapshot(snap.now, performance.now());
     const me = snap.me;
     if (!me || snap.phase === 'lobby') {
       resetLocal();
       prevSnap = snap;
+      prevPrevSnap = null;
       return;
     }
     if (!initialized || me.id !== selfId || me.teleportSeq !== teleportSeq) {
@@ -201,15 +223,27 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
     if (me.ventId) ventPendingUntil = 0;
     if (snap.phase !== 'playing') {
       self.moving = false;
-      sentMoving = false;
+      moves.idle();
       ventPendingUntil = 0;
     }
-    detectBridgeUse(prevSnap, snap, me);
+    // Our own bridge entry pops once the server confirms it (a rejected request shows nothing).
+    if (me.ventId && snap.phase === 'playing' && prevSnap?.phase === 'playing' && prevSnap.me && !prevSnap.me.ventId) {
+      const v = ventById(me.ventId);
+      if (v) {
+        renderer.effects.hatch(v.x, v.y);
+        sound('vent');
+      }
+    }
+    detectBridgeUse(prevPrevSnap, prevSnap, snap, me);
+    prevPrevSnap = prevSnap;
     prevSnap = snap;
   });
 
   store.onPhase(({ from, to }) => {
-    if (from === null || to === 'roleReveal' || to === 'lobby') renderer.resetForNewGame();
+    if (from === null || to === 'roleReveal' || to === 'lobby') {
+      renderer.resetForNewGame();
+      clock.reset();
+    }
     if (to === 'meeting' && from !== null) renderer.effects.flash('#ffffff', 0.9, 0.8);
   });
 
@@ -219,6 +253,11 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
     } catch (err) {
       console.error('[game] event handling failed', err);
     }
+  });
+
+  // A refused bridge entry (too far, ...) must not keep us frozen for the rest of VENT_PENDING_MS.
+  store.onError(({ code }) => {
+    if (code === 'INVALID_ACTION' && ventPendingUntil > performance.now()) ventPendingUntil = 0;
   });
 
   /** Where a player is right now: the latest snapshot is closest to the server's truth. */
@@ -280,7 +319,7 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
   }
 
   /** Bridge hatch pops for other players entering/leaving bridges in plain sight. */
-  function detectBridgeUse(prev: Snapshot | null, snap: Snapshot, me: MeView): void {
+  function detectBridgeUse(prevPrev: Snapshot | null, prev: Snapshot | null, snap: Snapshot, me: MeView): void {
     if (!prev || prev.phase !== 'playing' || snap.phase !== 'playing') return;
     const popped = new Set<string>();
     const pop = (v: Vent | null) => {
@@ -289,11 +328,16 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
       renderer.effects.hatch(v.x, v.y);
       sound('vent');
     };
+    // Ruggers get fellow ruggers' `inVent` and ghosts see everyone: for them a player who appears or
+    // vanishes never used a bridge. Living holders have to infer it.
+    const inferVents = me.alive && me.role !== 'rugger';
+    const seen = (x: number, y: number) => renderer.canSee(x, y);
     // Came out of a bridge: now visible and outside, previously absent or inside.
     for (const p of snap.players) {
       if (p.id === me.id || p.inVent || !p.alive) continue;
       const q = findPlayer(prev.players, p.id);
       if (q && !q.inVent) continue;
+      if (!q && !inferVents) continue;
       pop(ventNear(p.x, p.y, 6));
     }
     // Went into a bridge: was outside, now inside or gone (and not because they got rugged).
@@ -302,7 +346,13 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
       const p = findPlayer(snap.players, q.id);
       if (p && !p.inVent) continue;
       if (p && !p.alive) continue;
-      if (!p && snap.bodies.some((b) => b.id === q.id)) continue;
+      if (!p) {
+        if (!inferVents || snap.bodies.some((b) => b.id === q.id)) continue;
+        // Interest management also drops players who leave our line of sight or reach: only a vanish in
+        // plain view (where they were and where they were heading) is a bridge.
+        const before = prevPrev?.phase === 'playing' ? findPlayer(prevPrev.players, q.id) : undefined;
+        if (!vanishedInView(seen, q, before ?? null)) continue;
+      }
       pop(p ? ventNear(p.x, p.y, 6) : ventNear(q.x, q.y, VENT_RANGE + 10));
     }
   }
@@ -313,7 +363,8 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
     prevX = sim.x;
     prevY = sim.y;
     let moved = 0;
-    const canMove = snap.phase === 'playing' && !blocked && !inVent && net.connected;
+    // Hold still while an action waits for its position flush: the server checks where we pressed.
+    const canMove = snap.phase === 'playing' && !blocked && !inVent && net.connected && flushTimer === null;
     if (canMove) {
       input.read(vec);
       if (vec.mag > 0) {
@@ -345,19 +396,56 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
 
   function maybeSendMove(now: number, snap: Snapshot, inVent: boolean): void {
     if (snap.phase !== 'playing') {
-      sentMoving = false;
+      moves.idle();
       return;
     }
     if (inVent || !net.connected) return;
-    if (now - lastSendAt < SEND_INTERVAL_MS) return;
-    if (self.moving && !blocked) sendMove(now, true);
-    else if (sentMoving) sendMove(now, false); // movement stopped: report it once
+    const moving = moves.due(now, self.moving && !blocked);
+    if (moving !== null) sendMove(now, moving);
   }
 
   function sendMove(now: number, moving: boolean): void {
     net.send({ t: 'move', x: sim.x, y: sim.y, facing: self.facing, moving });
-    lastSendAt = now;
-    sentMoving = moving;
+    moves.sent(now, sim.x, sim.y, moving);
+  }
+
+  /**
+   * Run `send` (an action the server range-checks against our last accepted move) right after
+   * reporting where we are now. Moves only go out at CLIENT_SEND_HZ, so otherwise the server
+   * would judge a position up to 50 ms old and refuse presses made on arrival. The flush keeps
+   * FLUSH_GAP_MS after the previous move, so the action can wait up to that long (movement is
+   * held meanwhile). Queued actions are dropped if we leave play or lose the connection first.
+   */
+  function syncThen(send: () => void): void {
+    if (flushTimer !== null) {
+      flushQueue.push(send);
+      return;
+    }
+    const wait = store.snap?.me?.ventId || !net.connected ? null : moves.flushDelay(performance.now(), sim.x, sim.y);
+    if (wait === null) {
+      send();
+      return;
+    }
+    if (wait <= 0) {
+      sendMove(performance.now(), self.moving && !blocked);
+      send();
+      return;
+    }
+    flushQueue.push(send);
+    flushTimer = window.setTimeout(() => {
+      flushTimer = null;
+      const queued = flushQueue.splice(0);
+      const c = current();
+      if (!c) return;
+      if (!c.me.ventId) sendMove(performance.now(), self.moving && !blocked);
+      for (const f of queued) {
+        try {
+          f();
+        } catch (err) {
+          console.error('[game] action failed', err);
+        }
+      }
+    }, wait);
   }
 
   // ---------- frame ----------
@@ -430,8 +518,19 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
     self.y = prevY + (sim.y - prevY) * alpha;
 
     maybeSendMove(now, snap, inVent);
-    remotes.update(store.history, serverTime() - INTERP_DELAY_MS, me.id, dt);
+    const renderTime = clock.ready ? clock.renderTime(now, INTERP_DELAY_MS) : serverTime() - INTERP_DELAY_MS;
+    remotes.update(store.history, renderTime, me.id, dt);
     interactions = computeInteractions(snap, me, sim, inVent, interactions);
+
+    // Meeting / ejection / game over screens are opaque: after their fade-in, draw one last
+    // frame (only again if the canvas gets resized) and just keep the renderer's clock moving.
+    const covered = COVERED_PHASES.has(snap.phase);
+    if (!covered) coveredSince = -1;
+    else if (coveredSince < 0) coveredSince = now;
+    if (covered && now - coveredSince > COVER_FADE_MS && !renderer.canvasStale) {
+      renderer.skipFrame(dt);
+      return;
+    }
     renderer.renderWorld(buildView(snap, me), dt, time);
     snapCamera = false;
   }
@@ -480,14 +579,18 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
         const host = ui();
         if (!host || host.isMinigameOpen()) return;
         stopNow();
-        host.openMinigame(
-          u.type === 'task' ? { type: 'task', stationId: u.stationId, kind: u.kind } : { type: 'fix', stationId: u.stationId, kind: u.kind },
-        );
+        const target: MinigameTarget =
+          u.type === 'task' ? { type: 'task', stationId: u.stationId, kind: u.kind } : { type: 'fix', stationId: u.stationId, kind: u.kind };
+        // The overlay sends taskOpen as it opens.
+        syncThen(() => {
+          const h = ui();
+          if (h && !h.isMinigameOpen()) h.openMinigame(target);
+        });
       } else if (u.type === 'emergency') {
         if (!c.me.alive || c.me.emergencyLeft <= 0 || c.snap.sabotage?.kind === 'devDump') return;
         if (!guard('emergency', 1500)) return;
         stopNow();
-        net.send({ t: 'emergency' });
+        syncThen(() => net.send({ t: 'emergency' }));
       } else if (u.type === 'vent') {
         api.ventToggle();
       }
@@ -503,7 +606,7 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
         return;
       }
       if (!guard('kill', 400)) return;
-      net.send({ t: 'kill', targetId });
+      syncThen(() => net.send({ t: 'kill', targetId }));
     },
 
     report(): void {
@@ -513,7 +616,7 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
       if (!bodyId) return;
       if (!guard('report', 1500)) return;
       stopNow();
-      net.send({ t: 'report', bodyId });
+      syncThen(() => net.send({ t: 'report', bodyId }));
     },
 
     ventToggle(): void {
@@ -534,10 +637,9 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
       const host = ui();
       if (host?.isMinigameOpen()) host.closeMinigame();
       stopNow();
-      net.send({ t: 'vent', action: 'enter', ventId });
+      // Frozen from here; the hatch pops when the server confirms (see onSnapshot).
       ventPendingUntil = performance.now() + VENT_PENDING_MS;
-      renderer.effects.hatch(vent.x, vent.y);
-      sound('vent');
+      syncThen(() => net.send({ t: 'vent', action: 'enter', ventId }));
     },
 
     ventMove(ventId: string): void {

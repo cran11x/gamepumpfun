@@ -143,7 +143,8 @@ export interface EjectionView {
   /** Undefined when settings.confirmEjects is false. */
   wasRugger?: boolean;
   tie: boolean;
-  ruggersLeft: number;
+  /** Living ruggers after the ejection. Undefined when settings.confirmEjects is false (it would reveal the role). */
+  ruggersLeft?: number;
 }
 
 export interface GameOverView {
@@ -162,7 +163,11 @@ export interface Snapshot {
   /** Absolute server time when the current timed phase/stage ends. */
   phaseEndsAt?: number;
   room: RoomView;
-  /** Players visible to you. Living players don't receive ghosts; non-ruggers don't receive vented ruggers. */
+  /**
+   * Players visible to you. Living players don't receive ghosts; non-ruggers don't receive vented ruggers.
+   * While playing, a living viewer only receives players near its vision radius and in line of sight
+   * (fellow ruggers always), so an absent player may simply be out of view.
+   */
   players: PlayerView[];
   bodies: BodyView[];
   /** Bonding curve 0..1 = completed holder tasks / total holder tasks. Hidden (-1) during rpcDown for holders. */

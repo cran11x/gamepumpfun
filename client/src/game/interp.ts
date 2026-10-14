@@ -9,6 +9,67 @@ import type { TimedSnapshot } from '../store';
 /** Moves bigger than this between two snapshots are teleports (meeting, bridges): no lerp. */
 const TELEPORT_PX = 150;
 
+/** A snapshot whose arrival offset jumps by more than this (reconnect, clock change) restarts the clock. */
+const CLOCK_RESYNC_MS = 1000;
+/** The smoothed render time jumps instead of easing when it is this far from its target. */
+const CLOCK_SNAP_MS = 250;
+/** While easing toward its target, the render clock runs at most this much faster or slower than real time. */
+const CLOCK_MAX_SKEW = 0.1;
+/** Error (ms) at which the full skew applies; smaller errors ease proportionally. */
+const CLOCK_SKEW_SPAN_MS = 250;
+
+/**
+ * The timeline remote players are rendered on, anchored to snapshot ARRIVAL rather than to the
+ * latency-compensated server clock. The newest snapshot is always one-way-latency old, so
+ * `serverNow - INTERP_DELAY_MS` runs past it once latency reaches ~50 ms and remotes step at 20 Hz.
+ *
+ * `offset` tracks (snap.now - local time) of the latest-arriving snapshots: a late packet pulls it
+ * down quickly, early ones let it drift back slowly, so jitter only ever pushes rendering later.
+ * The render time then advances with local time, sped up or slowed down by at most CLOCK_MAX_SKEW
+ * to follow its target, so it never runs backwards (short of a CLOCK_SNAP_MS resync).
+ */
+export class InterpClock {
+  private offset = NaN;
+  private rt = NaN;
+  private at = NaN;
+
+  reset(): void {
+    this.offset = NaN;
+    this.rt = NaN;
+    this.at = NaN;
+  }
+
+  /** At least one snapshot has been seen since the last reset. */
+  get ready(): boolean {
+    return Number.isFinite(this.offset);
+  }
+
+  /** Feed every snapshot on arrival: its server time and the local clock (ms) at receipt. */
+  onSnapshot(serverNow: number, localNow: number): void {
+    const off = serverNow - localNow;
+    if (!Number.isFinite(off)) return;
+    if (!this.ready || Math.abs(off - this.offset) > CLOCK_RESYNC_MS) this.offset = off;
+    else if (off < this.offset) this.offset += (off - this.offset) * 0.5;
+    else this.offset += (off - this.offset) * 0.03;
+  }
+
+  /** Server time to render remote players at for local time `localNow` (call once per frame). */
+  renderTime(localNow: number, delayMs: number): number {
+    const target = localNow + this.offset - delayMs;
+    const dt = localNow - this.at;
+    if (!Number.isFinite(this.rt) || !(dt >= 0) || Math.abs(target - this.rt) > CLOCK_SNAP_MS) {
+      this.rt = target;
+    } else {
+      // Error left after advancing at real speed.
+      const err = target - (this.rt + dt);
+      const skew = Math.max(-CLOCK_MAX_SKEW, Math.min(CLOCK_MAX_SKEW, err / CLOCK_SKEW_SPAN_MS));
+      this.rt += dt * (1 + skew);
+    }
+    this.at = localNow;
+    return this.rt;
+  }
+}
+
 interface Remote extends RenderPlayer {
   stamp: number;
 }

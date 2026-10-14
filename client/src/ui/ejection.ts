@@ -16,8 +16,8 @@ export function ejectionText(snap: Snapshot): { main: string; sub: string; tie: 
     main = 'No one was blacklisted.';
   }
   const n = e.ruggersLeft;
-  // Without confirmed blacklists the remaining count would leak the role, so only show it when confirmed.
-  const sub = snap.room.settings.confirmEjects ? `${n} ${plural(n, 'Rugger')} ${n === 1 ? 'remains' : 'remain'}.` : '';
+  // The server only sends the remaining count when blacklists are confirmed (it would otherwise leak the role).
+  const sub = n !== undefined ? `${n} ${plural(n, 'Rugger')} ${n === 1 ? 'remains' : 'remain'}.` : '';
   return { main, sub, tie: e.tie };
 }
 

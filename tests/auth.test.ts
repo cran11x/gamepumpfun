@@ -12,7 +12,7 @@ import { shortAddress } from '../shared/protocol';
 import { createWallet } from '../client/src/wallet';
 import { createApiRouter } from '../server/api';
 import { AuthError, NONCE_TTL_MS, createAuth, issueNonce, resolveAuthToken, revokeToken, verifyLogin, type Auth } from '../server/auth';
-import { getPublicConfig } from '../server/config';
+import { getLoginOrigins, getPublicConfig } from '../server/config';
 import { SESSION_TTL_MS, flushStore, recordGameResults, resetStore } from '../server/store';
 
 const ORIGINAL_DATA_DIR = process.env.DATA_DIR;
@@ -64,18 +64,44 @@ describe('auth: nonce + signature login', () => {
     auth = createAuth({ now: () => clock });
   });
 
-  it('issues the exact login message for the wallet', () => {
+  it('issues the exact login message for the wallet, bound to the site', () => {
     const w = newWallet();
-    const { nonce, message } = auth.issueNonce(w.address);
+    const site = { domain: 'amongrugs.fun', uri: 'https://amongrugs.fun' };
+    const { nonce, message } = auth.issueNonce(w.address, { site });
     expect(nonce).toMatch(/^[0-9a-f]{32}$/);
     expect(message).toBe(
-      'AMONG RUGS login\n\n' +
-        'Sign this message to prove you own this wallet. This is NOT a transaction and costs nothing.\n\n' +
-        `Wallet: ${w.address}\n` +
+      'amongrugs.fun wants you to sign in with your Solana account:\n' +
+        `${w.address}\n\n` +
+        'Sign in to AMONG RUGS to prove you own this wallet. This is NOT a transaction and costs nothing.\n\n' +
+        'URI: https://amongrugs.fun\n' +
+        'Version: 1\n' +
         `Nonce: ${nonce}\n` +
-        'Issued: 2026-10-14T12:00:00.000Z',
+        'Issued At: 2026-10-14T12:00:00.000Z\n' +
+        'Expiration Time: 2026-10-14T12:05:00.000Z',
     );
-    expect(auth.issueNonce(w.address).nonce).not.toBe(nonce);
+    expect(auth.issueNonce(w.address, { site }).nonce).not.toBe(nonce);
+    // Without a site (direct callers / tests) it is bound to localhost.
+    const local = auth.issueNonce(w.address).message.split('\n');
+    expect(local[0]).toBe('localhost wants you to sign in with your Solana account:');
+    expect(local).toContain('URI: http://localhost');
+    // The signature is checked against the stored, site-bound message.
+    const sig = w.sign(message.replace('amongrugs.fun wants', 'phish.example wants'));
+    expect(authError(() => auth.verifyLogin(w.address, nonce, sig)).code).toBe('SIGNATURE_INVALID');
+  });
+
+  it('rejects a site that is not a plain host and matching origin', () => {
+    const w = newWallet();
+    const bad = [
+      { domain: 'amongrugs.fun\nURI: https://evil.example', uri: 'https://amongrugs.fun' },
+      { domain: 'amongrugs.fun', uri: 'https://evil.example' },
+      { domain: 'amongrugs.fun', uri: 'https://amongrugs.fun/path' },
+      { domain: 'amongrugs.fun', uri: 'javascript://amongrugs.fun' },
+      { domain: 'user@amongrugs.fun', uri: 'https://amongrugs.fun' },
+      { domain: '', uri: '' },
+    ];
+    for (const site of bad) expect(authError(() => auth.issueNonce(w.address, { site })).code).toBe('BAD_REQUEST');
+    expect(auth.issueNonce(w.address, { site: { domain: 'localhost:5173', uri: 'http://localhost:5173' } }).nonce).toBeTruthy();
+    expect(auth.issueNonce(w.address, { site: { domain: '[::1]:8787', uri: 'http://[::1]:8787' } }).nonce).toBeTruthy();
   });
 
   it('verifies a valid signature, creates the profile and a session token', () => {
@@ -185,6 +211,20 @@ describe('auth: nonce + signature login', () => {
     expect(auth.verifyLogin(w.address, many[6].nonce, w.sign(many[6].message)).token).toBeTruthy();
   });
 
+  it("another requester can't evict a wallet's pending login", () => {
+    const victim = newWallet();
+    const mine = auth.issueNonce(victim.address, { requester: 'A' });
+    // Someone who only knows the public address asks for many nonces for it.
+    for (let i = 0; i < 12; i++) auth.issueNonce(victim.address, { requester: 'B' });
+    expect(auth.pendingNonces()).toBe(1 + 5); // B's own nonces are still capped per wallet
+    expect(auth.verifyLogin(victim.address, mine.nonce, victim.sign(mine.message)).profile.address).toBe(victim.address);
+
+    // The same requester is still capped at 5 per wallet (oldest evicted).
+    const own = Array.from({ length: 6 }, () => auth.issueNonce(victim.address, { requester: 'A' }));
+    expect(authError(() => auth.verifyLogin(victim.address, own[0].nonce, victim.sign(own[0].message))).code).toBe('NONCE_INVALID');
+    expect(auth.verifyLogin(victim.address, own[5].nonce, victim.sign(own[5].message)).token).toBeTruthy();
+  });
+
   it('resolveAuthToken handles missing, garbage, revoked and expired tokens', () => {
     const w = newWallet();
     const { nonce, message } = auth.issueNonce(w.address);
@@ -250,6 +290,24 @@ describe('config', () => {
     warn.mockRestore();
   });
 
+  it('parses PUBLIC_ORIGIN into normalized http(s) origins', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(getLoginOrigins({})).toEqual([]);
+    expect(getLoginOrigins({ PUBLIC_ORIGIN: '  ' })).toEqual([]);
+    expect(getLoginOrigins({ PUBLIC_ORIGIN: 'https://AmongRugs.fun/' })).toEqual(['https://amongrugs.fun']);
+    const list = [
+      'https://amongrugs.fun',
+      'ftp://x.example',
+      'nope',
+      'https://u:p@a.example',
+      'http://localhost:8787',
+      'https://amongrugs.fun/play',
+    ];
+    expect(getLoginOrigins({ PUBLIC_ORIGIN: list.join(', ') })).toEqual(['https://amongrugs.fun', 'http://localhost:8787']);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
   it('returns fresh objects', () => {
     const a = getPublicConfig({ LINK_X: 'https://x.com/a' });
     a.links.x = 'https://evil.example/';
@@ -258,8 +316,12 @@ describe('config', () => {
 });
 
 /** An express app with the API router mounted exactly like server/index.ts does (outer JSON parser first). */
-async function startApi(rooms = { publicLobbies: 2, playersOnline: 7 }): Promise<{ base: string; close(): Promise<void> }> {
+async function startApi(
+  rooms = { publicLobbies: 2, playersOnline: 7 },
+  opts: { trustProxy?: boolean } = {},
+): Promise<{ base: string; close(): Promise<void> }> {
   const app = express();
+  if (opts.trustProxy) app.set('trust proxy', true);
   app.use('/api', express.json({ limit: '16kb' }), createApiRouter({ getRoomsInfo: () => rooms }));
   const server = http.createServer(app);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
@@ -267,6 +329,19 @@ async function startApi(rooms = { publicLobbies: 2, playersOnline: 7 }): Promise
     base: `http://127.0.0.1:${(server.address() as AddressInfo).port}/api`,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
+}
+
+/** GET with arbitrary headers (fetch can't set Host). */
+function rawGet(url: string, headers: Record<string, string>): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const r = http.get(url, { headers }, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (c: string) => (body += c));
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, body }));
+    });
+    r.on('error', reject);
+  });
 }
 
 describe('HTTP API', () => {
@@ -349,6 +424,68 @@ describe('HTTP API', () => {
     expect(noAuth.headers.get('www-authenticate')).toBe('Bearer');
   });
 
+  it('binds the login message to the Host header, or to PUBLIC_ORIGIN when set', async () => {
+    const w = newWallet();
+    const host = new URL(base).host;
+    const lines = async (headers: Record<string, string> = {}) => {
+      const r = await rawGet(`${base}/auth/nonce?address=${w.address}`, headers);
+      expect(r.status).toBe(200);
+      return (JSON.parse(r.body) as { message: string }).message.split('\n');
+    };
+    const plain = await lines();
+    expect(plain[0]).toBe(`${host} wants you to sign in with your Solana account:`);
+    expect(plain[1]).toBe(w.address);
+    expect(plain).toContain(`URI: http://${host}`);
+    expect(plain.join('\n')).toContain('This is NOT a transaction');
+    expect(await lines({ 'X-Forwarded-Proto': 'https' })).toContain(`URI: https://${host}`);
+    expect((await rawGet(`${base}/auth/nonce?address=${w.address}`, { Host: 'bad host/x' })).status).toBe(400);
+
+    const saved = process.env.PUBLIC_ORIGIN;
+    try {
+      process.env.PUBLIC_ORIGIN = 'https://amongrugs.fun, https://www.amongrugs.fun';
+      // A spoofed Host can't move the binding off the configured origins.
+      const spoofed = await lines({ Host: 'phish.example' });
+      expect(spoofed[0]).toBe('amongrugs.fun wants you to sign in with your Solana account:');
+      expect(spoofed).toContain('URI: https://amongrugs.fun');
+      const www = await lines({ Host: 'www.amongrugs.fun' });
+      expect(www[0]).toBe('www.amongrugs.fun wants you to sign in with your Solana account:');
+      expect(www).toContain('URI: https://www.amongrugs.fun');
+      // The signed, site-bound message still verifies.
+      const { nonce, message } = JSON.parse((await rawGet(`${base}/auth/nonce?address=${w.address}`, {})).body) as {
+        nonce: string;
+        message: string;
+      };
+      expect(message.startsWith('amongrugs.fun wants you')).toBe(true);
+      const v = await post('/auth/verify', { address: w.address, nonce, signature: w.sign(message) });
+      expect(v.status).toBe(200);
+    } finally {
+      if (saved === undefined) delete process.env.PUBLIC_ORIGIN;
+      else process.env.PUBLIC_ORIGIN = saved;
+    }
+  });
+
+  it("nonces requested from another IP don't evict a wallet's pending login", async () => {
+    const api = await startApi(undefined, { trustProxy: true });
+    try {
+      const w = newWallet();
+      const nonceFrom = async (ip: string) =>
+        JSON.parse((await rawGet(`${api.base}/auth/nonce?address=${w.address}`, { 'X-Forwarded-For': ip })).body) as {
+          nonce: string;
+          message: string;
+        };
+      const mine = await nonceFrom('203.0.113.7');
+      for (let i = 0; i < 8; i++) await nonceFrom('198.51.100.9');
+      const v = await fetch(`${api.base}/auth/verify`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '203.0.113.7' },
+        body: JSON.stringify({ address: w.address, nonce: mine.nonce, signature: w.sign(mine.message) }),
+      });
+      expect(v.status).toBe(200);
+    } finally {
+      await api.close();
+    }
+  });
+
   it('GET /leaderboard validates sort and limit', async () => {
     const w = newWallet();
     await login(w);
@@ -397,7 +534,12 @@ describe('client wallet (mock Phantom)', () => {
   };
   let apiBase: string;
   let close: () => Promise<void>;
-  let win: { location: { href: string; origin: string }; addEventListener(): void; phantom?: unknown; solana?: unknown };
+  let win: {
+    location: { href: string; origin: string; host: string };
+    addEventListener(): void;
+    phantom?: unknown;
+    solana?: unknown;
+  };
 
   type SignMode = 'object' | 'raw';
   function mockPhantom(opts: { mode?: SignMode; rejectConnect?: boolean } = {}) {
@@ -445,9 +587,16 @@ describe('client wallet (mock Phantom)', () => {
     await close();
   });
 
+  const savedOrigin = process.env.PUBLIC_ORIGIN;
+
   beforeEach(() => {
     storage.clear();
-    win = { location: { href: 'https://rugs.example/?room=ABCD', origin: 'https://rugs.example' }, addEventListener() {} };
+    // The mocked page is https://rugs.example; the test API runs elsewhere, so bind logins to the page.
+    process.env.PUBLIC_ORIGIN = 'https://rugs.example';
+    win = {
+      location: { href: 'https://rugs.example/?room=ABCD', origin: 'https://rugs.example', host: 'rugs.example' },
+      addEventListener() {},
+    };
     vi.stubGlobal('window', win);
     vi.stubGlobal('localStorage', memoryStorage);
     vi.stubGlobal('fetch', (input: string, init?: RequestInit) => realFetch(apiBase + String(input).replace(/^\/api/, ''), init));
@@ -455,6 +604,8 @@ describe('client wallet (mock Phantom)', () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    if (savedOrigin === undefined) delete process.env.PUBLIC_ORIGIN;
+    else process.env.PUBLIC_ORIGIN = savedOrigin;
   });
 
   it('logs in with connect + signMessage only, and stores the session', async () => {
@@ -468,7 +619,14 @@ describe('client wallet (mock Phantom)', () => {
 
     const session = await wallet.login();
     expect(phantom.calls).toEqual(['connect', 'signMessage:utf8']);
-    expect(phantom.signed[0]).toMatch(new RegExp(`^AMONG RUGS login\n\n.*\n\nWallet: ${phantom.address}\nNonce: [0-9a-f]{32}\nIssued: `, 's'));
+    expect(phantom.signed[0]).toMatch(
+      new RegExp(
+        `^rugs\\.example wants you to sign in with your Solana account:\n${phantom.address}\n\n` +
+          'Sign in to AMONG RUGS .*This is NOT a transaction.*\n\nURI: https://rugs\\.example\nVersion: 1\nNonce: [0-9a-f]{32}\n' +
+          'Issued At: .*\nExpiration Time: ',
+        's',
+      ),
+    );
     expect(session.profile.address).toBe(phantom.address);
     expect(session.token).toMatch(/^[0-9a-f]{64}$/);
     expect(wallet.getSession()).toEqual(session);
@@ -479,6 +637,16 @@ describe('client wallet (mock Phantom)', () => {
     // A new page load restores the session from storage.
     const reloaded = createWallet();
     expect(reloaded.getSession()?.token).toBe(session.token);
+  });
+
+  it("refuses to sign a login message bound to another site", async () => {
+    const phantom = mockPhantom();
+    win.phantom = { solana: phantom.provider };
+    process.env.PUBLIC_ORIGIN = 'https://phish.example';
+    const wallet = createWallet();
+    await expect(wallet.login()).rejects.toThrow(/unexpected sign-in message/i);
+    expect(phantom.calls).toEqual(['connect']);
+    expect(wallet.getSession()).toBeNull();
   });
 
   it('accepts a raw Uint8Array signature (legacy provider) via window.solana', async () => {

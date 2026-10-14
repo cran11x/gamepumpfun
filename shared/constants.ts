@@ -22,7 +22,8 @@ export const KILL_RANGE = 70;
 export const REPORT_RANGE = 90;
 export const USE_RANGE = 70;
 export const VENT_RANGE = 55;
-export const EMERGENCY_RANGE = 90;
+/** Reaches the SPACES button from every side of the Launchpad table (half-width 80 px + PLAYER_RADIUS, corners included). */
+export const EMERGENCY_RANGE = 115;
 
 export const SERVER_TICK_HZ = 20;
 export const CLIENT_SEND_HZ = 20;

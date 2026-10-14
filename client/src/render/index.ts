@@ -126,6 +126,15 @@ export class Renderer {
   private builtFontEpoch = 0;
   private fontTimer: number | null = null;
   private builtHadFonts = false;
+  /** A font arrived while rebuilding had to wait (see deferRescale). */
+  private fontRebuildPending = false;
+  /**
+   * Rebuilding the static layers takes a few hundred ms for the whole world, so it never runs
+   * while playing: it waits for a meeting, ejection, game over or the lobby backdrop.
+   */
+  private deferRescale = false;
+  /** The canvas was resized (and so cleared) since the last frame was drawn. */
+  private resized = true;
   /** Lowered if a big static layer ever fails to allocate. */
   private scaleCap = Infinity;
   private dumpVignette: CanvasGradient | null = null;
@@ -170,7 +179,9 @@ export class Renderer {
       if (this.fontTimer !== null) window.clearTimeout(this.fontTimer);
       this.fontTimer = window.setTimeout(() => {
         this.fontTimer = null;
-        if (this.builtFontEpoch !== this.fontEpoch && !this.builtHadFonts) this.rebuild(this.builtScale || this.wantScale);
+        if (this.builtFontEpoch === this.fontEpoch || this.builtHadFonts) return;
+        if (this.deferRescale) this.fontRebuildPending = true;
+        else this.rebuild(this.builtScale || this.wantScale);
       }, 200);
     };
     try {
@@ -224,6 +235,7 @@ export class Renderer {
     this.canvas.height = Math.round(h * dpr);
     this.canvas.style.width = `${w}px`;
     this.canvas.style.height = `${h}px`;
+    this.resized = true;
     this.fog.resize(w, h);
     this.dumpVignette = null;
     this.ghostVignette = null;
@@ -241,10 +253,15 @@ export class Renderer {
    * downscales: a smaller window (e.g. a mobile keyboard opening) would only cost a rebuild.
    */
   private maybeRescale(): void {
+    if (this.deferRescale) return;
     const target = Math.min(this.wantScale, this.maxStaticScale);
-    if (target <= this.builtScale) return;
-    if (performance.now() - this.wantScaleSince < 450) return;
-    this.rebuild(target);
+    const grow = target > this.builtScale && performance.now() - this.wantScaleSince >= 450;
+    if (this.fontRebuildPending) {
+      this.fontRebuildPending = false;
+      if (grow || (this.builtFontEpoch !== this.fontEpoch && !this.builtHadFonts)) this.rebuild(grow ? target : this.builtScale || this.wantScale);
+      return;
+    }
+    if (grow) this.rebuild(target);
   }
 
   private vignettes(): void {
@@ -300,11 +317,29 @@ export class Renderer {
     this.visionR = 0;
   }
 
+  /** The canvas was resized since the last drawn frame, so it is blank. */
+  get canvasStale(): boolean {
+    return this.resized;
+  }
+
+  /**
+   * A frame under an opaque DOM screen (meeting, ejection, game over): draw nothing, the last
+   * world frame stays on the canvas. Effects keep aging so none replay afterwards, and a pending
+   * static-layer rebuild may run since nobody is moving.
+   */
+  skipFrame(dt: number): void {
+    this.deferRescale = false;
+    this.resizeIfNeeded();
+    this.maybeRescale();
+    this.effects.update(dt, false);
+  }
+
   // ---------- frame helpers ----------
 
   private beginFrame(): void {
     this.resizeIfNeeded();
     this.maybeRescale();
+    this.resized = false;
     this.vignettes();
     const g = this.g;
     g.setTransform(1, 0, 0, 1, 0, 0);
@@ -384,6 +419,7 @@ export class Renderer {
   // ---------- world ----------
 
   renderWorld(view: WorldView, dt: number, t: number): void {
+    this.deferRescale = view.phase === 'playing';
     this.beginFrame();
     const g = this.g;
     const self = view.self;
@@ -746,6 +782,7 @@ export class Renderer {
   // ---------- home / lobby backdrop ----------
 
   renderBackdrop(dt: number, t: number, colors: readonly number[]): void {
+    this.deferRescale = false;
     this.beginFrame();
     const g = this.g;
     const entering = this.mode !== 'backdrop';

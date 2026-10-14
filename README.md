@@ -40,7 +40,7 @@ Checks:
 ```bash
 npm run typecheck
 npm test             # vitest: rules, bots, auth, store, map
-npm run build && npm run e2e   # Playwright multiplayer smoke test
+npm run build && npm run e2e   # Playwright smoke test: 3 browsers + bots play a full game (~1-2 min)
 ```
 
 ## Configuration (env)
@@ -53,8 +53,9 @@ npm run build && npm run e2e   # Playwright multiplayer smoke test
 | `TICKER` | `$RUGS` | Your coin's ticker, shown in the UI and used in minigames |
 | `CONTRACT_ADDRESS` | unset | Your coin's CA. It is shown with a copy button, and the "Verify the CA" task uses it, so players learn the real CA |
 | `LINK_X`, `LINK_TELEGRAM`, `LINK_PUMPFUN` | unset | Links on the home screen (https only) |
-| `PUBLIC_ORIGIN` | unset | Public origin (e.g. `https://amongrugs.fun`) that the Phantom login message is bound to |
+| `PUBLIC_ORIGIN` | unset | Public origin (e.g. `https://amongrugs.fun`) that the Phantom login message is bound to. A comma-separated list allows several (e.g. `https://amongrugs.fun,https://www.amongrugs.fun`). Set it in production: unset, the message follows the request's Host header |
 | `TRUST_PROXY` | unset | Set it when the server runs behind a reverse proxy, so the per-IP limits use the real client IP |
+| `MAX_SOCKETS_PER_IP` | `20` | Concurrent WebSocket connections allowed per client IP |
 
 ## Deploy
 

@@ -81,10 +81,10 @@ Avoid slurs. Never use the word "jeet". Keep jokes about trench culture, not rea
 
 ### Movement
 - The client reports `move {x, y, facing, moving}` at about 20 Hz. The server accepts it only in `playing`, and only when the player is not in a bridge.
-- **Validation:**
-  - Let `dt` be the time since the last accepted move, clamped to `[50 ms, 1000 ms]`.
-  - Reject the move if it is farther than `speed * dt * 1.5 + 24px`, where `speed = BASE_SPEED * settings.playerSpeed` (times `GHOST_SPEED_MULT` for ghosts).
-  - For living players, also reject it if `!circleFree(x, y)`.
+- **Validation:** each player has a movement budget in px, where `speed = BASE_SPEED * settings.playerSpeed` (times `GHOST_SPEED_MULT` for ghosts).
+  - The budget refills at `speed * 1.5` per second, up to a cap of `speed * 1.5 * 1 s + 24px`. It is reset to `24px` on every teleport, at `playing` start, on rejoin and on bridge exit.
+  - Reject the move if it is farther than the budget; an accepted move spends its distance. Sustained speed is therefore capped at 1.5x however often moves are sent, while a client that stalled for up to a second can still catch up.
+  - For living players, also reject it if `!circleFree(x, y)` or the straight path from the last position crosses a solid cell.
   - Ghosts may be anywhere inside the world bounds.
   - On rejection, keep the old position and increment `teleportSeq` so the client snaps back.
 - **Rate limit:** ignore moves that arrive faster than every 25 ms.
@@ -116,7 +116,7 @@ Avoid slurs. Never use the word "jeet". Keep jokes about trench culture, not rea
 
 ### Reporting and X SPACES (meetings)
 - **`report {bodyId}`:** a living player within `REPORT_RANGE` of a body, in `playing`.
-- **`emergency`:** a living player within `EMERGENCY_RANGE` of `EMERGENCY_BUTTON`, with `emergencyLeft > 0`, and no `devDump` active. It decrements `emergencyLeft` (which starts at `settings.emergencyMeetings`).
+- **`emergency`:** a living player within `EMERGENCY_RANGE` of `EMERGENCY_BUTTON` (reachable from every side of the table), with `emergencyLeft > 0`, and no `devDump` active. It decrements `emergencyLeft` (which starts at `settings.emergencyMeetings`).
 - **Meeting start:**
   - phase `meeting`
   - clear all sabotage
@@ -132,7 +132,7 @@ Avoid slurs. Never use the word "jeet". Keep jokes about trench culture, not rea
 - **Tally:** count votes per target. Players who didn't vote don't count. If the top count is shared (a tie), or the top target is `'skip'`, nobody is ejected.
 - **Then** phase `ejection` for `EJECTION_MS`:
   - The ejected player is set dead with no body.
-  - `wasRugger` is shown only if `confirmEjects`.
+  - `wasRugger` and `ruggersLeft` are sent only if `confirmEjects` (the remaining count would give the role away).
   - After that, run the win check. If the game isn't over, return to `playing` with `killReadyAt = now + killCooldown * 1000` and `sabotageReadyAt = now + POST_MEETING_COOLDOWN_MS`.
 
 ### Sabotage (ruggers, alive or dead)
@@ -140,8 +140,8 @@ Avoid slurs. Never use the word "jeet". Keep jokes about trench culture, not rea
   - **`devDump`** (critical): `endsAt = now + DEV_DUMP_DURATION_MS`, stations `dump_a` and `dump_b`.
     - Living players send `fix {holdStart|holdEnd}` within `USE_RANGE`.
     - A holder is dropped from a station when they move farther than `USE_RANGE * 1.5`, die, or disconnect.
-    - When both stations have at least 1 holder at the same tick, it is fixed.
-    - If `endsAt` passes first, ruggers win with reason `devDump`.
+    - When both stations have at least 1 holder at the same time, it is fixed (checked on every `holdStart` and every tick).
+    - If `endsAt` passes first, ruggers win with reason `devDump`. Expiry is checked every tick and before any gameplay message, so an action that arrives after `endsAt` (a report, a hold, a last task) is too late.
   - **`fud`:** station `fud_fix`. Holders' vision is multiplied by `FUD_VISION_MULT` (applied client-side). Fixed by `fix {done}` from a living player within range, after the fix minigame.
   - **`rpcDown`:** station `rpc_fix`. Holders get `taskProgress = -1`; the client hides the task list and the curve. Fixed like `fud`.
 - **On fix:** send the `sabotageFixed` event and set `sabotageReadyAt = now + SABOTAGE_COOLDOWN_MS` for all ruggers.
@@ -156,9 +156,11 @@ Avoid slurs. Never use the word "jeet". Keep jokes about trench culture, not rea
 ### Snapshot visibility
 - **Living non-rugger viewer:** receives living players except vented ruggers. Never receives ghosts. `isRugger` is never set.
 - **Living rugger viewer:** receives living players (vented fellow ruggers included, with `inVent`). Fellow ruggers get `isRugger: true`.
+- **Interest management (phase `playing`, living viewers, bots included):** another living player is sent only when it is within the viewer's vision radius + 120 px and in line of sight (`lineOfSight` to its center or to any of 4 points `PLAYER_RADIUS` off it, so nobody pops at wall edges). The vision radius is `BASE_VISION * crewVision` for holders (times `FUD_VISION_MULT` during FUD, from 500 ms after it starts, while the client's fog closes in) and `BASE_VISION * ruggerVision` for ruggers. Fellow ruggers always receive each other. A player out of view and a rugger inside a bridge look the same: simply absent.
+- **Meetings:** living viewers receive every player for the meeting cards, ghosts included, but a ghost's position is replaced by its spawn point (`moving: false`).
 - **Dead viewer (ghost):** receives everyone, including ghosts, with `isRugger` set for ruggers.
 - **gameOver:** everyone receives everyone with `isRugger`.
-- Bodies are visible to all. The snapshot is not vision-filtered; the client applies fog of war and must not draw players outside its vision polygon.
+- Bodies are visible to all. Other phases (`roleReveal`, `meeting`, `ejection`) are not vision-filtered. The client still applies fog of war and must not draw players outside its vision polygon.
 
 ### Chat
 - **lobby:** anyone.
@@ -177,10 +179,11 @@ On game over, call `recordGameResults` for wallet-linked players. The host can s
 
 ### Disconnects and rejoin
 - **On socket close:** mark the player `disconnected` and keep them for `RECONNECT_GRACE_MS`.
-- **`rejoin {code, playerId, sessionKey}`** within the grace period restores the seat and sends `welcome` again.
+- **`rejoin {code, playerId, sessionKey}`** within the grace period restores the seat and sends `welcome` again, a snapshot, and the chat lines that were sent to the seat while it was disconnected (at most 100).
 - **After the grace period:** remove the player. If they were alive in a game, treat them as dead with no body, and exclude their tasks from the curve. Run the win check.
 - **Leaving the lobby:** removes the player immediately when they send `leave`.
-- **Bad rejoin:** send `REJOIN_FAILED`.
+- **Bad rejoin:** send `REJOIN_FAILED` with the same message whether the room is missing or the seat/key is wrong, so rejoin can't probe for private room codes.
+- **Failed lookups:** at most 30 failed room lookups (a `join` to a code with no room, any failed `rejoin`) per client IP per minute. Past that, `join` and failing `rejoin`s get `RATE_LIMITED` until the minute ends; a rejoin with a valid seat key still works.
 
 ### Snapshots
 - Per-client, see `Snapshot` in `protocol.ts`.
@@ -191,7 +194,7 @@ On game over, call `recordGameResults` for wallet-linked players. The host can s
 
 | File | Owner | Exports |
 |---|---|---|
-| `server/index.ts` | server-core | Starts express + ws on `PORT` (default 8787). Mounts `createApiRouter` at `/api`. Serves `dist/client` statically when present (SPA fallback to `index.html`). WebSocket path `/ws`, max payload 4 KB, per-socket rate limit. |
+| `server/index.ts` | server-core | Starts express + ws on `PORT` (default 8787). Mounts `createApiRouter` at `/api`. Serves `dist/client` statically when present (SPA fallback to `index.html`). WebSocket path `/ws`, max payload 4 KB, per-socket rate limit, at most 20 concurrent sockets per client IP (`MAX_SOCKETS_PER_IP`; IPs keyed like the HTTP API, honoring `TRUST_PROXY`). |
 | `server/rooms.ts` | server-core | `RoomManager`: create, join, quick, rejoin, cleanup, the 20 Hz tick loop, `getRoomsInfo()`. |
 | `server/game.ts` (+ `server/game/*.ts`) | server-core | `Room` / game state machine with an injectable clock and send function so it is unit-testable without sockets. |
 | `server/bots.ts` | bots | `BotBrain` (see below), `botName(i)`. |
@@ -252,7 +255,7 @@ The client is Vite + TypeScript, an HTML5 Canvas 2D world, and a DOM UI overlay.
 
 | Path | Owner | Exports / responsibility |
 |---|---|---|
-| `client/src/game/**` | client-core | `createGame(canvas, ctx): GameApi`. Main loop (requestAnimationFrame) and local prediction: move with `moveWithCollision`, send `move` at `CLIENT_SEND_HZ`, snap on a `teleportSeq` change. Remote interpolation at `serverNow - INTERP_DELAY_MS`. Keyboard input: WASD/arrows move; E/Space use; Q rug; R report; V bridge. `Interactions` every frame. Movement is frozen outside `playing`. |
+| `client/src/game/**` | client-core | `createGame(canvas, ctx): GameApi`. Main loop (requestAnimationFrame) and local prediction: move with `moveWithCollision`, send `move` at `CLIENT_SEND_HZ`, snap on a `teleportSeq` change. Remote interpolation on a timeline anchored to snapshot arrival: `INTERP_DELAY_MS` behind the server time of the latest-arriving snapshots (not the latency-compensated `serverNow`, which runs past the newest snapshot at high latency). Keyboard input: WASD/arrows move; E/Space use; Q rug; R report; V bridge. `Interactions` every frame. Movement is frozen outside `playing`. |
 | `client/src/render/**` | client-core | Camera and zoom (about 2.4 × BASE_VISION fits the shorter screen side, clamped to 0.5–1.6, DPR-aware). Static map pre-rendered to an offscreen canvas. Props, stations (your undone tasks glow yellow), bridges, the SPACES table, characters, bodies, ghosts, fog of war from `visibilityPolygon`, and room labels. Effects: rug slash, DEV DUMP red pulse with falling red candles, FUD darkness. Draw only players inside your vision. Ghosts see everything without fog. |
 | `client/src/audio.ts` | client-core | `createAudio(): AudioApi`, WebAudio synth for every `SoundName`. Unlock audio on the first user gesture. |
 | `client/src/ui/**` + `client/src/styles.css` | ui | `createUi(root, ctx): UiApi`. Covers every DOM screen and overlay (see below) and hosts minigames: `openMinigame` creates the overlay and calls `mountMinigame`. It sends `taskOpen`/`taskDone`/`taskClose` and `fix` messages, and calls `game.setInputBlocked`. It also covers the mobile joystick, toasts, and the full map (M). `styles.css` holds the base page styles: full-screen canvas, UI layer above it, fonts and the color tokens above. |

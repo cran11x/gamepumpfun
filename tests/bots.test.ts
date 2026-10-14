@@ -251,7 +251,7 @@ class Sim {
       case 'move': {
         if (!playing) return this.problem('move outside playing');
         if (me.ventId) return this.problem('move while in a bridge');
-        if (this.now - this.lastMoveMsgAt < 50) this.problem(`moves ${this.now - this.lastMoveMsgAt}ms apart`);
+        if (this.now - this.lastMoveMsgAt < 40) this.problem(`moves ${this.now - this.lastMoveMsgAt}ms apart`);
         this.lastMoveMsgAt = this.now;
         const speed = BASE_SPEED * this.snap.room.settings.playerSpeed * (me.alive ? 1 : GHOST_SPEED_MULT);
         const d = dist(this.pos, msg);
@@ -384,6 +384,9 @@ class Sim {
   }
 }
 
+/** Long enough for any bot to have cast its vote after voting opens. */
+const VOTE_WAIT_MS = 17000;
+
 function meetingView(stage: MeetingView['stage'], extra: Partial<MeetingView> = {}): MeetingView {
   return { callerId: 'p2', reason: 'emergency', stage, votedIds: [], ...extra };
 }
@@ -419,13 +422,24 @@ describe('BotBrain movement', () => {
     expect(sim.problems).toEqual([]);
   });
 
-  it('caps each step under irregular tick timing and never sends moves closer than 50 ms', () => {
+  it('caps each step under irregular tick timing and never sends moves closer than 40 ms', () => {
     const sim = new Sim({ role: 'holder', pos: SPAWN_POINTS[3], tasks: tasks('burn_lp'), settings: { playerSpeed: 2 } });
     const gaps = [50, 50, 700, 50, 20, 20, 20, 20, 70, 130, 45, 55, 300, 10, 10, 80];
     for (let i = 0; i < 400; i++) sim.step(gaps[i % gaps.length]);
     const moves = sim.messages('move');
     expect(moves.length).toBeGreaterThan(50);
-    for (let i = 1; i < moves.length; i++) expect(moves[i].at - moves[i - 1].at).toBeGreaterThanOrEqual(50);
+    for (let i = 1; i < moves.length; i++) expect(moves[i].at - moves[i - 1].at).toBeGreaterThanOrEqual(40);
+    expect(sim.problems).toEqual([]);
+  });
+
+  it('sends a move on every tick when the 20 Hz timer jitters (no skipped ticks, no stutter)', () => {
+    const sim = new Sim({ role: 'holder', pos: SPAWN_POINTS[3], tasks: tasks('burn_lp') });
+    const gaps = [49, 51, 48, 52, 50];
+    sim.step(50);
+    const first = sim.messages('move').length;
+    for (let i = 0; i < 40; i++) sim.step(gaps[i % gaps.length]);
+    // Walking the whole time toward a far station: one move per tick.
+    expect(sim.messages('move').length - first).toBe(40);
     expect(sim.problems).toEqual([]);
   });
 
@@ -632,6 +646,61 @@ describe('BotBrain rugger', () => {
     expect(sim.messages('sabotage')[0].at).toBeGreaterThanOrEqual(T0 + 1000);
     expect(sim.problems).toEqual([]);
   });
+
+  it('holds off after a fellow rugger rugs, so the team never rugs all at once', () => {
+    for (let seed = 1; seed <= 5; seed++) {
+      // 'r2' sorts after this bot, so this bot has the first turn of the round.
+      const sim = new Sim(
+        ruggerInit({
+          seed,
+          killReadyAt: T0 + 500,
+          others: [{ id: 'h1', name: 'alice', x: LP_B.x, y: LP_B.y }, { id: 'r2', name: 'carl', x: TRADING_FLOOR.x, y: TRADING_FLOOR.y, isRugger: true }],
+        }),
+      );
+      sim.run(100);
+      sim.event({ kind: 'rugged', victimId: 'hx', killerId: 'r2' });
+      const heardAt = sim.now;
+      expect(sim.runUntil(() => sim.messages('kill').length > 0, 30000), `seed ${seed}`).toBe(true);
+      expect(sim.messages('kill')[0].at - heardAt, `seed ${seed}`).toBeGreaterThanOrEqual(15000);
+      expect(sim.problems, `seed ${seed}`).toEqual([]);
+    }
+  });
+
+  it('takes turns at round start: a later rugger waits even with a lone holder in reach', () => {
+    for (let seed = 1; seed <= 5; seed++) {
+      // 'a0' sorts before this bot, so this bot goes second.
+      const sim = new Sim(
+        ruggerInit({
+          seed,
+          killReadyAt: T0 + 1000,
+          others: [{ id: 'h1', name: 'alice', x: LP_B.x, y: LP_B.y }, { id: 'a0', name: 'carl', x: TRADING_FLOOR.x, y: TRADING_FLOOR.y, isRugger: true }],
+        }),
+      );
+      expect(sim.runUntil(() => sim.messages('kill').length > 0, 30000), `seed ${seed}`).toBe(true);
+      expect(sim.messages('kill')[0].at - (T0 + 1000), `seed ${seed}`).toBeGreaterThanOrEqual(7000);
+      expect(sim.problems, `seed ${seed}`).toEqual([]);
+    }
+    // Alone, the rugger is up first.
+    const solo = new Sim(ruggerInit({ killReadyAt: T0 + 1000, others: [{ id: 'h1', name: 'alice', x: LP_B.x, y: LP_B.y }] }));
+    expect(solo.runUntil(() => solo.messages('kill').length > 0, 3000)).toBe(true);
+  });
+
+  it('keeps after a holder who walks out of view (the server stops sending them)', () => {
+    for (let seed = 1; seed <= 5; seed++) {
+      const sim = new Sim(ruggerInit({ seed, others: [{ id: 'h1', name: 'alice', x: LP_C.x, y: LP_C.y }] }));
+      sim.run(300);
+      // Interest management: out of view simply means not listed. They are still alive.
+      sim.snap.players = sim.snap.players.filter((p) => p.id !== 'h1');
+      let closest = Infinity;
+      for (let i = 0; i < 160; i++) {
+        sim.step();
+        closest = Math.min(closest, dist(sim.pos, LP_C));
+      }
+      expect(closest, `seed ${seed}`).toBeLessThanOrEqual(45);
+      expect(sim.messages('kill'), `seed ${seed}`).toHaveLength(0);
+      expect(sim.problems, `seed ${seed}`).toEqual([]);
+    }
+  });
 });
 
 // ---------- Sabotage fixing ----------
@@ -681,6 +750,13 @@ describe('BotBrain meetings', () => {
     { id: 'p3', name: 'bob', x: SPAWN_POINTS[2].x, y: SPAWN_POINTS[2].y },
     { id: 'p4', name: 'carol', x: SPAWN_POINTS[3].x, y: SPAWN_POINTS[3].y },
   ];
+  // Seven at the table: far from a must-win vote, so only the evidence decides.
+  const table: PlayerSpec[] = [
+    ...others,
+    { id: 'p5', name: 'dave', x: SPAWN_POINTS[4].x, y: SPAWN_POINTS[4].y },
+    { id: 'p6', name: 'erin', x: SPAWN_POINTS[5].x, y: SPAWN_POINTS[5].y },
+    { id: 'p7', name: 'frank', x: SPAWN_POINTS[6].x, y: SPAWN_POINTS[6].y },
+  ];
 
   it('votes skip with no info', () => {
     for (let seed = 1; seed <= 10; seed++) {
@@ -693,12 +769,12 @@ describe('BotBrain meetings', () => {
         others,
         seed,
       });
-      sim.run(11000);
+      sim.run(VOTE_WAIT_MS);
       const votes = sim.messages('vote');
       expect(votes, `seed ${seed}`).toHaveLength(1);
       expect(votes[0].target).toBe('skip');
-      expect(votes[0].at - T0).toBeGreaterThanOrEqual(2000);
-      expect(votes[0].at - T0).toBeLessThanOrEqual(10000 + 2 * TICK_MS);
+      expect(votes[0].at - T0).toBeGreaterThanOrEqual(3000);
+      expect(votes[0].at - T0).toBeLessThanOrEqual(16000 + 2 * TICK_MS);
       expect(sim.messages('chat').length).toBeLessThanOrEqual(2);
       expect(sim.problems, `seed ${seed}`).toEqual([]);
     }
@@ -725,7 +801,7 @@ describe('BotBrain meetings', () => {
       sim.chat('p2', 'dev_dave is sus');
       sim.chat('p3', 'vote dev_dave, saw him vent');
       sim.chat('p4', 'dev_dave rugged');
-      sim.run(11000);
+      sim.run(VOTE_WAIT_MS);
       const votes = sim.messages('vote');
       expect(votes).toHaveLength(1);
       expect(votes[0].target).not.toBe('r2');
@@ -745,22 +821,32 @@ describe('BotBrain meetings', () => {
     });
     sim.chat('p3', 'alice is sus');
     sim.chat('p4', 'its alice, vote her');
-    sim.run(11000);
+    sim.run(VOTE_WAIT_MS);
     expect(sim.messages('vote').map((v) => v.target)).toEqual(['p2']);
   });
 
-  it('a holder votes for someone repeatedly accused by others, but not on a single claim', () => {
-    const crowd = new Sim({ role: 'holder', phase: 'meeting', meeting: meetingView('voting'), phaseEndsAt: T0 + 60000, pos: SPAWN_POINTS[0], others });
-    crowd.chat('p2', 'carol is sus');
-    crowd.chat('p3', 'carol vented, vote carol');
-    crowd.run(11000);
-    expect(crowd.messages('vote').map((v) => v.target)).toEqual(['p4']);
+  it('a holder follows corroborated claims, but not a bare accusation, its echoes or a vouched player', () => {
+    for (let seed = 1; seed <= 10; seed++) {
+      const crowd = new Sim({ role: 'holder', phase: 'meeting', meeting: meetingView('voting'), phaseEndsAt: T0 + 60000, pos: SPAWN_POINTS[0], others: table, seed });
+      crowd.chat('p2', 'carol rugged in Meme Lab, I saw it');
+      crowd.chat('p3', 'saw carol right by the body in the Meme Lab, sus');
+      crowd.run(VOTE_WAIT_MS);
+      expect(crowd.messages('vote').map((v) => v.target), `seed ${seed}`).toEqual(['p4']);
 
-    const single = new Sim({ role: 'holder', phase: 'meeting', meeting: meetingView('voting'), phaseEndsAt: T0 + 60000, pos: SPAWN_POINTS[0], others });
-    single.chat('p2', 'carol is sus');
-    single.chat('p3', 'nah carol is not sus, she was with me');
-    single.run(11000);
-    expect(single.messages('vote').map((v) => v.target)).toEqual(['skip']);
+      // "yeah X is sus" agrees with an accusation; it is not a second source.
+      const echoed = new Sim({ role: 'holder', phase: 'meeting', meeting: meetingView('voting'), phaseEndsAt: T0 + 60000, pos: SPAWN_POINTS[0], others: table, seed });
+      echoed.chat('p2', 'carol is sus');
+      echoed.chat('p3', 'yeah carol is sus');
+      echoed.chat('p5', 'agree, carol');
+      echoed.run(VOTE_WAIT_MS);
+      expect(echoed.messages('vote').map((v) => v.target), `seed ${seed}`).toEqual(['skip']);
+
+      const vouched = new Sim({ role: 'holder', phase: 'meeting', meeting: meetingView('voting'), phaseEndsAt: T0 + 60000, pos: SPAWN_POINTS[0], others: table, seed });
+      vouched.chat('p2', 'carol is sus');
+      vouched.chat('p3', 'nah carol is not sus, she was with me');
+      vouched.run(VOTE_WAIT_MS);
+      expect(vouched.messages('vote').map((v) => v.target), `seed ${seed}`).toEqual(['skip']);
+    }
   });
 
   it('a witness reports, accuses the rugger by name in the meeting and votes them', () => {
@@ -794,7 +880,7 @@ describe('BotBrain meetings', () => {
       sim.snap.meeting = meetingView('voting', { callerId: BOT_ID, reason: 'report', bodyColor: victim.color });
       sim.snap.phaseEndsAt = sim.now + 60000;
       sim.event({ kind: 'votingOpened' });
-      sim.run(11000);
+      sim.run(VOTE_WAIT_MS);
       expect(sim.messages('vote').map((v) => v.target)).toEqual(['k']);
       expect(sim.problems, `seed ${seed}`).toEqual([]);
     }
@@ -826,28 +912,167 @@ describe('BotBrain meetings', () => {
       expect(sim.messages('chat').map((c) => c.text)[0], `seed ${seed}`).toBe('cabal_carl vented in the Launchpad, I saw it');
       sim.snap.meeting = meetingView('voting');
       sim.snap.phaseEndsAt = sim.now + 60000;
-      sim.run(11000);
+      sim.run(VOTE_WAIT_MS);
       expect(sim.messages('vote').map((v) => v.target), `seed ${seed}`).toEqual(['r']);
       expect(sim.problems, `seed ${seed}`).toEqual([]);
     }
   });
 
-  it('usually follows a single eyewitness claim, and votes the liar when it is the one accused', () => {
-    let followed = 0;
-    for (let seed = 1; seed <= 20; seed++) {
-      const sim = new Sim({ role: 'holder', phase: 'meeting', meeting: meetingView('voting'), phaseEndsAt: T0 + 60000, pos: SPAWN_POINTS[0], others, seed });
-      sim.chat('p2', 'carol rugged in Meme Lab, I saw it');
-      sim.run(11000);
-      const [vote] = sim.messages('vote').map((v) => v.target);
-      expect(['p4', 'skip']).toContain(vote);
-      if (vote === 'p4') followed++;
+  it('someone who just comes into view near a bridge did not use it', () => {
+    const vent = ventById('v_launch')!;
+    for (let seed = 1; seed <= 5; seed++) {
+      const sim = new Sim({ role: 'holder', pos: LP_A, tasks: tasks('lp_snipe'), others: [{ id: 'p3', name: 'bob', x: TRADING_FLOOR.x, y: TRADING_FLOOR.y }], seed });
+      sim.run(300);
+      // With interest management a player walking in around a corner shows up out of nowhere too.
+      sim.snap.players.push(view({ id: 'w', name: 'cabal_carl', x: vent.x + 40, y: vent.y }, 5));
+      sim.run(3000);
+      sim.snap.phase = 'meeting';
+      sim.snap.meeting = meetingView('discussion');
+      sim.snap.phaseEndsAt = sim.now + 30000;
+      sim.teleport(SPAWN_POINTS[0].x, SPAWN_POINTS[0].y);
+      sim.run(20000);
+      for (const c of sim.messages('chat')) expect(c.text, `seed ${seed}`).not.toMatch(/vented/);
+      expect(sim.problems, `seed ${seed}`).toEqual([]);
     }
-    expect(followed).toBeGreaterThanOrEqual(10);
+  });
+
+  it('a holder that found someone standing by a body says so and votes them', () => {
+    const far = (id: string, name: string, i: number): PlayerSpec => ({ id, name, x: TRADING_FLOOR.x + 40 * i, y: TRADING_FLOOR.y });
+    let voted = 0;
+    let named = 0;
+    for (let seed = 1; seed <= 10; seed++) {
+      const sim = new Sim({
+        role: 'holder',
+        pos: LP_A,
+        tasks: tasks('lp_snipe'),
+        // Bodies listed from the start are not fresh: we didn't watch the rug, we found them by it.
+        bodies: [{ id: 'v', color: 9, x: LP_C.x, y: LP_C.y }],
+        others: [{ id: 'k', name: 'KOL_Kevin', x: LP_C.x + 40, y: LP_C.y }, far('p3', 'bob', 0), far('p4', 'carol', 1), far('p5', 'dave', 2), { id: 'v', name: 'victim', color: 9, x: LP_C.x, y: LP_C.y, alive: false }],
+        seed,
+      });
+      // A living viewer never receives the ghost itself.
+      sim.snap.players = sim.snap.players.filter((p) => p.id !== 'v');
+      expect(sim.runUntil(() => sim.messages('report').length > 0, 15000), `seed ${seed}`).toBe(true);
+      sim.snap.phase = 'meeting';
+      sim.snap.bodies = [];
+      sim.snap.players.push(view({ id: 'v', name: 'victim', color: 9, x: SPAWN_POINTS[9].x, y: SPAWN_POINTS[9].y, alive: false }, 9));
+      sim.snap.meeting = meetingView('discussion', { callerId: BOT_ID, reason: 'report', bodyColor: 9 });
+      sim.snap.phaseEndsAt = sim.now + 30000;
+      sim.teleport(SPAWN_POINTS[0].x, SPAWN_POINTS[0].y);
+      sim.run(20000);
+      const lines = sim.messages('chat').map((c) => c.text);
+      expect(lines[0], `seed ${seed}`).toMatch(/^(body in the|found a rugged bag in the) Launchpad$/);
+      if (lines.some((t) => t.includes('KOL_Kevin') && /by the body|near the body/.test(t))) named++;
+      sim.snap.meeting = meetingView('voting', { callerId: BOT_ID, reason: 'report', bodyColor: 9 });
+      sim.snap.phaseEndsAt = sim.now + 60000;
+      sim.run(VOTE_WAIT_MS);
+      const votes = sim.messages('vote').map((v) => v.target);
+      expect(votes, `seed ${seed}`).toHaveLength(1);
+      expect(['k', 'skip'], `seed ${seed}`).toContain(votes[0]);
+      if (votes[0] === 'k') voted++;
+      expect(sim.problems, `seed ${seed}`).toEqual([]);
+    }
+    expect(voted).toBeGreaterThanOrEqual(8);
+    expect(named).toBeGreaterThanOrEqual(5);
+  });
+
+  it("doesn't ask where the body was once the reporter said it, and doesn't repeat lines", () => {
+    for (let seed = 1; seed <= 30; seed++) {
+      const meeting = meetingView('discussion', { callerId: 'p2', reason: 'report', bodyColor: 9 });
+      const sim = new Sim({ role: 'holder', phase: 'meeting', meeting, phaseEndsAt: T0 + 30000, pos: SPAWN_POINTS[0], others, seed });
+      sim.chat('p2', 'body in the Trading Floor');
+      sim.chat('p3', 'dev is sus fr');
+      sim.chat('p4', 'ngmi');
+      sim.run(30000);
+      for (const c of sim.messages('chat')) {
+        expect(c.text, `seed ${seed}`).not.toMatch(/where was the body|who found it/);
+        expect(['dev is sus fr', 'ngmi', 'body in the Trading Floor'], `seed ${seed}`).not.toContain(c.text);
+      }
+      expect(sim.problems, `seed ${seed}`).toEqual([]);
+    }
+    // The bot that found the body never asks either.
+    for (let seed = 1; seed <= 30; seed++) {
+      const meeting = meetingView('discussion', { callerId: BOT_ID, reason: 'report', bodyColor: 9 });
+      const sim = new Sim({ role: 'holder', phase: 'meeting', meeting, phaseEndsAt: T0 + 30000, pos: SPAWN_POINTS[0], others, seed });
+      sim.run(30000);
+      for (const c of sim.messages('chat')) expect(c.text, `seed ${seed}`).not.toMatch(/where was the body|who found it/);
+    }
+  });
+
+  it('votes are spread out over the voting stage, not all in the same second', () => {
+    const times: number[] = [];
+    for (let seed = 1; seed <= 20; seed++) {
+      const sim = new Sim({ role: 'holder', phase: 'meeting', meeting: meetingView('voting'), phaseEndsAt: T0 + 60000, pos: SPAWN_POINTS[0], others: table, seed });
+      sim.run(VOTE_WAIT_MS);
+      times.push(sim.messages('vote')[0].at - T0);
+    }
+    times.sort((a, b) => a - b);
+    expect(times[times.length - 1] - times[0]).toBeGreaterThan(8000);
+    // No single second holds more than a quarter of the votes.
+    for (const t of times) expect(times.filter((u) => u >= t && u < t + 1000).length).toBeLessThanOrEqual(5);
+  });
+
+  it('when one more rug loses the game, a holder picks someone instead of skipping and follows the table', () => {
+    const three = [others[0], others[1]];
+    for (let seed = 1; seed <= 10; seed++) {
+      const sim = new Sim({ role: 'holder', phase: 'meeting', meeting: meetingView('discussion'), phaseEndsAt: T0 + 30000, pos: SPAWN_POINTS[0], others: three, seed });
+      sim.run(30000);
+      const said = sim.messages('chat').map((c) => c.text);
+      sim.snap.meeting = meetingView('voting');
+      sim.snap.phaseEndsAt = sim.now + 60000;
+      sim.run(VOTE_WAIT_MS);
+      const [vote] = sim.messages('vote').map((v) => v.target);
+      expect(['p2', 'p3'], `seed ${seed}`).toContain(vote);
+      // It says who it is voting for, so the holders don't split.
+      const name = vote === 'p2' ? 'alice' : 'bob';
+      expect(said.some((t) => /vot/.test(t) && t.includes(name)), `seed ${seed}: ${said.join(' | ')}`).toBe(true);
+
+      const follow = new Sim({ role: 'holder', phase: 'meeting', meeting: meetingView('voting'), phaseEndsAt: T0 + 60000, pos: SPAWN_POINTS[0], others: three, seed });
+      follow.chat('p2', 'voting bob, no skip this time');
+      follow.run(VOTE_WAIT_MS);
+      expect(follow.messages('vote').map((v) => v.target), `seed ${seed}`).toEqual(['p3']);
+    }
+    // With the curve about to finish, skipping is still fine.
+    const done = new Sim({ role: 'holder', phase: 'meeting', meeting: meetingView('voting'), phaseEndsAt: T0 + 60000, pos: SPAWN_POINTS[0], others: three });
+    done.snap.taskProgress = 0.95;
+    done.run(VOTE_WAIT_MS);
+    expect(done.messages('vote').map((v) => v.target)).toEqual(['skip']);
+  });
+
+  it('weighs a lone eyewitness claim: some follow it, fewer once it is denied, and none when the room is wrong', () => {
+    const followRate = (setup: (sim: Sim) => void, reason: 'emergency' | 'report' = 'emergency') => {
+      let followed = 0;
+      for (let seed = 1; seed <= 40; seed++) {
+        const meeting = meetingView('voting', reason === 'report' ? { reason, callerId: 'p2', bodyColor: 9 } : {});
+        const sim = new Sim({ role: 'holder', phase: 'meeting', meeting, phaseEndsAt: T0 + 60000, pos: SPAWN_POINTS[0], others: table, seed });
+        setup(sim);
+        sim.run(VOTE_WAIT_MS);
+        const votes = sim.messages('vote').map((v) => v.target);
+        expect(votes).toHaveLength(1);
+        if (votes[0] === 'p4') followed++;
+        expect(sim.problems, `seed ${seed}`).toEqual([]);
+      }
+      return followed / 40;
+    };
+    const lone = followRate((sim) => sim.chat('p3', 'carol rugged in Meme Lab, I saw it'));
+    expect(lone).toBeGreaterThan(0.1);
+    expect(lone).toBeLessThan(0.7);
+    const denied = followRate((sim) => {
+      sim.chat('p3', 'carol rugged in Meme Lab, I saw it');
+      sim.chat('p4', 'not me, I was in the Burn Room');
+    });
+    expect(denied).toBeLessThan(lone);
+    // The reporter said the body was in the Trading Floor: "I saw it in the Meme Lab" can't be true.
+    const wrongRoom = followRate((sim) => {
+      sim.chat('p2', 'body in the Trading Floor');
+      sim.chat('p3', 'carol rugged in Meme Lab, I saw it');
+    }, 'report');
+    expect(wrongRoom).toBe(0);
 
     for (let seed = 1; seed <= 5; seed++) {
       const sim = new Sim({ role: 'holder', phase: 'meeting', meeting: meetingView('voting'), phaseEndsAt: T0 + 60000, pos: SPAWN_POINTS[0], others, seed, name: 'sniper.sol' });
       sim.chat('p2', 'sniper.sol rugged in the Burn Room, I saw it');
-      sim.run(11000);
+      sim.run(VOTE_WAIT_MS);
       expect(sim.messages('vote').map((v) => v.target), `seed ${seed}`).toEqual(['p2']);
     }
   });

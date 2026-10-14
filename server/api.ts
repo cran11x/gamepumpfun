@@ -1,7 +1,7 @@
 // HTTP API mounted at /api (see the bottom of shared/protocol.ts):
 //
 //   GET  /config                       -> PublicConfig
-//   GET  /auth/nonce?address=<b58>     -> { nonce, message }
+//   GET  /auth/nonce?address=<b58>     -> { nonce, message }  (message bound to PUBLIC_ORIGIN or the Host)
 //   POST /auth/verify {address, nonce, signature}  -> AuthResult | 401
 //   POST /auth/logout   (Bearer)       -> 204 (revokes the token; extra, used by the client on logout)
 //   GET  /me            (Bearer)       -> Profile | 401
@@ -14,8 +14,8 @@
 
 import express, { type NextFunction, type Request, type RequestHandler, type Response, type Router } from 'express';
 import type { Profile } from '../shared/protocol';
-import { AuthError, issueNonce, resolveAuthToken, revokeToken, verifyLogin } from './auth';
-import { getPublicConfig } from './config';
+import { AuthError, isLoginDomain, isLoginSite, issueNonce, resolveAuthToken, revokeToken, verifyLogin, type LoginSite } from './auth';
+import { getLoginOrigins, getPublicConfig } from './config';
 import {
   LEADERBOARD_MAX_LIMIT,
   LEADERBOARD_SORTS,
@@ -109,6 +109,38 @@ function limitBy(limiter: RateLimiter): RequestHandler {
 
 // ---------- Helpers ----------
 
+let warnedNoOrigin = false;
+
+/**
+ * The site a login message is bound to. With PUBLIC_ORIGIN set (recommended in production) it is
+ * the configured origin whose host matches the request, else the first one, whatever Host says.
+ * Without it, the request's own Host header (https when the request or a proxy says so). Null when
+ * that header is missing or malformed.
+ */
+export function loginSiteFor(req: Request): LoginSite | null {
+  const host = (typeof req.headers.host === 'string' ? req.headers.host : '').trim().toLowerCase();
+  const origins = getLoginOrigins();
+  let uri: string;
+  if (origins.length > 0) {
+    uri = origins.find((o) => new URL(o).host === host) ?? origins[0];
+  } else {
+    if (!warnedNoOrigin && process.env.NODE_ENV === 'production') {
+      warnedNoOrigin = true;
+      console.warn('[api] PUBLIC_ORIGIN is not set: Phantom login messages use the request Host header. Set it to your public origin.');
+    }
+    if (!isLoginDomain(host)) return null;
+    const forwarded = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim().toLowerCase();
+    uri = `${req.protocol === 'https' || forwarded === 'https' ? 'https' : 'http'}://${host}`;
+  }
+  try {
+    const url = new URL(uri);
+    const site: LoginSite = { domain: url.host, uri: url.origin };
+    return isLoginSite(site) ? site : null;
+  } catch {
+    return null;
+  }
+}
+
 function fail(res: Response, status: number, error: string): void {
   res.status(status).json({ error });
 }
@@ -174,8 +206,10 @@ export function createApiRouter(deps: ApiDeps): Router {
   router.get('/auth/nonce', limitBy(nonceLimiter), (req, res) => {
     const address = queryString(req, 'address')?.trim();
     if (!address) return fail(res, 400, 'Missing wallet address');
+    const site = loginSiteFor(req);
+    if (!site) return fail(res, 400, 'Bad Host header');
     try {
-      res.json(issueNonce(address));
+      res.json(issueNonce(address, { site, requester: clientKey(req) }));
     } catch (err) {
       if (err instanceof AuthError) return fail(res, 400, err.message);
       throw err;

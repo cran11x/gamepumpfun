@@ -138,6 +138,26 @@ export function createChat(core: UiCore, opts: ChatOpts): ChatPanel {
 
   fill();
 
+  // Stay on the newest message when the list shrinks (an on-screen keyboard opening, a tab switch).
+  // Scrolls caused by the resize itself (scroll anchoring) don't count as the player scrolling away.
+  let pinned = true;
+  let seenHeight = -1;
+  list.addEventListener(
+    'scroll',
+    () => {
+      if (list.clientHeight === seenHeight) pinned = list.scrollTop + list.clientHeight >= list.scrollHeight - 8;
+    },
+    { passive: true },
+  );
+  const resizeObs =
+    typeof ResizeObserver === 'function'
+      ? new ResizeObserver(() => {
+          seenHeight = list.clientHeight;
+          if (pinned) list.scrollTop = list.scrollHeight;
+        })
+      : null;
+  resizeObs?.observe(list);
+
   return {
     el,
     setChannels(next, placeholder) {
@@ -157,12 +177,14 @@ export function createChat(core: UiCore, opts: ChatOpts): ChatPanel {
       unread = 0;
       opts.onUnread?.(0);
       list.scrollTop = list.scrollHeight;
+      pinned = true;
     },
     focus() {
       if (!input.disabled) input.focus();
     },
     destroy() {
       off();
+      resizeObs?.disconnect();
       if (pending !== null) window.clearTimeout(pending);
       if (document.activeElement === input) input.blur();
     },

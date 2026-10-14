@@ -60,6 +60,9 @@ export interface Hud extends Screen {
 /** The player's last choice for the task list, kept across HUD instances (meetings rebuild the HUD). */
 let tasksCollapsedPref: boolean | null = null;
 
+/** Landscape phones: an open task list would sit on the joystick, so it starts collapsed there. */
+const SHORT_TOUCH_PX = 520;
+
 export function createHud(core: UiCore): Hud {
   const { ctx } = core;
   let snap: Snapshot | null = null;
@@ -72,7 +75,8 @@ export function createHud(core: UiCore): Hud {
   let bannerKey = '';
   let ventKey = '';
   let lastUseKey = '';
-  let tasksCollapsed = tasksCollapsedPref ?? core.isNarrow();
+  const shortTouch = () => core.isTouch() && window.innerHeight <= SHORT_TOUCH_PX;
+  let tasksCollapsed = tasksCollapsedPref ?? (core.isNarrow() || shortTouch());
   let flash: { stationId: string; at: number } | null = null;
   let gchatOpen = false;
   let gchat: ChatPanel | null = null;
@@ -140,8 +144,14 @@ export function createHud(core: UiCore): Hud {
 
   function setGchat(open: boolean): void {
     gchatOpen = open && !!gchat;
+    // No room for both on a landscape phone: fold the task list (without changing the saved preference).
+    if (gchatOpen && shortTouch() && !tasksCollapsed) {
+      tasksCollapsed = true;
+      applyCollapsed();
+    }
     setHidden(gchatPanel, !gchatOpen);
     toggleClass(gchatBtn, 'is-on', gchatOpen);
+    toggleClass(el, 'is-gchat', gchatOpen);
     if (gchatOpen && gchat) {
       gchat.markRead();
       if (!core.isTouch()) gchat.focus();

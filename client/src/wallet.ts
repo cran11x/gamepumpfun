@@ -104,6 +104,32 @@ function signatureBytes(result: PhantomSignResult | Uint8Array | null | undefine
   return null;
 }
 
+/**
+ * True for our Sign-In-With-Solana style login message (server/auth.ts loginMessage) bound to the
+ * page's own host, this wallet and this nonce. A server or proxy asking us to sign anything else
+ * (another site's login, or text with control characters) is refused before Phantom opens.
+ */
+function isOwnLoginMessage(message: string, address: string, nonce: string): boolean {
+  if (typeof message !== 'string' || /[\u0000-\u0009\u000b-\u001f\u007f]/.test(message)) return false;
+  let host: string;
+  try {
+    host = window.location.host.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (!host) return false;
+  const lines = message.split('\n');
+  if (lines[0] !== `${host} wants you to sign in with your Solana account:` || lines[1] !== address) return false;
+  const uri = lines.find((l) => l.startsWith('URI: '))?.slice('URI: '.length) ?? '';
+  let uriHost = '';
+  try {
+    uriHost = new URL(uri).host;
+  } catch {
+    return false;
+  }
+  return uriHost === host && lines.includes(`Nonce: ${nonce}`);
+}
+
 /** Turn a wallet / network failure into a short, human error message. */
 function friendlyError(err: unknown, fallback: string): Error {
   if (err instanceof ApiError) return new Error(err.message);
@@ -247,8 +273,8 @@ export function createWallet(): WalletApi {
     } catch (err) {
       throw friendlyError(err, "Couldn't start sign-in. Try again.");
     }
-    // Only ever sign our own plain-text login message for this exact wallet and nonce.
-    if (!challenge.message.includes(`\nWallet: ${address}\n`) || !challenge.message.includes(`\nNonce: ${challenge.nonce}\n`)) {
+    // Only ever sign our own plain-text login message for this site, this exact wallet and nonce.
+    if (!isOwnLoginMessage(challenge.message, address, challenge.nonce)) {
       throw new Error('Unexpected sign-in message from the server. Try again later.');
     }
 

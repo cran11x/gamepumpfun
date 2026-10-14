@@ -4,6 +4,7 @@
 import { randomInt } from 'node:crypto';
 import { DEFAULT_TICKER, ROOM_CODE_LENGTH, SERVER_TICK_HZ } from '../shared/constants';
 import type { C2S, ErrorCode, S2C } from '../shared/protocol';
+import { RateLimiter } from './api';
 import { resolveAuthToken } from './auth';
 import { BotBrain, botName } from './bots';
 import { getPublicConfig } from './config';
@@ -16,6 +17,15 @@ export const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
 const MAX_ROOMS = 5000;
 /** Minimum spacing between create / join / quick from one connection. */
 const JOIN_COOLDOWN_MS = 250;
+/**
+ * Failed room lookups (a join to a code with no room, any failed rejoin) allowed per client IP per window.
+ * Past that, join and rejoin answer RATE_LIMITED until the window ends, so private codes can't be swept.
+ */
+const LOOKUP_FAIL_LIMIT = 30;
+const LOOKUP_FAIL_WINDOW_MS = 60_000;
+/** Same text for every failed rejoin: whether the room exists must not show. */
+const REJOIN_FAILED_MSG = 'Could not restore your seat';
+const LOOKUP_BLOCKED_MSG = 'Too many attempts. Try again in a minute.';
 
 export interface Binding {
   code: string;
@@ -29,6 +39,8 @@ export interface Conn {
   binding: Binding | null;
   /** Last create/join/quick time (anti-churn), managed by RoomManager. */
   lastJoinAt: number;
+  /** Client key for per-IP limits (server/api.ts `clientKey`). Connections without one share 'local'. */
+  readonly ip?: string;
 }
 
 export interface RoomManagerOptions {
@@ -56,11 +68,15 @@ export class RoomManager {
   private readonly rng: () => number;
   private readonly log: (message: string, err?: unknown) => void;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** Failed room lookups per client IP, and IPs blocked from lookups until a time. */
+  private readonly lookupFails: RateLimiter;
+  private readonly lookupBlockedUntil = new Map<string, number>();
 
   constructor(opts: RoomManagerOptions = {}) {
     this.now = opts.now ?? Date.now;
     this.rng = opts.rng ?? Math.random;
     this.log = opts.log ?? ((m, e) => console.error(`[rooms] ${m}`, e ?? ''));
+    this.lookupFails = new RateLimiter(LOOKUP_FAIL_LIMIT, LOOKUP_FAIL_WINDOW_MS, 50_000, this.now);
   }
 
   // ---------- Lifecycle ----------
@@ -166,9 +182,14 @@ export class RoomManager {
 
   private join(conn: Conn, rawCode: string, name: string, authToken?: string): void {
     if (!this.joinAllowed(conn)) return;
+    // Whether a join works shows whether the room exists, so a blocked IP gets no answer at all.
+    if (this.lookupBlocked(conn)) return this.error(conn, 'RATE_LIMITED', LOOKUP_BLOCKED_MSG);
     const code = normalizeRoomCode(rawCode);
     const room = code ? this.rooms.get(code) : undefined;
-    if (!room) return this.error(conn, 'ROOM_NOT_FOUND', 'No room with that code');
+    if (!room) {
+      if (this.lookupFailed(conn)) return this.error(conn, 'RATE_LIMITED', LOOKUP_BLOCKED_MSG);
+      return this.error(conn, 'ROOM_NOT_FOUND', 'No room with that code');
+    }
     const b = conn.binding;
     if (b && b.code === room.code && this.seats.get(seatKey(b.code, b.playerId)) === conn && room.getPlayer(b.playerId)) {
       // Already seated here: just re-send the welcome.
@@ -199,13 +220,19 @@ export class RoomManager {
   }
 
   private rejoin(conn: Conn, rawCode: string, playerId: string, sessionKey: string): void {
+    // A missing room and a wrong seat/key must look the same (same error, same side effects), or
+    // rejoin becomes an oracle for private room codes. A valid seat key still works when blocked:
+    // only its owner can have it, so success reveals nothing to a prober.
+    const blocked = this.lookupBlocked(conn);
     const code = normalizeRoomCode(rawCode);
     const room = code ? this.rooms.get(code) : undefined;
-    if (!room) return this.error(conn, 'REJOIN_FAILED', 'That game is gone');
+    const player = room ? room.rejoin(playerId, sessionKey) : null;
+    if (!room || !player) {
+      if (blocked || this.lookupFailed(conn)) return this.error(conn, 'RATE_LIMITED', LOOKUP_BLOCKED_MSG);
+      return this.error(conn, 'REJOIN_FAILED', REJOIN_FAILED_MSG);
+    }
     const b = conn.binding;
     if (b && (b.code !== room.code || b.playerId !== playerId)) this.leave(conn);
-    const player = room.rejoin(playerId, sessionKey);
-    if (!player) return this.error(conn, 'REJOIN_FAILED', 'Could not restore your seat');
     const key = seatKey(room.code, playerId);
     const previous = this.seats.get(key);
     if (previous && previous !== conn) {
@@ -251,6 +278,7 @@ export class RoomManager {
     if (!p) return;
     conn.send({ t: 'welcome', playerId, sessionKey: p.sessionKey, code: room.code });
     room.sendSnapshotTo(playerId);
+    room.sendMissedChatTo(playerId);
   }
 
   // ---------- Internals ----------
@@ -309,6 +337,31 @@ export class RoomManager {
     } catch (err) {
       this.log(`send to ${playerId} failed`, err);
     }
+  }
+
+  private lookupBlocked(conn: Conn): boolean {
+    const ip = conn.ip ?? 'local';
+    const until = this.lookupBlockedUntil.get(ip);
+    if (until === undefined) return false;
+    if (until > this.now()) return true;
+    this.lookupBlockedUntil.delete(ip);
+    return false;
+  }
+
+  /**
+   * Count a failed room lookup. Past the limit the IP is blocked until its window ends, and true is
+   * returned so this failure is already answered RATE_LIMITED.
+   */
+  private lookupFailed(conn: Conn): boolean {
+    const ip = conn.ip ?? 'local';
+    const retryMs = this.lookupFails.take(ip);
+    if (retryMs <= 0) return false;
+    const now = this.now();
+    if (this.lookupBlockedUntil.size >= 10_000) {
+      for (const [k, until] of this.lookupBlockedUntil) if (until <= now) this.lookupBlockedUntil.delete(k);
+    }
+    this.lookupBlockedUntil.set(ip, now + retryMs);
+    return true;
   }
 
   private joinAllowed(conn: Conn): boolean {

@@ -1,4 +1,4 @@
-// Public, display-only configuration read from the environment.
+// Public configuration read from the environment.
 //
 //   GAME_NAME         title shown in the client (default: GAME_NAME constant)
 //   TICKER            coin ticker, e.g. "$RUGS" (a missing "$" is added)
@@ -6,6 +6,8 @@
 //   LINK_X            https link to the X / Twitter account
 //   LINK_TELEGRAM     https link to the Telegram group
 //   LINK_PUMPFUN      https link to the pump.fun coin page
+//   PUBLIC_ORIGIN     origin(s) the Phantom login message is bound to, e.g. "https://amongrugs.fun"
+//                     (comma-separated for several, the first is the default). Not sent to the client.
 //
 // Invalid values are dropped (with one warning per distinct value) so a typo in a deploy
 // never puts a broken or unsafe link on the home screen.
@@ -125,4 +127,38 @@ export function getPublicConfig(env: ConfigEnv = process.env): PublicConfig {
     cacheKey = key;
   }
   return { ...cached, links: { ...cached.links } };
+}
+
+// ---------- Login origin ----------
+
+let originsKey: string | undefined;
+let originsCache: string[] = [];
+
+/**
+ * The public origins from PUBLIC_ORIGIN (http/https only, normalized to `scheme://host[:port]`),
+ * in the order given. Empty when unset: the login message then uses the request's Host header.
+ */
+export function getLoginOrigins(env: ConfigEnv = process.env): string[] {
+  const raw = env.PUBLIC_ORIGIN?.trim() ?? '';
+  if (raw !== originsKey) {
+    const origins: string[] = [];
+    for (const part of raw.split(',')) {
+      const value = part.trim();
+      if (!value) continue;
+      let url: URL | null = null;
+      try {
+        url = new URL(value);
+      } catch {
+        url = null;
+      }
+      if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password || !url.host) {
+        warnOnce(`origin:${value}`, `PUBLIC_ORIGIN entry "${value}" is not an http(s) origin; it is ignored.`);
+        continue;
+      }
+      if (!origins.includes(url.origin)) origins.push(url.origin);
+    }
+    originsKey = raw;
+    originsCache = origins;
+  }
+  return [...originsCache];
 }
