@@ -1,0 +1,39 @@
+{
+  "name": "among-rugs",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Social deduction browser game from the trenches: find the rugger before the coin gets rugged.",
+  "scripts": {
+    "dev": "concurrently -k -n server,client -c green,cyan \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "tsx watch server/index.ts",
+    "dev:client": "vite",
+    "build": "vite build && npm run build:server",
+    "build:server": "esbuild server/index.ts --bundle --platform=node --format=esm --packages=external --target=node20 --outfile=dist/server/index.js",
+    "start": "node dist/server/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "e2e": "node e2e/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20.19"
+  },
+  "dependencies": {
+    "bs58": "^6.0.0",
+    "express": "^5.3.0",
+    "tweetnacl": "^1.0.3",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.5",
+    "@types/ws": "^8.18.2",
+    "concurrently": "^9.2.5",
+    "esbuild": "^0.28.2",
+    "playwright": "^1.56.1",
+    "tsx": "^4.23.15",
+    "typescript": "5.9",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.4"
+  }
+}
