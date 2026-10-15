@@ -12,7 +12,7 @@ import { createHome } from './home';
 import { createHud, type Hud } from './hud';
 import { createLobby } from './lobby';
 import { createRoleReveal } from './roleReveal';
-import { copyText, detectTouch, h, icon, isTextInput } from './dom';
+import { button, copyText, detectTouch, h, icon, isTextInput } from './dom';
 import { dismissRuggedCutscene, showRuggedCutscene } from './cutscene';
 import { createFullMap } from './fullMap';
 import { createMinigameHost } from './minigame';
@@ -451,6 +451,10 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
       sound('error');
       return;
     }
+    if ((e.code === 'NEED_WALLET' || e.code === 'NEED_TICKET') && offerSignIn()) {
+      sound('error');
+      return;
+    }
     toasts.show(friendlyError(e.code, e.message), 'bad');
     sound('error');
   });
@@ -475,6 +479,38 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
     return true;
   }
 
+  /**
+   * A ranked room turned a signed-out player away (an invite link opened as a guest): explain, connect
+   * Phantom, then send the same join again, which leads on to the ticket burn when one is needed.
+   * False when there is nothing to retry, or the player is already signed in.
+   */
+  function offerSignIn(): boolean {
+    const retry = core.rankedRetry;
+    if (core.burnMode() === 'off' || ctx.wallet.getSession() || store.snap || !retry) return false;
+    const connect = button('CONNECT PHANTOM', { cls: 'btn--phantom', icon: 'phantom' });
+    connect.id = 'btn-ranked-signin';
+    const body = h(
+      'div',
+      { class: 'ranked-signin' },
+      h('p', { text: 'This is a ranked room. Connect Phantom to join: you sign a message, no transaction.' }),
+      h('p', { class: 'ranked-signin-sub', text: 'Ranked games need a ticket, burned once per game. Results count toward the weekly leaderboard.' }),
+      h('div', { class: 'rename-actions' }, connect),
+    );
+    const modal = core.openModal({ title: 'RANKED ROOM', body, cls: 'modal--sm' });
+    connect.addEventListener('click', () => {
+      connect.disabled = true;
+      void signIn().then((ok) => {
+        if (!ok) {
+          connect.disabled = false;
+          return;
+        }
+        modal.close();
+        retry();
+      });
+    });
+    return true;
+  }
+
   // ----- Burns confirmed after the tab closed: check them once at boot, and after a sign-in -----
   let resumedFor: string | null = null;
   function resumeBurns(): void {
@@ -494,6 +530,15 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
   ctx.wallet.onChange(() => {
     if (!ctx.wallet.getSession()) resumedFor = null;
     else resumeBurns();
+  });
+
+  // Closing the tab in a ranked round counts as leaving early once the reconnect grace runs out: ask
+  // first (browsers show their own generic text; returnValue is for the ones that still read it).
+  window.addEventListener('beforeunload', (e) => {
+    const s = store.snap;
+    if (!s?.room.ranked || !s.me || (s.phase !== 'roleReveal' && s.phase !== 'playing' && s.phase !== 'meeting' && s.phase !== 'ejection')) return;
+    e.preventDefault();
+    e.returnValue = 'Leaving a ranked game counts as leaving early (-20 points). Your ticket is already used.';
   });
 
   let wasDisconnected = false;

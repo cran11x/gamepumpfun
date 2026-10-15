@@ -157,6 +157,12 @@ function toCosmetics(raw: unknown): Profile['cosmetics'] {
   return { owned, equipped };
 }
 
+/** `{name: <name effect id>}` when `raw` carries a known name effect, else undefined. */
+function toNameFx(raw: unknown): Pick<EquippedCosmetics, 'name'> | undefined {
+  const id = raw && typeof raw === 'object' ? (raw as { name?: unknown }).name : undefined;
+  return typeof id === 'string' && isCosmeticForSlot(id, 'name') ? { name: id } : undefined;
+}
+
 /** Normalize a Profile from the server; null when it isn't one. */
 export function toProfile(raw: unknown): Profile | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -303,7 +309,7 @@ export async function fetchRankedLeaderboard(week: 'current' | 'previous' = 'cur
       if (!item || typeof item !== 'object') continue;
       const e = item as Record<string, unknown>;
       if (typeof e.address !== 'string' || !e.address) continue;
-      entries.push({
+      const entry: RankedEntry = {
         address: e.address,
         shortAddress: typeof e.shortAddress === 'string' ? e.shortAddress : shortAddress(e.address),
         name: typeof e.name === 'string' && e.name ? e.name : shortAddress(e.address),
@@ -312,7 +318,10 @@ export async function fetchRankedLeaderboard(week: 'current' | 'previous' = 'cur
         wins: num(e.wins),
         rugs: num(e.rugs),
         correctVotes: num(e.correctVotes),
-      });
+      };
+      const fx = toNameFx(e.cosmetics);
+      if (fx) entry.cosmetics = fx;
+      entries.push(entry);
     }
   }
   return {
@@ -338,6 +347,8 @@ function toBurnRecord(raw: unknown): BurnRecord | null {
   };
   const itemId = optItem(r.purpose, r.itemId);
   if (itemId) record.itemId = itemId;
+  const fx = toNameFx(r.cosmetics);
+  if (fx) record.cosmetics = fx;
   return record;
 }
 

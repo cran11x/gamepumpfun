@@ -72,10 +72,12 @@ import {
   getProfile,
   getRankedLeaderboard,
   grantBurn,
+  isImpersonatingName,
   rankedPoints,
   rankedWeek,
   recordRankedResults,
   resetStore,
+  setProfileName,
   upsertProfile,
   type RankedResultRecord,
 } from '../server/store';
@@ -322,8 +324,10 @@ interface FakeChain {
   mints: Map<string, { owner: string; data: Buffer }>;
   tokenAccounts: FakeTokenAccount[];
   txs: Map<string, Json>;
-  /** Signatures that stay invisible to getTransaction until revealed. */
+  /** Signatures that stay invisible to getTransaction (and getSignatureStatuses) until revealed. */
   hidden: Set<string>;
+  /** Signatures the cluster knows (getSignatureStatuses) while getTransaction still lags behind. */
+  lagging: Set<string>;
   /** Methods that answer HTTP 500. */
   failing: Set<string>;
   /** New transactions start hidden. */
@@ -342,6 +346,7 @@ function createChain(blockTime: () => number = () => Math.floor(Date.now() / 100
     tokenAccounts: [],
     txs: new Map(),
     hidden: new Set(),
+    lagging: new Set(),
     failing: new Set(),
     hideNew: false,
     blockhash: randomKey(),
@@ -393,7 +398,19 @@ function createChain(blockTime: () => number = () => Math.floor(Date.now() / 100
           break;
         case 'getTransaction': {
           const sig = req.params[0] as string;
-          result = chain.hidden.has(sig) ? null : (chain.txs.get(sig) ?? null);
+          result = chain.hidden.has(sig) || chain.lagging.has(sig) ? null : (chain.txs.get(sig) ?? null);
+          break;
+        }
+        case 'getSignatureStatuses': {
+          const [sigs] = req.params as [string[]];
+          result = {
+            context,
+            value: sigs.map((sig) =>
+              chain.txs.has(sig) && !chain.hidden.has(sig)
+                ? { slot: 372_418_811, confirmations: null, err: chain.txs.get(sig)!.meta.err, status: { Ok: null }, confirmationStatus: 'finalized' }
+                : null,
+            ),
+          };
           break;
         }
         default:
@@ -1029,6 +1046,17 @@ describe('burn service (live, fake RPC)', () => {
     chain.txs.get(sig3)!.blockTime = Math.floor((clock.now - INTENT_TTL_MS - UNCLAIMED_GRACE_MS) / 1000);
     expect(await service.confirm(p.address, { intentId: third.intentId, signature: sig3 })).toMatchObject({ status: 'confirmed' });
 
+    // getTransaction lagging behind the cluster: the status check knows the signature, so it is kept.
+    const lag = await service.createIntent(p.address, { purpose: 'ranked' });
+    const sigLag = chain.land(lag.transaction!);
+    chain.lagging.add(sigLag);
+    expect(await service.confirm(p.address, { intentId: lag.intentId, signature: sigLag })).toEqual({ status: 'pending' });
+    expect(chain.calls.some((c) => c.method === 'getSignatureStatuses' && c.params[0][0] === sigLag)).toBe(true);
+    clock.now += INTENT_TTL_MS + UNCLAIMED_GRACE_MS + 1;
+    chain.lagging.clear();
+    chain.txs.get(sigLag)!.blockTime = Math.floor((clock.now - INTENT_TTL_MS - UNCLAIMED_GRACE_MS) / 1000);
+    expect(await service.confirm(p.address, { intentId: lag.intentId, signature: sigLag })).toMatchObject({ status: 'confirmed' });
+
     const fourth = await service.createIntent(p.address, { purpose: 'ranked' });
     const sig4 = chain.land(fourth.transaction!, { blockTime: null });
     expect(await service.confirm(p.address, { intentId: fourth.intentId, signature: sig4 })).toEqual({ status: 'pending' });
@@ -1445,6 +1473,31 @@ describe('weekly ranked points', () => {
     expect(getRankedLeaderboard('current', now + 7 * 86_400_000).entries).toEqual([]);
   });
 
+  it('shows name effects on the board and in recent burns; names never copy another wallet', () => {
+    const now = Date.UTC(2026, 9, 14, 12);
+    const [a, b] = [walletKey(), walletKey()];
+    upsertProfile(a, now);
+    upsertProfile(b, now);
+    expect(grantBurn({ signature: mockSig(), intentId: 'cd'.repeat(16), address: a, purpose: 'cosmetic', itemId: 'name_fire', amount: 60_000, amountRaw: '60000000000', at: now }).ok).toBe(true);
+    recordRankedResults([rec(a, { won: true }), rec(b, { won: true })], now);
+    const board = getRankedLeaderboard('current', now).entries;
+    expect(board.find((e) => e.address === a)!.cosmetics).toEqual({ name: 'name_fire' });
+    expect(board.find((e) => e.address === b)!.cosmetics).toBeUndefined();
+    // Unequipping shows at once (equip doesn't bump the board's cache revision).
+    expect(equipCosmetic(a, 'name', null).ok).toBe(true);
+    expect(getRankedLeaderboard('current', now).entries.find((e) => e.address === a)!.cosmetics).toBeUndefined();
+    expect(equipCosmetic(a, 'name', 'name_fire').ok).toBe(true);
+    expect(getBurnTotals().recent[0]).toMatchObject({ address: a, nameEffect: 'name_fire' });
+
+    // A name that looks like ANOTHER wallet's short address is refused; your own is the default.
+    expect(isImpersonatingName(shortAddress(b), a)).toBe(true);
+    expect(isImpersonatingName(`${b.slice(0, 4)}...${b.slice(-4)}`, a)).toBe(true);
+    expect(isImpersonatingName(shortAddress(a), a)).toBe(false);
+    expect(isImpersonatingName('Rug Lord', a)).toBe(false);
+    expect(setProfileName(a, shortAddress(b))!.name).toBe(shortAddress(a));
+    expect(setProfileName(a, 'Rug Lord')!.name).toBe('Rug Lord');
+  });
+
   it('ties break on wins, then fewer games, then who got there first; at most 50 entries', () => {
     const now = Date.UTC(2026, 9, 14, 12);
     const [x, y, z, v] = [walletKey(), walletKey(), walletKey(), walletKey()];
@@ -1561,6 +1614,19 @@ describe('HTTP burn, equip and ranked routes (mock mode)', () => {
     for (const body of [{ slot: 'rug', itemId: 'rug_gold' }, { slot: 'skin', itemId: 'rug_frog' }, { slot: 'hat', itemId: 'rug_frog' }, { slot: 'rug', itemId: 5 }, { slot: 'rug' }]) {
       expect((await call('POST', '/me/equip', body, token)).status).toBe(400);
     }
+  });
+
+  it('POST /me/name refuses a name that copies another wallet; GET /burns/stats carries name effects', async () => {
+    const { token } = await login();
+    const other = walletKey();
+    const bad = await call('POST', '/me/name', { name: shortAddress(other) }, token);
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { error: string }).error).toMatch(/another wallet/);
+    expect((await call('POST', '/me/name', { name: 'Degen' }, token)).status).toBe(200);
+    const intent = (await (await call('POST', '/burn/intent', { purpose: 'cosmetic', itemId: 'name_rainbow' }, token)).json()) as BurnIntent;
+    await call('POST', '/burn/confirm', { intentId: intent.intentId, signature: mockSig() }, token);
+    const stats = (await (await call('GET', '/burns/stats')).json()) as BurnStats;
+    expect(stats.recent[0]).toMatchObject({ name: 'Degen', cosmetics: { name: 'name_rainbow' } });
   });
 
   it('GET /leaderboard/ranked serves this week and last week', async () => {

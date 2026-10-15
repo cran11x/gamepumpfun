@@ -68,7 +68,6 @@ function silhouette(g: G, f: SkinFrame): void {
 interface Grads {
   lens: CanvasGradient;
   lensSheen: CanvasGradient;
-  goldLegs: CanvasGradient;
   goldBand: CanvasGradient;
   goldRim: CanvasGradient;
   crown: CanvasGradient;
@@ -90,11 +89,6 @@ function grads(g: G): Grads {
   const lensSheen = g.createLinearGradient(-9, 0, 9, 0);
   lensSheen.addColorStop(0, '#9945ff');
   lensSheen.addColorStop(1, '#14f195');
-  const goldLegs = g.createLinearGradient(0, 4, 0, 16);
-  goldLegs.addColorStop(0, '#fff3a8');
-  goldLegs.addColorStop(0.35, '#ffd23a');
-  goldLegs.addColorStop(0.75, '#d99a00');
-  goldLegs.addColorStop(1, '#8a5c00');
   const goldBand = g.createLinearGradient(0, PILL_CY - 1.8, 0, PILL_CY + 1.8);
   goldBand.addColorStop(0, '#fff3a8');
   goldBand.addColorStop(0.45, '#ffcc2e');
@@ -125,7 +119,7 @@ function grads(g: G): Grads {
   laserGlow.addColorStop(0, 'rgba(255,236,200,0.95)');
   laserGlow.addColorStop(0.3, 'rgba(255,110,50,0.7)');
   laserGlow.addColorStop(1, 'rgba(255,60,20,0)');
-  k = { lens, lensSheen, goldLegs, goldBand, goldRim, crown, crownBand, beamCore, beamOuter, laserGlow };
+  k = { lens, lensSheen, goldBand, goldRim, crown, crownBand, beamCore, beamOuter, laserGlow };
   gradCache.set(g, k);
   return k;
 }
@@ -280,13 +274,14 @@ function trianglesPath(g: G, tris: readonly number[]): void {
 function diamondSurface(g: G, f: SkinFrame): void {
   const a0 = g.globalAlpha;
   const shimmer = f.moving ? 0.5 + 0.5 * Math.sin(f.t * 9 + f.seed) : 0.5 + 0.5 * Math.sin(f.t * 2.2 + f.seed);
+  // Light facets stay gentle so the saturated player color shows through (Red vs Pink stays clear).
   trianglesPath(g, TRI_LIGHT);
   g.fillStyle = 'rgba(255,255,255,1)';
-  g.globalAlpha = a0 * (0.32 + 0.16 * shimmer);
+  g.globalAlpha = a0 * (0.2 + 0.12 * shimmer);
   g.fill();
   trianglesPath(g, TRI_MID);
   g.fillStyle = 'rgba(190,240,255,1)';
-  g.globalAlpha = a0 * (0.14 + 0.1 * (1 - shimmer));
+  g.globalAlpha = a0 * (0.1 + 0.08 * (1 - shimmer));
   g.fill();
   trianglesPath(g, TRI_DARK);
   g.fillStyle = 'rgba(0,10,30,1)';
@@ -487,23 +482,21 @@ function laserOver(g: G, f: SkinFrame): void {
   }
 }
 
-// ---------- Gold Bag ----------
-
-function goldLegs(g: G): CanvasGradient {
-  return grads(g).goldLegs;
-}
+// ---------- Gold Trim ----------
+// Gold stays a trim: a thin rim, the seam band and a shine sweep on the off-white half. The legs and the
+// colored cap keep the player's own color, so a Gold Trim pill never reads as "the gold player".
 
 function goldSurface(g: G, f: SkinFrame): void {
   const a0 = g.globalAlpha;
-  // Warm the off-white half into cream gold.
-  g.fillStyle = 'rgba(255,200,40,1)';
-  g.globalAlpha = a0 * 0.22;
-  g.fillRect(-PILL_R - 1, PILL_CY, PILL_W + 2, PILL_H / 2 + 12);
-  // Shine sweep.
+  g.save();
+  // Only the off-white half: the colored cap stays a solid player color.
+  g.beginPath();
+  g.rect(-PILL_R - 2, PILL_CY + 1.7, PILL_W + 4, PILL_H);
+  g.clip();
   const p = ((f.t + f.seed * 0.01) % 2.8) / 2.8;
   const x = -26 + p * 56;
-  g.globalAlpha = a0 * 0.5;
-  g.fillStyle = '#ffffff';
+  g.globalAlpha = a0 * 0.4;
+  g.fillStyle = '#fff6cf';
   g.beginPath();
   g.moveTo(x, PILL_TOP - 4);
   g.lineTo(x + 5, PILL_TOP - 4);
@@ -511,7 +504,7 @@ function goldSurface(g: G, f: SkinFrame): void {
   g.lineTo(x - 14, PILL_BOTTOM + 6);
   g.closePath();
   g.fill();
-  g.globalAlpha = a0 * 0.7;
+  g.globalAlpha = a0 * 0.55;
   g.beginPath();
   g.moveTo(x + 7, PILL_TOP - 4);
   g.lineTo(x + 8.6, PILL_TOP - 4);
@@ -519,6 +512,7 @@ function goldSurface(g: G, f: SkinFrame): void {
   g.lineTo(x - 7, PILL_BOTTOM + 6);
   g.closePath();
   g.fill();
+  g.restore();
   g.globalAlpha = a0;
 }
 
@@ -537,7 +531,7 @@ function goldOver(g: G, f: SkinFrame): void {
     silhouette(g, f);
   }
   g.strokeStyle = k.goldRim;
-  g.lineWidth = 1.5;
+  g.lineWidth = 1;
   g.stroke();
   const tw = twinkle(f.t, 1.9, f.seed, 12);
   if (tw > 0.04) sparkle(g, -8.5, PILL_TOP + 4.5, 3.6 * tw, 'rgba(255,250,220,0.95)');
@@ -701,7 +695,7 @@ const SKINS: Record<string, SkinPainter> = {
   skin_diamond: { headroom: 0, surface: diamondSurface, over: diamondOver },
   skin_onchain: { headroom: 0, surface: onchainSurface },
   skin_laser: { headroom: 0, over: laserOver },
-  skin_gold: { headroom: 0, legs: goldLegs, surface: goldSurface, over: goldOver },
+  skin_gold: { headroom: 0, surface: goldSurface, over: goldOver },
   skin_crown: { headroom: 11, over: crownOver },
   skin_holo: { headroom: 0, surface: holoSurface },
 };

@@ -4556,6 +4556,42 @@ textarea {
   box-shadow: 0 0 22px rgba(255, 59, 92, 0.5);
 }
 
+.over-ranked {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 6px;
+  animation: fade-in 0.4s 0.7s ease both;
+}
+
+.over-ranked-pts {
+  font-family: var(--font-title);
+  font-size: 14px;
+  letter-spacing: 0.04em;
+  color: var(--gold, #ffd400);
+}
+
+.over-ranked-pts.is-neg,
+.over-card-pts.is-neg {
+  color: var(--dim);
+}
+
+.over-nocontest {
+  max-width: 460px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.over-card-pts {
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--gold, #ffd400);
+}
+
 .over-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
@@ -4687,7 +4723,8 @@ textarea {
 
   .over-card-meta {
     flex-direction: row;
-    gap: 6px;
+    flex-wrap: wrap;
+    gap: 0 6px;
   }
 
   .over-card-pill .pill {
@@ -5875,8 +5912,8 @@ textarea {
   text-decoration: none;
 }
 
-.burns-row-link--none {
-  display: block;
+.burns-row--nolink {
+  grid-template-columns: 30px minmax(0, 1fr) auto;
 }
 
 /* ---------- Shop ---------- */
@@ -5992,10 +6029,13 @@ textarea {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  max-width: 100%;
+  min-width: 0;
   padding: 2px 8px;
   border-radius: 7px;
   background: rgba(255, 255, 255, 0.05);
   font-size: 12px;
+  white-space: nowrap;
 }
 
 .shop-me-look li.is-trying {
@@ -6010,7 +6050,15 @@ textarea {
 }
 
 .shop-me-item {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-weight: 600;
+}
+
+.shop-me-slot,
+.shop-me-try {
+  flex: none;
 }
 
 .shop-me-try {
@@ -6520,13 +6568,25 @@ textarea {
 }
 
 .nfx-fire {
-  background-image: linear-gradient(0deg, #ff8f0f 0%, #ffc23a 55%, #fff3b0 100%);
+  /* A tall orange-to-white gradient that licks upward, plus a flame mark: never mistaken for Gold Glow. */
+  background-image: linear-gradient(0deg, #ff7a00 0%, #ffa21f 22%, #ffd34d 40%, #fff3b0 50%, #ff9a1f 62%, #ffc23a 80%, #fff3b0 100%);
+  background-size: 100% 240%;
+  background-position: 0 100%;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent !important;
   -webkit-text-fill-color: transparent;
   filter: drop-shadow(0 0 5px rgba(255, 140, 0, 0.6));
-  animation: nfx-fire 1.3s ease-in-out infinite;
+  animation: nfx-fire 1.1s ease-in-out infinite alternate;
+}
+
+.nfx-fire::before {
+  content: '🔥';
+  display: inline-block;
+  margin-right: 0.2em;
+  font-size: 0.9em;
+  -webkit-text-fill-color: initial;
+  animation: flame 0.9s ease-in-out infinite;
 }
 
 .nfx-rainbow::after,
@@ -6541,12 +6601,16 @@ textarea {
 }
 
 @keyframes nfx-fire {
-  0%,
-  100% {
+  0% {
+    background-position: 0 100%;
     filter: drop-shadow(0 0 4px rgba(255, 140, 0, 0.55));
   }
-  50% {
-    filter: drop-shadow(0 -1px 8px rgba(255, 190, 40, 0.8));
+  45% {
+    filter: drop-shadow(0 -2px 9px rgba(255, 170, 30, 0.85));
+  }
+  100% {
+    background-position: 0 0;
+    filter: drop-shadow(0 -1px 6px rgba(255, 150, 20, 0.7));
   }
 }
 
@@ -6578,6 +6642,8 @@ textarea {
 
 @media (prefers-reduced-motion: reduce) {
   .nfx,
+  .nfx::before,
+  .nfx::after,
   .home-burns-ico,
   .burn-amount .ico,
   .burns-total-ico,
@@ -6602,9 +6668,13 @@ textarea {
     gap: 8px;
   }
 
+  /* Three tabs share the row exactly: no 2px overflow, no side-scroll clipping a border. */
   .shop-tab {
-    flex: 1;
+    flex: 1 1 0;
+    min-width: 0;
     justify-content: center;
+    gap: 5px;
+    padding: 9px 6px;
   }
 
   .shop-tab-long {

@@ -116,8 +116,15 @@ function hslHex(h: number, s: number, l: number): string {
   return `#${f(0)}${f(8)}${f(4)}`;
 }
 
-/** Rainbow without red: hues sweep orange -> yellow -> green -> cyan -> blue -> violet and back. */
-const RAINBOW: readonly string[] = Array.from({ length: 64 }, (_, k) => hslHex(42 + 248 * (0.5 - 0.5 * Math.cos((2 * Math.PI * k) / 64)), 1, 0.62));
+/**
+ * Rainbow without red: hues sweep orange -> yellow -> green -> cyan -> blue -> violet and back. Blues
+ * and violets are lifted so they keep their contrast on the dark floor.
+ */
+const RAINBOW: readonly string[] = Array.from({ length: 64 }, (_, k) => {
+  const hue = 42 + 248 * (0.5 - 0.5 * Math.cos((2 * Math.PI * k) / 64));
+  const lift = Math.max(0, Math.min(1, (hue - 190) / 50));
+  return hslHex(hue, 1, 0.62 + 0.12 * lift);
+});
 
 const OUTLINE = 'rgba(4,6,9,0.85)';
 
@@ -203,8 +210,9 @@ function glitchFx(g: G, font: string, text: string, x: number, y: number, size: 
   const bucket = Math.floor(t * 9);
   const h = hash01(bucket * 131 + seed * 7);
   const on = h < 0.22;
-  const jit = on ? (hash01(bucket * 17 + 3) - 0.5) * size * 0.4 : 0;
-  const split = size * (on ? 0.13 : 0.075);
+  const jit = on ? (hash01(bucket * 17 + 3) - 0.5) * Math.max(4, size * 0.4) : 0;
+  // At small label sizes the split would vanish below a pixel: keep it visible.
+  const split = on ? Math.max(2.2, size * 0.13) : Math.max(1.5, size * 0.075);
   const mx = x + jit * 0.5;
   g.strokeStyle = OUTLINE;
   g.lineWidth = Math.max(2, size * 0.3);
@@ -257,7 +265,8 @@ function fireFx(g: G, font: string, text: string, x: number, y: number, size: nu
   const w = textInfo(g, font, text, false).width;
   const n = Math.max(3, Math.round(w / (size * 0.42)));
   const cell = w / n;
-  const base = y - size * 0.58;
+  // Flames rise from just above the capitals, so they never sit over the letters (or a "…").
+  const base = y - size * 0.74;
   g.save();
   g.globalCompositeOperation = 'lighter';
   for (let pass = 0; pass < 2; pass++) {
@@ -267,7 +276,7 @@ function fireFx(g: G, font: string, text: string, x: number, y: number, size: nu
     for (let i = 0; i < n; i++) {
       const fx = x - w / 2 + (i + 0.5) * cell;
       const fl = 0.55 + 0.45 * Math.sin(t * 9 + i * 1.7 + seed) * Math.sin(t * 5.3 + i * 2.9);
-      const hgt = size * (0.42 + 0.42 * fl) * k;
+      const hgt = size * (0.34 + 0.34 * fl) * k;
       const fw = cell * 0.62 * k;
       const sway = Math.sin(t * 6 + i * 1.3) * size * 0.1;
       g.moveTo(fx - fw, base);

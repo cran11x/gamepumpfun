@@ -70,7 +70,10 @@ import {
 export const INTENT_TTL_MS = 10 * 60 * 1000;
 /** An intent nobody tried to confirm can still be confirmed this long after it expired. */
 export const UNCLAIMED_GRACE_MS = 15 * 60 * 1000;
-/** An intent a confirm call named a signature for stays confirmable this long after creation. */
+/**
+ * A claimed intent (the chain showed a transaction this wallet signed for it, or the chain couldn't be
+ * asked) stays confirmable this long after creation.
+ */
 export const CLAIMED_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const MAX_OPEN_INTENTS_PER_WALLET = 5;
 /** Every intent a wallet has stored (open, in its grace period, or claimed) counts toward this. */
@@ -526,10 +529,15 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
     let tx: ParsedTransactionWithMeta | null = null;
     /** The chain couldn't be asked (RPC error, or the server-wide lookup budget ran out). */
     let unasked = false;
+    /** This wallet ran out of its own lookup budget. */
+    let overBudget = false;
     for (;;) {
       // Out of this wallet's own budget: pending, try later. Out of the server's: same, but it isn't
       // the player's doing, so their intent is kept as if the chain had vouched for it.
-      if (!walletLookups.take(wallet)) break;
+      if (!walletLookups.take(wallet)) {
+        overBudget = true;
+        break;
+      }
       if (!globalLookups.take('*')) {
         unasked = true;
         break;
@@ -544,9 +552,25 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
       if (tx || stopped || now() + pollIntervalMs > deadline) break;
       await sleep(pollIntervalMs);
     }
+    // getTransaction can lag behind the cluster (indexing): one cheap status check tells a real send
+    // (the cluster knows the signature) from a junk one.
+    let known = false;
+    if (!tx && !unasked && !overBudget && !stopped && rpc!.getSignatureStatus) {
+      if (!globalLookups.take('*')) {
+        unasked = true;
+      } else {
+        try {
+          known = (await rpc!.getSignatureStatus(signature)) !== null;
+        } catch (err) {
+          log('getSignatureStatuses failed:', (err as Error)?.message ?? err);
+          unasked = true;
+        }
+      }
+    }
     // Keep the intent confirmable for a day only when the chain shows this wallet signed this very
-    // transaction, or when the chain couldn't be asked. Junk signatures never extend an intent.
-    if (tx ? signedBy(tx, signature, wallet) : unasked) markBurnIntentClaimed(intent.id);
+    // transaction (or at least knows the signature), or when the chain couldn't be asked. Signatures
+    // the cluster has never seen never extend an intent.
+    if (tx ? signedBy(tx, signature, wallet) : known || unasked) markBurnIntentClaimed(intent.id);
     if (!tx) return { status: 'pending' };
     const check = verifyBurn(tx, {
       signature,

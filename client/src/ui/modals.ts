@@ -5,6 +5,7 @@ import type { LeaderboardEntry, PlayerStats, RankedLeaderboard } from '../../../
 import { fetchLeaderboard, fetchRankedLeaderboard, LEADERBOARD_SORTS, type LeaderboardSort } from '../api';
 import type { ModalHandle, ModalOpts, UiCore } from './core';
 import { button, h, icon, toggleClass } from './dom';
+import { nameSpan } from './names';
 import { pillSvg } from './pill';
 import { formatTokens, nextWeekStartUtc, resetCountdown } from './ranked';
 
@@ -190,7 +191,7 @@ export function openLeaderboard(core: UiCore, initial: LbTab = 'wins'): void {
             'div',
             { class: `lb-row lb-row--ranked${rank <= 3 ? ` lb-row--top${rank}` : ''}${me && r.address === me ? ' lb-row--me' : ''}` },
             h('span', { class: 'lb-rank', text: `#${rank}` }),
-            h('span', { class: 'lb-who' }, h('span', { class: 'lb-name', text: r.name }), h('span', { class: 'lb-addr', text: r.shortAddress })),
+            h('span', { class: 'lb-who' }, nameSpan(r.name, r.cosmetics, false, 'lb-name'), h('span', { class: 'lb-addr', text: r.shortAddress })),
             h('span', { class: 'lb-sub', text: `${r.games} GP · ${r.wins}W` }),
             h('span', { class: `lb-val${r.points < 0 ? ' is-neg' : ''}` }, String(r.points), h('small', { text: 'PTS' })),
           ),

@@ -19,7 +19,8 @@ export function createRoleReveal(core: UiCore): Screen {
     const meView = snap.players.find((p) => p.id === me.id);
     const myColor = meView?.color ?? core.who(me.id)?.color ?? 0;
     const playerCount = snap.players.length;
-    const ruggers = Math.min(snap.room.settings.ruggers, maxRuggersFor(playerCount));
+    // The server says how many really play (ranked always plays maxRuggersFor(players)).
+    const ruggers = snap.room.ruggerCount ?? Math.min(snap.room.settings.ruggers, maxRuggersFor(playerCount));
     el.classList.add(rugger ? 'reveal--rugger' : 'reveal--holder');
 
     const team = h('div', { class: 'reveal-team' });

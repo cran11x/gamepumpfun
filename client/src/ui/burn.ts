@@ -11,6 +11,7 @@ import { fetchBurnStats } from '../api';
 import type { BurnStage } from '../context';
 import type { BurnModalOpts, ModalHandle, UiCore } from './core';
 import { button, clear, h, icon, setText } from './dom';
+import { nameSpan } from './names';
 import { createPillPreview } from './previews';
 import { burnCopy, burnWhat, formatTokens, isPendingBurnError, purchasePrice, receiptToast, slotNoun, timeAgo } from './ranked';
 
@@ -22,6 +23,9 @@ const STAGES: ReadonlyArray<{ id: BurnStage; label: string }> = [
 ];
 
 type State = 'ready' | 'busy' | 'pending' | 'error' | 'done';
+
+/** How long "Confirming on-chain" runs before the modal explains the wait. */
+const SLOW_CONFIRM_MS = 5000;
 
 /** "TEST MODE: no real tokens" badge (mock mode only). */
 export function testModeBadge(): HTMLElement {
@@ -66,7 +70,7 @@ export function openBurnModal(core: UiCore, opts: BurnModalOpts): ModalHandle | 
   const ticker = cfg.ticker;
   const req = opts.request;
   if (mode === 'off') {
-    core.toast('Burns open when the token launches.', 'info');
+    core.toast("Burns aren't available yet.", 'info');
     return null;
   }
   const amount = purchasePrice(cfg.burn, req);
@@ -81,6 +85,12 @@ export function openBurnModal(core: UiCore, opts: BurnModalOpts): ModalHandle | 
   let failedAt: BurnStage | null = null;
   let closed = false;
   let message = '';
+  /** Long on-chain confirms: after a few seconds, say what is going on and that closing is safe. */
+  let slowTimer: number | null = null;
+  const stopSlowTimer = () => {
+    if (slowTimer !== null) window.clearTimeout(slowTimer);
+    slowTimer = null;
+  };
 
   // ----- Offer -----
   let visual: HTMLElement;
@@ -318,10 +328,20 @@ export function openBurnModal(core: UiCore, opts: BurnModalOpts): ModalHandle | 
     try {
       const r = await ctx.wallet.burn(req, (st) => {
         reached = st;
+        if (st === 'confirming' && slowTimer === null) {
+          slowTimer = window.setTimeout(() => {
+            slowTimer = null;
+            if (closed || state !== 'busy' || reached !== 'confirming') return;
+            message = "Waiting for Solana to confirm. This can take up to a minute. You can close this window: we keep checking and tell you when it lands.";
+            render();
+          }, SLOW_CONFIRM_MS);
+        }
         if (state === 'busy') render();
       });
+      stopSlowTimer();
       succeed(r);
     } catch (err) {
+      stopSlowTimer();
       fail(err instanceof Error ? err.message : '');
     }
   }
@@ -363,6 +383,7 @@ export function openBurnModal(core: UiCore, opts: BurnModalOpts): ModalHandle | 
     dismissible: () => state !== 'busy',
     onClose: () => {
       closed = true;
+      stopSlowTimer();
     },
   });
   const offWallet = ctx.wallet.onChange(() => {
@@ -421,21 +442,22 @@ export function openRecentBurns(core: UiCore): void {
         const now = Date.now();
         for (const r of st.recent) {
           const link = safeExplorer(r.explorerUrl);
+          // No Solscan link (test mode): no empty column either, so the "what · when" line keeps its room.
           list.append(
             h(
               'div',
-              { class: 'burns-row' },
+              { class: `burns-row${link ? '' : ' burns-row--nolink'}` },
               h('span', { class: 'burns-row-ico' }, icon(r.purpose === 'ranked' ? 'ticket' : 'sparkle')),
               h(
                 'span',
                 { class: 'burns-row-who' },
-                h('span', { class: 'burns-row-name', text: r.name || r.shortAddress || 'anon' }),
+                nameSpan(r.name || r.shortAddress || 'anon', r.cosmetics, false, 'burns-row-name'),
                 h('span', { class: 'burns-row-what', text: `${recordWhat(r)} · ${timeAgo(r.at, now)}` }),
               ),
               h('span', { class: 'burns-row-amt', text: formatTokens(r.amount) }),
               link
                 ? h('a', { class: 'icon-btn burns-row-link', attrs: { href: link, target: '_blank', rel: 'noopener noreferrer', 'aria-label': 'View on Solscan', title: 'View on Solscan' } }, icon('external'))
-                : h('span', { class: 'burns-row-link burns-row-link--none' }),
+                : null,
             ),
           );
         }

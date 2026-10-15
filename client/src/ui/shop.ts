@@ -98,7 +98,7 @@ export function openShop(core: UiCore): void {
     banner.hidden = false;
     if (off) {
       banner.className = 'shop-banner shop-banner--soon';
-      banner.append(icon('flame'), h('div', null, h('strong', { text: 'Shop opens when the token launches.' }), h('span', { text: ' Browse the looks now.' })));
+      banner.append(icon('flame'), h('div', null, h('strong', { text: "The shop isn't open yet." }), h('span', { text: ' Browse the looks now.' })));
       return;
     }
     if (!profile()) {
@@ -130,7 +130,13 @@ export function openShop(core: UiCore): void {
         ),
       );
     }
-    setText(meHint, tryOn ? 'Tap the card again to stop trying it on.' : 'Tap a card to try it on. Rugs only show under your own rugged bag.');
+    const tap = core.isTouch() ? 'Tap' : 'Click';
+    setText(
+      meHint,
+      tryOn
+        ? `${tap} the card again to stop trying it on.`
+        : `${tap} a card to try it on. Everyone sees your rug under your bag when you get rugged; your ejection ride shows it to you only.`,
+    );
   }
 
   function itemButton(item: CosmeticItem): HTMLElement {
@@ -163,7 +169,14 @@ export function openShop(core: UiCore): void {
     }
     tryOn = { slot: item.slot, id: item.id };
     refresh();
-    core.openBurn({ request: { purpose: 'cosmetic', itemId: item.id }, onDone: () => refresh() });
+    core.openBurn({
+      request: { purpose: 'cosmetic', itemId: item.id },
+      onDone: () => {
+        // Bought (and usually equipped): it isn't a try-on any more.
+        if (tryOn?.id === item.id) tryOn = null;
+        refresh();
+      },
+    });
   }
 
   async function equip(s: CosmeticSlot, id: string | null): Promise<void> {

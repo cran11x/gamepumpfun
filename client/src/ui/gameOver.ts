@@ -1,9 +1,10 @@
 // Game over: GRADUATED (holders) or RUGGED (ruggers), reason, every role, BACK TO LOBBY (host) / LEAVE.
 
-import type { GameOverReason, Role, Snapshot } from '../../../shared/protocol';
+import { RANKED_POINTS } from '../../../shared/constants';
+import type { GameOverReason, GameOverView, Role, Snapshot } from '../../../shared/protocol';
 import { createChat } from './chat';
 import type { Screen, UiCore } from './core';
-import { button, clear, h, setHidden, setText } from './dom';
+import { button, clear, h, icon, setHidden, setText } from './dom';
 import { pillSvg } from './pill';
 import { applyNameFx } from './names';
 import { createPillPreview, type PillPreview } from './previews';
@@ -25,6 +26,9 @@ export function createGameOver(core: UiCore): Screen {
   const grid = h('div', { class: 'over-grid' });
   const backBtn = button('BACK TO LOBBY', { cls: 'btn--green', icon: 'users', onClick: () => ctx.net.send({ t: 'backToLobby' }) });
   const leaveBtn = button('LEAVE', { cls: 'btn--ghost', icon: 'door', onClick: () => core.leaveRoom() });
+  const weekBtn = button('THIS WEEK', { cls: 'btn--ghost', icon: 'trophy', onClick: () => core.openLeaderboardAt('rankedCurrent') });
+  weekBtn.id = 'btn-over-week';
+  weekBtn.hidden = true;
   const waitEl = h('span', { class: 'over-wait' }, h('span', { class: 'spinner' }), 'Waiting for the host…');
   const chat = createChat(core, {
     channels: ['lobby', 'system'],
@@ -43,7 +47,7 @@ export function createGameOver(core: UiCore): Screen {
       { class: 'over-inner' },
       head,
       grid,
-      h('div', { class: 'over-actions' }, backBtn, waitEl, leaveBtn),
+      h('div', { class: 'over-actions' }, backBtn, waitEl, weekBtn, leaveBtn),
       h('div', { class: 'over-chatwrap panel' }, chat.el),
     ),
   );
@@ -61,6 +65,19 @@ export function createGameOver(core: UiCore): Screen {
       h('div', { class: 'over-reason', text: REASON_TEXT[go.reason] ?? '' }),
     );
     if (won !== null) head.append(h('div', { class: `over-you ${won ? 'is-win' : 'is-loss'}`, text: won ? 'YOU WON' : 'YOU LOST' }));
+    if (snap.room.ranked) {
+      weekBtn.hidden = false;
+      const mine = snap.me ? go.rankedPoints?.[snap.me.id] : undefined;
+      head.append(
+        h(
+          'div',
+          { class: 'over-ranked' },
+          h('span', { class: 'chip chip--sm chip--ranked' }, icon('trophy'), 'RANKED'),
+          mine !== undefined ? h('span', { class: `over-ranked-pts${mine < 0 ? ' is-neg' : ''}`, text: `${signed(mine)} PTS THIS WEEK` }) : null,
+        ),
+      );
+      if (go.noContest) head.append(h('div', { class: 'over-nocontest', text: 'No contest: players left, so nobody gets win points. Rugs, tasks and correct votes still count.' }));
+    }
   }
 
   function renderRoster(snap: Snapshot): void {
@@ -103,6 +120,7 @@ export function createGameOver(core: UiCore): Screen {
       const red = isAllyRed(myRole, r.role === 'rugger');
       const name = h('span', { class: `over-card-name${red ? ' is-ally' : ''}`, text: r.name });
       applyNameFx(name, r.looks, red);
+      const pts = snap.room.ranked ? rankedPointsOf(go, r.id, r.left) : undefined;
       grid.append(
         h(
           'div',
@@ -117,6 +135,7 @@ export function createGameOver(core: UiCore): Screen {
               { class: 'over-card-meta' },
               h('span', { class: 'over-card-role', text: r.role === 'rugger' ? 'RUGGER' : 'HOLDER' }),
               h('span', { class: 'over-card-state', text: r.left ? 'LEFT' : r.alive ? 'ALIVE' : 'OUT' }),
+              pts !== undefined ? h('span', { class: `over-card-pts${pts < 0 ? ' is-neg' : ''}`, text: `${signed(pts)} PTS` }) : null,
             ),
           ),
         ),
@@ -140,6 +159,17 @@ export function createGameOver(core: UiCore): Screen {
       for (const pv of previews) pv.destroy();
     },
   };
+}
+
+function signed(n: number): string {
+  return n > 0 ? `+${n}` : String(n);
+}
+
+/** Ranked points of one game-over card: the server's number, or leftEarly for someone who left mid-game. */
+function rankedPointsOf(go: GameOverView, id: string, left: boolean): number | undefined {
+  const n = go.rankedPoints?.[id];
+  if (typeof n === 'number') return n;
+  return left && go.rankedPoints ? RANKED_POINTS.leftEarly : undefined;
 }
 
 function fx(i: number): HTMLElement {

@@ -279,7 +279,12 @@ export function createHome(core: UiCore): Screen {
   const ticketLink = h('button', { class: 'home-link', type: 'button' }, icon('ticket'), h('span', { text: 'GET TICKET' }));
   ticketLink.id = 'btn-get-ticket';
   ticketLink.addEventListener('click', () => buyTicket(null));
-  const privLink = h('button', { class: 'home-link', type: 'button', title: 'Create a private ranked room for friends' }, icon('lock'), h('span', { text: 'PRIVATE ROOM' }));
+  const privLink = h(
+    'button',
+    { class: 'home-link', type: 'button', title: 'Create a private ranked room: friends join with the code, strangers never land in it' },
+    icon('lock'),
+    h('span', { text: 'PRIVATE ROOM' }),
+  );
   privLink.id = 'btn-create-ranked';
   privLink.addEventListener('click', () => ranked('create'));
   const weekLink = h('button', { class: 'home-link', type: 'button' }, icon('trophy'), h('span', { text: 'THIS WEEK' }));
@@ -387,7 +392,8 @@ export function createHome(core: UiCore): Screen {
       }
       msg = { t: 'join', code, name, ...auth };
     } else if (kind === 'create') {
-      msg = rankedRoom ? { t: 'create', name, ...auth, ranked: true } : { t: 'create', name, ...auth };
+      // The ranked create is the PRIVATE ROOM link: friends join by code, quick play never fills it.
+      msg = rankedRoom ? { t: 'create', name, ...auth, ranked: true, isPublic: false } : { t: 'create', name, ...auth };
     } else {
       msg = rankedRoom ? { t: 'quick', name, ...auth, ranked: true } : { t: 'quick', name, ...auth };
     }

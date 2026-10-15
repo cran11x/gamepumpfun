@@ -345,10 +345,10 @@ Burned tokens are destroyed with the SPL Token `BurnChecked` instruction from th
 | `TOKEN_MINT` | SPL mint. Unset means `mode: 'off'`, and the client hides every burn feature. |
 | `SOLANA_RPC_URL` | Required for live mode, e.g. a Helius URL. Default `https://api.mainnet-beta.solana.com`. |
 | `SOLANA_CLUSTER` | `mainnet-beta` (default) or `devnet`. Used for explorer links. |
-| `BURN_MODE` | `mock` enables mock mode for local testing and e2e. The server REFUSES to start in mock mode when `NODE_ENV=production`. Otherwise the mode is `live` when `TOKEN_MINT` is set and `off` when it isn't. |
+| `BURN_MODE` | `mock` enables mock mode for local testing and e2e. The server REFUSES to start in mock mode when `NODE_ENV=production` (any case) and whenever `TOKEN_MINT` is set. Mock-mode data lives in its own file (`DATA_DIR/db.mock.json`), so fake tickets and looks never carry over to a live server. Otherwise the mode is `live` when `TOKEN_MINT` is set and `off` when it isn't. |
 | `RANKED_ENTRY_PRICE`, `COSMETIC_PRICE_MULTIPLIER` | As above. |
 
-At startup in live mode the server reads the mint account via RPC. It records the decimals and the owning token program, either classic Token or Token-2022, and uses them for every transaction.
+At startup in live mode the server reads the mint account via RPC. It records the decimals and the owning token program, either classic Token or Token-2022, and uses them for every transaction. It logs a loud warning when the mint still has a mint authority or a Token-2022 permanent delegate.
 
 ### Burn flow (`server/solana.ts` + `server/burns.ts`, routes in `server/api.ts`)
 1. `POST /api/burn/intent {purpose, itemId?}` with a Bearer session.
@@ -356,7 +356,8 @@ At startup in live mode the server reads the mint account via RPC. It records th
      - the mode is not off
      - the purpose and item are valid
      - a cosmetic is not already owned
-     - at most 5 open intents per wallet
+     - at most 5 open intents per wallet, and at most 10 stored intents (open, in their grace period, or claimed); idle ones are dropped first
+     - a cosmetic with an intent already on its way (a signature was named for it) is refused with 409; an idle open intent for the same cosmetic is handed out again with a fresh transaction (same id and memo), so two windows can't pay twice for one item
    - **Creates an intent:** a random nonce, the wallet, the purpose, the item, `amountRaw`, and a 10-minute expiry.
    - **The memo** is exactly `AMONGRUGS <purpose>[:<itemId>] <nonce>`.
    - **Live mode only:**
@@ -368,12 +369,15 @@ At startup in live mode the server reads the mint account via RPC. It records th
 3. `POST /api/burn/confirm {intentId, signature}` with Bearer.
    - **The intent must:** belong to the caller, be unexpired (or created at most 10 minutes plus a grace before), and be unused.
    - **Signatures are single use forever.** Persist them in the store; a replay returns 409, but the same intent and the same signature again returns the original receipt (idempotent).
+   - **At most 2 distinct signatures per intent**, bound before any chain lookup; a third returns 409. In-flight confirms are keyed by signature + wallet + intent, so one caller never blocks another's confirm.
+   - **Lookup budgets:** `getTransaction` calls are token-bucketed per wallet (40/min) and server-wide (1200/min). Out of budget means 202 pending (the client retries later).
+   - **Retention:** an intent is kept confirmable for 24 h only when the chain shows a transaction this wallet signed for it, when `getSignatureStatuses` knows the signature while `getTransaction` still lags (one cheap call after the polling), or when the chain couldn't be asked (RPC error, server-wide budget). Signatures the cluster has never seen don't extend it.
    - **Live verification:**
      - poll `getTransaction(signature, {commitment: 'confirmed', maxSupportedTransactionVersion: 0, encoding: 'jsonParsed'})` for up to about 25 s; still missing means 202 `{status: 'pending'}`
      - the transaction must have `meta.err === null`
-     - the wallet must be a signer
-     - a memo instruction must contain the intent nonce
-     - the burned amount must be ≥ `amountRaw`, summed over parsed `burn`/`burnChecked` instructions (top level and inner) whose authority is the wallet and whose mint is `TOKEN_MINT`; for plain `burn`, resolve the mint through `meta.preTokenBalances`
+     - the signature must be the transaction id (`signatures[0]`), and the wallet must be a signer
+     - there must be exactly one memo instruction (top level or inner), equal to the intent memo, so one transaction can't pay for two intents
+     - the burned amount must be ≥ `amountRaw`, summed over parsed `burn`/`burnChecked` instructions (top level and inner) whose authority is the wallet, whose account the wallet owns (`meta.preTokenBalances[].owner`; a delegate or permanent delegate burning someone else's tokens never counts, and a missing owner fails closed) and whose mint is `TOKEN_MINT`; for plain `burn`, resolve the mint through `meta.preTokenBalances`
      - `blockTime` must be within the intent window
    - **Mock verification:** the signature must match `/^mock_[A-Za-z0-9]{8,64}$/`.
    - **On success:** grant the purchase (ticket +1, or the cosmetic added to `owned` and auto-equipped if that slot is empty), append a burn record, and return `BurnReceipt`.
@@ -395,20 +399,29 @@ All of this is verified server-side. The client is never trusted about amounts o
   - `client/src/render/cosmetics.ts` exports `drawPillPreview(ctx2d, x, y, scale, color, equipped, timeMs)`, which the UI uses for shop and lobby previews
 
 ### Ranked rooms (server-core)
-- **Creating:** `create {ranked: true}` or `quick {ranked: true}` makes or finds a ranked room. Quick play picks the public ranked lobby with the most players, or creates a public ranked room.
+- **Creating:** `create {ranked: true}` or `quick {ranked: true}` makes or finds a ranked room. Quick play picks the public ranked lobby with the most players, or creates a public ranked room. `create {isPublic: false}` makes a private room (the home PRIVATE ROOM link sends it); quick play never fills it.
 - **Join requirements** (create, join and quick into a ranked room):
   - a valid `authToken` with a Profile, else `NEED_WALLET`
   - `profile.rankedTickets >= 1`, else `NEED_TICKET`
-  - one seat per wallet; a second seat for the same wallet is rejected with `INVALID_ACTION`
+  - one seat per wallet; a second seat for the same wallet is rejected with `INVALID_ACTION`, in the same room and in any other ranked room on the server
+  - a wallet the host kicked can't join that room again (`INVALID_ACTION`), and ranked quick play skips it
 - **Room rules:**
   - no bots: `addBot` gives `RANKED_LOCKED`
   - settings are locked to `DEFAULT_SETTINGS` (`settings` gives `RANKED_LOCKED`), except `isPublic`
   - at start, `ruggers = maxRuggersFor(playerCount)`
 - **`PlayerView.hasTicket`** is set in ranked lobbies so the UI can show who is ready.
 - **Start** (4+ humans): consume one ticket from every player at once (`consumeRankedTickets(addresses)`, all or nothing). If anyone lacks a ticket, nothing starts and the host gets `NEED_TICKET` with their names.
-- **Game over:** `recordRankedResults(records)` adds weekly points per `RANKED_POINTS`. A player removed before the end gets `leftEarly` instead of everything else.
+- **`RoomView.ruggerCount`** (not in the lobby) is the number of Ruggers really playing; clients show it instead of computing it from the locked settings.
+- **Game over:** `recordRankedResults(records)` adds weekly points per `RANKED_POINTS` (formula `rankedPointsFor` in `shared/constants.ts`). A player removed before the end gets `leftEarly` instead of everything else. Win and survival points also need:
+  - a real ending: a game that ends because players left (a removal's win check) is a **no-contest** (`GameOverView.noContest`), so nobody gets win or survival points; rugs, tasks and correct votes still count
+  - a connected player (not sitting out the reconnect grace at the end)
+  - an active player: an accepted move, task, vote, rug, report, sabotage, fix or vent during the round (no AFK farming)
+- Correct votes count only for Holders (a Rugger voting out a partner, or himself, earns nothing).
+- Seats whose reconnect grace runs out in the same tick are all removed before one win check, so they are all `leftEarly`.
+- `GameOverView.rankedPoints` (playerId → points) carries the weekly points of the players still in the room.
+- **Shutdown:** `RoomManager.stop()` aborts ranked rounds in progress: every seated player gets the ticket back (`refundRankedTickets`), players who already left keep `leftEarly`.
 - **Weeks:** ISO weeks, starting Monday 00:00 UTC.
-- **`GET /api/leaderboard/ranked?week=current|previous`:** top 50 by points, then wins.
+- **`GET /api/leaderboard/ranked?week=current|previous`:** top 50 by points, then wins. Only entries with more than 0 points are listed, each with the player's name effect (`RankedEntry.cosmetics`). Names that look like another wallet's short address are refused (`POST /api/me/name` answers 400).
 - **Room hooks:** the Room reads profiles, consumes tickets and records ranked results through injected hooks (like the existing results recorder), so it stays unit-testable.
 - **Store functions** (owned by the wallet/burn owner):
 
@@ -439,7 +452,7 @@ export function getRankedLeaderboard(week: 'current' | 'previous', now?: number)
   - item cards with an animated pill preview (canvas, `drawPillPreview`), rarity color, price, and owned/equipped state
   - BURN TO UNLOCK / EQUIP / UNEQUIP
   - a mini profile preview of how you look
-  - requires a wallet; with burns off it shows "Shop opens when the token launches"
+  - requires a wallet; with burns off it shows "The shop isn't open yet"
 - **Lobby (ranked):**
   - a RANKED badge
   - per-player ticket status

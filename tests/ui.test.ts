@@ -419,7 +419,7 @@ describe('burn prices and copy', () => {
 
   it('toasts burns that confirmed later', () => {
     expect(receiptToast({ purpose: 'ranked', amount: 50_000 }, '$RUGS')).toBe('50,000 $RUGS burned. Ranked ticket added.');
-    expect(receiptToast({ purpose: 'cosmetic', itemId: 'skin_gold', amount: 60_000 }, '$RUGS')).toBe('60,000 $RUGS burned. Gold Bag unlocked.');
+    expect(receiptToast({ purpose: 'cosmetic', itemId: 'skin_gold', amount: 60_000 }, '$RUGS')).toBe('60,000 $RUGS burned. Gold Trim unlocked.');
   });
 
   it("hides every burn feature unless the server says 'live' or 'mock'", () => {

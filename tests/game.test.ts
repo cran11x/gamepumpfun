@@ -15,6 +15,7 @@ import {
   MEETING_RESULTS_MS,
   PLAYER_RADIUS,
   POST_MEETING_COOLDOWN_MS,
+  RANKED_POINTS,
   RECONNECT_GRACE_MS,
   ROLE_REVEAL_MS,
   SABOTAGE_COOLDOWN_MS,
@@ -2935,7 +2936,10 @@ describe('RoomManager: ranked rooms and quick play', () => {
     expect(victim.lastError()).toMatchObject({ code: 'INVALID_ACTION', message: expect.stringMatching(/removed you/) });
     expect(room.playerCount).toBe(1);
     // Quick play doesn't put them back either (the room is still the only ranked lobby).
-    expect(quick(victim, true)).not.toBe(R);
+    const other = quick(victim, true);
+    expect(other).not.toBe(R);
+    expect(mgr.getRoom(other!)!.ranked).toBe(true);
+    expect(room.playerCount).toBe(1);
   });
 
   it('create with isPublic:false makes a private ranked room that quick play never fills', () => {

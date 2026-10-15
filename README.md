@@ -63,7 +63,7 @@ npm run e2e:smoke / npm run e2e:ranked   # one suite
 | `TOKEN_MINT` | unset | SPL mint of your coin. Unset: burns are off and Ranked and the Shop are hidden |
 | `SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | RPC for live burns (use a dedicated one, e.g. Helius). Never sent to clients or logged |
 | `SOLANA_CLUSTER` | `mainnet-beta` | `mainnet-beta` or `devnet` (explorer links) |
-| `BURN_MODE` | unset | `mock` fakes burns for local testing and e2e (the server refuses to start with it when `NODE_ENV=production`); `off` disables burns |
+| `BURN_MODE` | unset | `mock` fakes burns for local testing and e2e (the server refuses to start with it when `NODE_ENV=production` or when `TOKEN_MINT` is set; its data goes to `db.mock.json`, never `db.json`); `off` disables burns |
 | `RANKED_ENTRY_PRICE` | `50000` | Whole tokens burned for one ranked ticket |
 | `COSMETIC_PRICE_MULTIPLIER` | `1` | Multiplies every shop price |
 

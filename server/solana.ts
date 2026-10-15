@@ -62,6 +62,11 @@ export interface SolanaRpc {
   getLatestBlockhash(): Promise<{ blockhash: string; lastValidBlockHeight: number }>;
   /** getTransaction(signature, {commitment: 'confirmed', maxSupportedTransactionVersion: 0, encoding: 'jsonParsed'}). */
   getParsedTransaction(signature: string): Promise<ParsedTransactionWithMeta | null>;
+  /**
+   * getSignatureStatuses([signature], {searchTransactionHistory: true}): whether the cluster knows the
+   * signature at all (a cheap check when getTransaction lags behind). Null when it doesn't.
+   */
+  getSignatureStatus?(signature: string): Promise<{ slot: number } | null>;
 }
 
 type FetchLike = typeof globalThis.fetch;
@@ -103,6 +108,12 @@ export function createConnectionRpc(url: string, opts: { fetch?: FetchLike; time
 
     getParsedTransaction: (signature) =>
       connection.getParsedTransaction(signature, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 }),
+
+    async getSignatureStatus(signature) {
+      const res = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+      const st = res.value[0];
+      return st ? { slot: st.slot } : null;
+    },
   };
 }
 

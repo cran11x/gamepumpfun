@@ -295,8 +295,8 @@ export class RoomManager {
     let best: Room | undefined;
     for (const room of this.rooms.values()) {
       if (room.code === current || room.ranked !== ranked || !room.isPublicLobby) continue;
-      // Entry was checked once above; skip rooms this wallet already sits in (another tab).
-      if (ranked && wallet && room.hasWallet(wallet.address)) continue;
+      // Entry was checked once above; skip rooms this wallet already sits in (another tab) or was kicked from.
+      if (ranked && wallet && (room.hasWallet(wallet.address) || room.hasKicked(wallet.address))) continue;
       if (!best || room.playerCount > best.playerCount || (room.playerCount === best.playerCount && room.createdAt < best.createdAt)) {
         best = room;
       }

@@ -586,6 +586,11 @@ export class Room {
 
   // ---------- Membership (called by the RoomManager) ----------
 
+  /** Ranked: the host kicked this wallet out of this room (it can't come back). */
+  hasKicked(address: string): boolean {
+    return this.kickedAddresses.has(address);
+  }
+
   /** True when a seat in this room is already linked to this full wallet address. */
   hasWallet(address: string): boolean {
     for (const p of this.players.values()) if (p.address === address) return true;

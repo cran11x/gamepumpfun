@@ -403,6 +403,9 @@ async function main(G, server) {
       check(join?.t === 'error' && join.code === 'NEED_TICKET', `join ranked without a ticket: ${JSON.stringify(join)}`);
       const create = await wsProbe(server.base, { t: 'create', name: 'Delta', authToken: phone.token, ranked: true });
       check(create?.t === 'error' && create.code === 'NEED_TICKET', `create ranked without a ticket: ${JSON.stringify(create)}`);
+      // One ranked seat per wallet across the server: alpha (seated here) can't open another ranked room.
+      const elsewhere = await wsProbe(server.base, { t: 'create', name: 'Alpha2', authToken: alpha.token, ranked: true, isPublic: false });
+      check(elsewhere?.t === 'error' && elsewhere.code === 'INVALID_ACTION' && elsewhere.message.includes(code), `a second ranked seat elsewhere: ${JSON.stringify(elsewhere)}`);
       const guest = await wsProbe(server.base, { t: 'join', code, name: 'Guest' });
       check(guest?.t === 'error' && guest.code === 'NEED_WALLET', `join ranked as a guest: ${JSON.stringify(guest)}`);
       const second = await wsProbe(server.base, { t: 'join', code, name: 'Alpha2', authToken: alpha.token });
@@ -535,6 +538,23 @@ async function main(G, server) {
     const victimRug = looks[victim.label].rug ?? null;
     log(`rugger ${rugger.name} rugs ${victim.name} (rug ${victimRug}); ${reporter.name} reports`);
 
+    // ---------- The victim plays a little first: ranked pays win points only to players who did
+    // something (an idle player gets none), so step off the spawn and let the server see it.
+    {
+      const before = (await victim.state()).pos;
+      check(before, 'victim has no position');
+      for (const key of ['ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp']) {
+        await victim.keys([key]);
+        await sleep(220);
+        await victim.keys([]);
+        await sleep(120);
+        const now = (await victim.state()).pos;
+        if (now && dist(now, before) > 3) break;
+      }
+      check(dist((await victim.state()).pos, before) > 3, 'the victim could not take a step');
+      await sleep(300);
+    }
+
     // ---------- The rugger rugs the victim
     const victimPos = (await victim.state()).pos;
     check(victimPos, 'victim has no position');
@@ -593,7 +613,12 @@ async function main(G, server) {
     await all(async (p) => {
       await until(`${p.label} GRADUATED`, async () => (await p.text('.over-title')) === 'GRADUATED', { timeout: 4000 });
       check((await p.page.locator('.over-card').count()) === 4, `${p.label}: game over should list 4 players`);
+      // Ranked game over: RANKED chip, the points of every card, and a way to the weekly board.
+      check(await p.visible('.over-ranked .chip--ranked'), `${p.label}: no RANKED chip on the game-over screen`);
+      check(await p.visible('#btn-over-week'), `${p.label}: no THIS WEEK button on the game-over screen`);
+      check((await p.page.locator('.over-card-pts').count()) === 4, `${p.label}: every card should show its ranked points`);
     });
+    check(go.noContest === undefined && go.rankedPoints && Object.keys(go.rankedPoints).length === 4, `ranked points on game over: ${JSON.stringify(go.rankedPoints)}`);
     await all((p) => p.settle());
     await all((p) => p.shot('40-gameover'));
 
