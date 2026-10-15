@@ -266,7 +266,9 @@ export function checkBurnTransaction(tx: TxLike, want: { owner: string; mint: st
   if (raw !== BigInt(want.intent.amount) * 10n ** BigInt(decimals)) return 'burn amount differs from the price';
   if (burn.accountKeyIndexes.length !== 3) return 'BurnChecked has unexpected accounts';
   const [account, mint, authority] = burn.accountKeyIndexes.map((i) => keys[i]);
-  if (want.mint && mint !== want.mint) return 'burns a different token';
+  // A live burn always names the configured mint; no mint configured means nothing can be checked.
+  if (!want.mint) return 'no token mint configured';
+  if (mint !== want.mint) return 'burns a different token';
   if (authority !== want.owner) return 'burn authority is not the signed-in wallet';
   if (!account || account === want.owner || account === mint) return 'bad token account';
 

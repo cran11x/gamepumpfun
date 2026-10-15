@@ -136,4 +136,42 @@ export const RANKED_POINTS = {
   leftEarly: -20,
 } as const;
 
+/** Per-game maxima the ranked counters are clamped to before they turn into points. */
+export const RANKED_CAPS = {
+  rugs: MAX_PLAYERS - 1,
+  tasksDone: SETTINGS_BOUNDS.tasksPerPlayer.max,
+  correctVotes: SETTINGS_BOUNDS.ruggers.max,
+} as const;
+
+/** One finished ranked game, as the store records it (server/store.ts RankedResultRecord). */
+export interface RankedPointsInput {
+  role: 'holder' | 'rugger';
+  won: boolean;
+  rugs: number;
+  tasksDone: number;
+  correctVotes: number;
+  survived: boolean;
+  leftEarly: boolean;
+}
+
+function rankedCount(v: unknown, max: number): number {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return 0;
+  return Math.min(max, Math.floor(v));
+}
+
+/**
+ * Weekly points for one finished ranked game (RANKED_POINTS), with the counters clamped to RANKED_CAPS.
+ * Shared by the store (which records them) and the room (which shows them on the game-over screen).
+ */
+export function rankedPointsFor(r: RankedPointsInput): number {
+  if (r.leftEarly === true) return RANKED_POINTS.leftEarly;
+  let points = 0;
+  if (r.won === true) points += r.role === 'rugger' ? RANKED_POINTS.ruggerWin : RANKED_POINTS.holderWin;
+  points += rankedCount(r.rugs, RANKED_CAPS.rugs) * RANKED_POINTS.perRug;
+  points += rankedCount(r.tasksDone, RANKED_CAPS.tasksDone) * RANKED_POINTS.perTask;
+  points += rankedCount(r.correctVotes, RANKED_CAPS.correctVotes) * RANKED_POINTS.perCorrectVote;
+  if (r.survived === true && r.won === true && r.role === 'holder') points += RANKED_POINTS.survived;
+  return points;
+}
+
 export const DEFAULT_RANKED_ENTRY_PRICE = 50_000;

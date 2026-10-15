@@ -16,7 +16,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { MAX_NAME_LENGTH, MAX_PLAYERS, RANKED_POINTS, SETTINGS_BOUNDS } from '../shared/constants';
+import { MAX_NAME_LENGTH, RANKED_CAPS, rankedPointsFor } from '../shared/constants';
 import { COSMETICS, COSMETIC_SLOTS, cosmeticById, isCosmeticForSlot, type CosmeticSlot } from '../shared/cosmetics';
 import {
   shortAddress,
@@ -29,7 +29,7 @@ import {
   type RankedLeaderboard,
   type Role,
 } from '../shared/protocol';
-import { isSolanaAddress } from './config';
+import { isSolanaAddress, mockBurnsRequested } from './config';
 
 export interface GameResultRecord {
   address: string; // full wallet address
@@ -78,6 +78,8 @@ const MAX_PER_GAME = 1000;
 const RANKED_WEEKS_KEPT = 8;
 /** Hard cap on stored burn intents (open + recently expired); see server/burns.ts for the policy. */
 export const MAX_BURN_INTENTS = 20_000;
+/** Most signatures one intent ever stores (server/burns.ts binds at most MAX_SIGNATURES_PER_INTENT). */
+const MAX_INTENT_SIGNATURES = 4;
 const DB_VERSION = 2;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -161,8 +163,17 @@ export interface StoredBurnIntent {
   mode: 'live' | 'mock';
   createdAt: number;
   expiresAt: number;
-  /** A confirm with a well-formed signature arrived: the player probably signed it. Kept longer. */
+  /**
+   * The chain (or an RPC outage, which can't tell) says the player probably signed it: kept
+   * confirmable longer (see server/burns.ts CLAIMED_RETENTION_MS).
+   */
   claimed: boolean;
+  /**
+   * Signatures confirm calls named for this intent, oldest first. Bound before any chain lookup and
+   * capped (server/burns.ts MAX_SIGNATURES_PER_INTENT), so one intent can't be used to make the
+   * server look up an unlimited number of junk signatures.
+   */
+  signatures?: string[];
 }
 
 interface StoredRankedStats {
@@ -225,7 +236,9 @@ const leaderboardCache = new Map<LeaderboardSort, { revision: number; entries: L
 const rankedCache = new Map<string, { revision: number; entries: RankedEntry[] }>();
 
 function dbPath(): string {
-  return path.resolve(process.env.DATA_DIR || './data', 'db.json');
+  // Mock burns are fake: profiles, tickets and looks made in BURN_MODE=mock live in their own file,
+  // so a server later switched to live burns never carries them over.
+  return path.resolve(process.env.DATA_DIR || './data', mockBurnsRequested() ? 'db.mock.json' : 'db.json');
 }
 
 function emptyState(): Loaded {
@@ -308,6 +321,13 @@ function copyEquipped(eq: EquippedCosmetics): EquippedCosmetics {
   return out;
 }
 
+/** The profile's equipped name effect when it is a current catalog item it owns (for boards and burn rows). */
+function nameEffectOf(p: StoredProfile | undefined): Pick<EquippedCosmetics, 'name'> | undefined {
+  const id = p?.cosmetics.equipped.name;
+  if (!id || !CATALOG_IDS.has(id) || !isCosmeticForSlot(id, 'name') || !p!.cosmetics.owned.includes(id)) return undefined;
+  return { name: id };
+}
+
 function toProfile(p: StoredProfile): Profile {
   return {
     address: p.address,
@@ -347,6 +367,15 @@ export function sanitizeProfileName(raw: unknown): string {
 
 function defaultName(address: string): string {
   return shortAddress(address);
+}
+
+/** "AbCd…WxYz" (or with "..." / ".."): what a short wallet address looks like on the boards. */
+const SHORT_ADDRESS_LOOK = /^[1-9A-HJ-NP-Za-km-z]{4}\s*(?:…|\.{2,3})\s*[1-9A-HJ-NP-Za-km-z]{4}$/u;
+
+/** A name that would pass for ANOTHER wallet's short address (your own is fine: it is the default). */
+export function isImpersonatingName(name: string, address: string): boolean {
+  const clean = sanitizeProfileName(name);
+  return SHORT_ADDRESS_LOOK.test(clean) && clean !== shortAddress(address);
 }
 
 // ---------- Loading ----------
@@ -411,6 +440,10 @@ function parseIntent(raw: unknown): StoredBurnIntent | null {
     claimed: v.claimed === true,
   };
   if (itemId !== undefined) intent.itemId = itemId;
+  if (Array.isArray(v.signatures)) {
+    const sigs = [...new Set(v.signatures.filter((x): x is string => typeof x === 'string' && SIGNATURE_RE.test(x)))].slice(0, MAX_INTENT_SIGNATURES);
+    if (sigs.length > 0) intent.signatures = sigs;
+  }
   return intent;
 }
 
@@ -786,7 +819,9 @@ function ensureProfile(s: State, address: string, now: number): StoredProfile {
 export function setProfileName(address: string, name: string): Profile | null {
   const p = typeof address === 'string' ? load().profiles.get(address) : undefined;
   if (!p) return null;
-  const next = sanitizeProfileName(name) || defaultName(address);
+  // Never another wallet's short-address look (the API refuses it with a message first).
+  const cleaned = sanitizeProfileName(name);
+  const next = cleaned && !isImpersonatingName(cleaned, address) ? cleaned : defaultName(address);
   if (next !== p.name) {
     p.name = next;
     markChanged(true);
@@ -905,6 +940,25 @@ export function consumeRankedTickets(addresses: string[]): { ok: true } | { ok: 
   return { ok: true };
 }
 
+/**
+ * Give one ranked ticket back to each wallet (a ranked round the server had to abort, e.g. a deploy).
+ * Duplicates count once, unknown wallets are skipped, and the count stays at most MAX_RANKED_TICKETS.
+ * Returns how many wallets got a ticket back.
+ */
+export function refundRankedTickets(addresses: string[]): number {
+  if (!Array.isArray(addresses) || addresses.length === 0) return 0;
+  const s = load();
+  let n = 0;
+  for (const a of new Set(addresses)) {
+    const p = typeof a === 'string' ? s.profiles.get(a) : undefined;
+    if (!p || p.rankedTickets >= MAX_RANKED_TICKETS) continue;
+    p.rankedTickets += 1;
+    n++;
+  }
+  if (n > 0) markChanged(false);
+  return n;
+}
+
 // ---------- Weekly ranked stats ----------
 
 export interface RankedWeek {
@@ -928,22 +982,9 @@ export function rankedWeek(now: number = Date.now()): RankedWeek {
   return { weekId: `${isoYear}-W${String(week).padStart(2, '0')}`, weekStart, weekEnd: weekStart + WEEK_MS };
 }
 
-const RANKED_CAPS = {
-  rugs: MAX_PLAYERS - 1,
-  tasksDone: SETTINGS_BOUNDS.tasksPerPlayer.max,
-  correctVotes: SETTINGS_BOUNDS.ruggers.max,
-};
-
 /** Weekly points for one finished ranked game (RANKED_POINTS). Counters are clamped to sane per-game maxima. */
 export function rankedPoints(r: RankedResultRecord): number {
-  if (r.leftEarly === true) return RANKED_POINTS.leftEarly;
-  let points = 0;
-  if (r.won === true) points += r.role === 'rugger' ? RANKED_POINTS.ruggerWin : RANKED_POINTS.holderWin;
-  points += toCount(r.rugs, RANKED_CAPS.rugs) * RANKED_POINTS.perRug;
-  points += toCount(r.tasksDone, RANKED_CAPS.tasksDone) * RANKED_POINTS.perTask;
-  points += toCount(r.correctVotes, RANKED_CAPS.correctVotes) * RANKED_POINTS.perCorrectVote;
-  if (r.survived === true && r.won === true && r.role === 'holder') points += RANKED_POINTS.survived;
-  return points;
+  return rankedPointsFor(r);
 }
 
 /** Add one finished ranked game to the week containing `now`. Invalid and duplicate records are skipped. */
@@ -992,7 +1033,9 @@ export function getRankedLeaderboard(week: 'current' | 'previous' = 'current', n
   let cached = rankedCache.get(w.weekId);
   if (!cached || cached.revision !== revision) {
     const players = s.ranked.get(w.weekId) ?? new Map<string, StoredRankedStats>();
+    // Only players with points on the board: a week of nothing but early exits isn't a ranking.
     const entries = [...players.entries()]
+      .filter(([, st]) => st.points > 0)
       .sort(
         ([aAddr, a], [bAddr, b]) =>
           b.points - a.points || b.wins - a.wins || a.games - b.games || a.lastAt - b.lastAt || (aAddr < bAddr ? -1 : aAddr > bAddr ? 1 : 0),
@@ -1011,7 +1054,14 @@ export function getRankedLeaderboard(week: 'current' | 'previous' = 'current', n
     cached = { revision, entries };
     rankedCache.set(w.weekId, cached);
   }
-  return { weekId: w.weekId, weekStart: w.weekStart, weekEnd: w.weekEnd, entries: cached.entries.map((e) => ({ ...e })) };
+  // Name effects are read now (equipping doesn't bump the board's revision).
+  const entries = cached.entries.map((e) => {
+    const out: RankedEntry = { ...e };
+    const fx = nameEffectOf(s.profiles.get(e.address));
+    if (fx) out.cosmetics = fx;
+    return out;
+  });
+  return { weekId: w.weekId, weekStart: w.weekStart, weekEnd: w.weekEnd, entries };
 }
 
 // ---------- Burns (used by server/burns.ts) ----------
@@ -1079,8 +1129,8 @@ export interface BurnTotals {
   /** Whole tokens burned, all time. */
   totalBurned: number;
   burns: number;
-  /** Newest first, each with the burner's current display name. */
-  recent: Array<StoredBurn & { name: string }>;
+  /** Newest first, each with the burner's current display name and name effect. */
+  recent: Array<StoredBurn & { name: string; nameEffect?: string }>;
 }
 
 export function getBurnTotals(recentLimit = 20): BurnTotals {
@@ -1088,7 +1138,13 @@ export function getBurnTotals(recentLimit = 20): BurnTotals {
   const n = Math.max(0, Math.min(100, Math.floor(recentLimit)));
   const recent = (n === 0 ? [] : s.burns.slice(-n))
     .reverse()
-    .map((b) => ({ ...b, name: s.profiles.get(b.address)?.name ?? defaultName(b.address) }));
+    .map((b) => {
+      const p = s.profiles.get(b.address);
+      const row: StoredBurn & { name: string; nameEffect?: string } = { ...b, name: p?.name ?? defaultName(b.address) };
+      const fx = nameEffectOf(p)?.name;
+      if (fx) row.nameEffect = fx;
+      return row;
+    });
   return { totalBurned: s.totalBurned, burns: s.burns.length, recent };
 }
 
@@ -1127,6 +1183,23 @@ export function markBurnIntentClaimed(id: string): void {
   if (!intent || intent.claimed) return;
   intent.claimed = true;
   markChanged(false);
+}
+
+/**
+ * Bind `signature` to an intent before it is looked up on chain. 'bound' when it is (or already was)
+ * one of the intent's signatures, 'full' when the intent already has `max` other signatures,
+ * 'missing' when there is no such intent.
+ */
+export function bindBurnIntentSignature(id: string, signature: string, max: number): 'bound' | 'full' | 'missing' {
+  const intent = typeof id === 'string' ? load().intents.get(id) : undefined;
+  if (!intent) return 'missing';
+  if (typeof signature !== 'string' || !SIGNATURE_RE.test(signature)) return 'full';
+  const sigs = intent.signatures ?? [];
+  if (sigs.includes(signature)) return 'bound';
+  if (sigs.length >= Math.min(max, MAX_INTENT_SIGNATURES)) return 'full';
+  intent.signatures = [...sigs, signature];
+  markChanged(false);
+  return 'bound';
 }
 
 export function deleteBurnIntent(id: string): void {

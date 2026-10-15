@@ -13,8 +13,11 @@
 //   TOKEN_MINT                 SPL mint of the project's token. Unset: burns are off.
 //   SOLANA_RPC_URL             JSON-RPC endpoint for live mode (default mainnet-beta). Never sent to the client.
 //   SOLANA_CLUSTER             mainnet-beta (default) or devnet; used for explorer links.
-//   BURN_MODE                  "mock" for local testing / e2e (refused when NODE_ENV=production), "off" to
-//                              force burns off. Otherwise live when TOKEN_MINT is set, off when it isn't.
+//   BURN_MODE                  "mock" for local testing / e2e, "off" to force burns off. Otherwise live when
+//                              TOKEN_MINT is set, off when it isn't. Mock accepts fake burns, so it is
+//                              refused when NODE_ENV=production and whenever TOKEN_MINT is set (a real
+//                              token), and its data lives in its own file (DATA_DIR/db.mock.json) so mock
+//                              tickets and looks can never carry over to a live server.
 //   RANKED_ENTRY_PRICE         whole tokens per ranked ticket (default DEFAULT_RANKED_ENTRY_PRICE)
 //   COSMETIC_PRICE_MULTIPLIER  multiplies every cosmetic base price (default 1)
 //
@@ -225,6 +228,14 @@ function parseMultiplier(raw: string | undefined): number {
   return 1;
 }
 
+/**
+ * BURN_MODE asks for mock burns. The store keeps mock-mode data in its own file (see server/store.ts
+ * dbPath), so a server switched from mock to live never sees a fake ticket or look.
+ */
+export function mockBurnsRequested(env: ConfigEnv = process.env): boolean {
+  return env.BURN_MODE?.trim().toLowerCase() === 'mock';
+}
+
 let burnKey: string | null = null;
 let burnCached: BurnSettings | ConfigError | null = null;
 
@@ -239,10 +250,16 @@ function buildBurnSettings(env: ConfigEnv): BurnSettings | ConfigError {
     priceMultiplier: parseMultiplier(env.COSMETIC_PRICE_MULTIPLIER),
   };
   if (rawMode === 'mock') {
-    if (env.NODE_ENV?.trim() === 'production') {
+    // Fail closed: fake burns never run in production, nor next to a real (or mistyped) token mint.
+    if (env.NODE_ENV?.trim().toLowerCase() === 'production') {
       return new ConfigError('BURN_MODE=mock accepts fake burns and must never run with NODE_ENV=production. Unset BURN_MODE.');
     }
-    return { mode: 'mock', ...base };
+    if (env.TOKEN_MINT?.trim()) {
+      return new ConfigError(
+        'BURN_MODE=mock accepts fake burns and must never run with TOKEN_MINT set. Unset TOKEN_MINT for local testing (CONTRACT_ADDRESS still shows the coin), or unset BURN_MODE for real burns.',
+      );
+    }
+    return { mode: 'mock', ...base, mint: null };
   }
   if (rawMode === 'off') return { mode: 'off', ...base, mint: null };
   if (rawMode !== '' && rawMode !== 'live') {

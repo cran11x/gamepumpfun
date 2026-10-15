@@ -105,6 +105,14 @@ class FakeStore {
   readonly record = (records: RankedResultRecordLike[]): void => {
     this.ranked.push(records.map((r) => ({ ...r })));
   };
+  readonly refunds: string[][] = [];
+  readonly refund = (addresses: string[]): void => {
+    this.refunds.push([...addresses]);
+    for (const a of new Set(addresses)) {
+      const p = this.profiles.get(a);
+      if (p) p.rankedTickets++;
+    }
+  };
 }
 
 /** A Room with a fake clock, a seeded rng and an in-memory outbox per player. */
@@ -137,6 +145,7 @@ class Harness {
       profileOf: this.store.profileOf,
       consumeRankedTickets: this.store.consume,
       recordRankedResults: this.store.record,
+      refundRankedTickets: this.store.refund,
       log: () => {},
     });
     for (let i = 0; i < (opts.players ?? 5); i++) {
@@ -2369,6 +2378,8 @@ describe('ranked rooms', () => {
       const [victim, quitter, a, b, c] = h.holders();
       const address = (id: string) => h.p(id).address!;
       const addrs = Object.fromEntries([r, victim, quitter, a, b, c].map((id) => [id, address(id)]));
+      // The victim plays (moves) before getting rugged; idle players get no win points (see the AFK test).
+      h.walk(victim, 4, 0, 2);
       h.advance(POST_MEETING_COOLDOWN_MS);
       // The quitter does a task, then leaves for good mid-game.
       h.doTask(quitter, h.p(quitter).tasks[0].stationId);
@@ -2418,6 +2429,7 @@ describe('ranked rooms', () => {
       h.room.setDisconnected(back);
       h.advance(RECONNECT_GRACE_MS - 1000);
       expect(h.room.rejoin(back, h.p(back).sessionKey)).not.toBeNull();
+      h.walk(back, 4, 0, 2);
       h.advance(1000);
       expect(h.room.getPlayer(gone)).toBeUndefined();
       expect(h.room.phase).toBe('playing');
@@ -2434,6 +2446,136 @@ describe('ranked rooms', () => {
       expect(of(back)).toMatchObject({ leftEarly: false, won: false, survived: true });
       expect(of(r)).toMatchObject({ role: 'rugger', won: true, rugs: 2, survived: true, leftEarly: false });
       expect(of(c)).toMatchObject({ won: false, leftEarly: false });
+    });
+
+    it('a game that ends because players left is a no-contest: no win points, leavers still leftEarly', () => {
+      // The rugger quits during the role reveal: holders would have "won" at t=0.
+      const h = ranked(4, { seed: 5 });
+      h.send(h.host, { t: 'start' });
+      const [r] = h.ruggers();
+      const holders = h.holders();
+      h.send(r, { t: 'leave' });
+      expect(h.room.phase).toBe('gameOver');
+      const over = h.snap(holders[0]).gameOver!;
+      expect(over).toMatchObject({ winner: 'holders', reason: 'ruggersEjected', noContest: true });
+      for (const id of holders) expect(over.rankedPoints![id]).toBe(0);
+      const rec = h.store.ranked[0];
+      expect(rec.find((x) => x.address === h.p(holders[0]).address)).toMatchObject({ won: false, survived: false, leftEarly: false });
+      expect(rec.filter((x) => x.leftEarly)).toHaveLength(1);
+      expect(h.chats(holders[0]).some((c) => /no-contest/.test(c.text))).toBe(true);
+
+      // A holder with open tasks leaves after the others finished theirs: the curve completes, but
+      // that is a no-contest too; the tasks done still count.
+      const g = ranked(4, { seed: 9 });
+      g.start();
+      const [quitter, ...rest] = g.holders();
+      for (const id of rest) for (const t of g.p(id).tasks) g.doTask(id, t.stationId);
+      expect(g.room.phase).toBe('playing');
+      g.send(quitter, { t: 'leave' });
+      expect(g.snap(rest[0]).gameOver).toMatchObject({ winner: 'holders', reason: 'tasks', noContest: true });
+      const tasks = g.p(rest[0]).tasks.length;
+      expect(g.snap(rest[0]).gameOver!.rankedPoints![rest[0]]).toBe(tasks * RANKED_POINTS.perTask);
+      expect(g.store.ranked[0].find((x) => x.address === g.p(rest[0]).address)).toMatchObject({ won: false, tasksDone: tasks });
+    });
+
+    it('idle (AFK) players and players still disconnected at the end get no win or survival points', () => {
+      const h = ranked(5, { seed: 3 });
+      h.start();
+      scatter(h);
+      const [r] = h.ruggers();
+      const [a, b, c, afk] = h.holders();
+      h.place(a, { x: EMERGENCY_BUTTON.x, y: EMERGENCY_BUTTON.y - 85 });
+      h.send(a, { t: 'emergency' });
+      h.advance(DEFAULT_SETTINGS.discussionTime * 1000);
+      for (const id of [a, b, c]) h.send(id, { t: 'vote', target: r });
+      // c drops out with the vote almost over and is still inside the reconnect grace at game over.
+      h.advance(DEFAULT_SETTINGS.votingTime * 1000 - 1000);
+      h.room.setDisconnected(c);
+      h.advance(1000);
+      h.advance(MEETING_RESULTS_MS);
+      h.advance(EJECTION_MS);
+      expect(h.room.getPlayer(c)).toBeDefined();
+      const over = h.snap(a).gameOver!;
+      expect(over).toMatchObject({ winner: 'holders', reason: 'ruggersEjected' });
+      expect(over.noContest).toBeUndefined();
+      const rec = h.store.ranked[0];
+      const of = (id: string) => rec.find((x) => x.address === h.p(id).address)!;
+      expect(of(a)).toMatchObject({ won: true, survived: true, correctVotes: 1 });
+      expect(over.rankedPoints![a]).toBe(RANKED_POINTS.holderWin + RANKED_POINTS.perCorrectVote + RANKED_POINTS.survived);
+      expect(of(afk)).toMatchObject({ won: false, survived: false, leftEarly: false });
+      expect(over.rankedPoints![afk]).toBe(0);
+      expect(of(c)).toMatchObject({ won: false, survived: false, leftEarly: false, correctVotes: 1 });
+      expect(over.rankedPoints![c]).toBe(RANKED_POINTS.perCorrectVote);
+    });
+
+    it('correct votes count only for Holders: a Rugger voting himself (or a partner) out earns nothing', () => {
+      const h = ranked(5, { seed: 4 });
+      h.start();
+      scatter(h);
+      const [r] = h.ruggers();
+      const [a] = h.holders();
+      h.place(a, { x: EMERGENCY_BUTTON.x, y: EMERGENCY_BUTTON.y - 85 });
+      h.send(a, { t: 'emergency' });
+      h.advance(DEFAULT_SETTINGS.discussionTime * 1000);
+      for (const id of h.room.playerIds()) h.send(id, { t: 'vote', target: r });
+      h.advance(MEETING_RESULTS_MS);
+      h.advance(EJECTION_MS);
+      expect(h.room.phase).toBe('gameOver');
+      expect(h.store.ranked[0].find((x) => x.address === h.p(r).address)).toMatchObject({ correctVotes: 0, won: false });
+      expect(h.records[0].find((x) => x.address === h.p(r).address)).toMatchObject({ correctVotes: 0 });
+      expect(h.snap(a).gameOver!.rankedPoints![r]).toBe(0);
+      expect(h.store.ranked[0].find((x) => x.address === h.p(a).address)).toMatchObject({ correctVotes: 1 });
+    });
+
+    it('seats whose grace runs out in the same tick are all leftEarly, whatever the removal order', () => {
+      const h = ranked(4, { seed: 2 });
+      h.start();
+      for (const id of h.room.playerIds()) h.room.setDisconnected(id);
+      h.advance(RECONNECT_GRACE_MS);
+      expect(h.room.phase).toBe('gameOver');
+      expect(h.store.ranked).toHaveLength(1);
+      expect(h.store.ranked[0]).toHaveLength(4);
+      expect(h.store.ranked[0].every((x) => x.leftEarly && !x.won)).toBe(true);
+    });
+
+    it('a shutdown mid-round gives every seated player their ticket back; leavers keep leftEarly', () => {
+      const h = ranked(5, { seed: 6 });
+      h.start();
+      expect(tickets(h, 5)).toEqual([0, 0, 0, 0, 0]);
+      const leaver = h.holders()[0];
+      const leaverAddr = h.p(leaver).address!;
+      h.send(leaver, { t: 'leave' });
+      expect(h.room.phase).toBe('playing');
+      h.room.abort();
+      expect(h.store.refunds).toHaveLength(1);
+      expect(h.store.refunds[0]).toHaveLength(4);
+      expect(h.store.refunds[0]).not.toContain(leaverAddr);
+      expect(h.store.tickets(leaverAddr)).toBe(0);
+      expect(h.store.ranked).toEqual([[expect.objectContaining({ address: leaverAddr, leftEarly: true })]]);
+      expect(h.room.shouldDestroy()).toBe(true);
+      // Nothing to give back from a lobby or after the game ended.
+      const lobby = ranked(4);
+      lobby.room.abort();
+      expect(lobby.store.refunds).toEqual([]);
+      const over = ranked(4);
+      over.start();
+      endByDevDump(over);
+      over.room.abort();
+      expect(over.store.refunds).toEqual([]);
+    });
+
+    it('tells everyone how many Ruggers really play (ranked uses maxRuggersFor, not the locked setting)', () => {
+      const h = ranked(7);
+      expect(h.snap(h.ids[1]).room.ruggerCount).toBeUndefined();
+      h.send(h.host, { t: 'start' });
+      expect(h.ruggers()).toHaveLength(2);
+      const holder = h.holders()[0];
+      expect(h.snap(holder).room.settings.ruggers).toBe(1);
+      expect(h.snap(holder).room.ruggerCount).toBe(2);
+      // Casual rooms report the clamped count too.
+      const u = new Harness({ players: 5, settings: { ruggers: 3 } });
+      u.start();
+      expect(u.snap(u.host).room.ruggerCount).toBe(1);
     });
 
     it('leaving during the role reveal is leftEarly; leaving after game over changes nothing', () => {
@@ -2635,6 +2777,7 @@ describe('RoomManager: ranked rooms and quick play', () => {
       profileOf: store.profileOf,
       consumeRankedTickets: store.consume,
       recordRankedResults: store.record,
+      refundRankedTickets: store.refund,
       recordGameResults: (r) => lifetime.push(r),
     });
     let n = 0;
@@ -2761,16 +2904,73 @@ describe('RoomManager: ranked rooms and quick play', () => {
     mgr.handleMessage(tab, { t: 'join', code: R, name: 'a2', authToken: tab.token });
     expect(tab.lastError()).toMatchObject({ code: 'INVALID_ACTION' });
     expect(mgr.getRoom(R)!.playerCount).toBe(1);
-    // Ranked quick play doesn't send the second tab into the room its wallet already sits in.
-    const other = quick(tab, true)!;
-    expect(other).not.toBe(R);
-    expect(mgr.getRoom(other)!.ranked).toBe(true);
+    // Nor a seat in another ranked room: one ranked seat per wallet across the server (one ticket can't
+    // hold seats in several lobbies, and nobody plays two ranked games at once).
+    clock();
+    mgr.handleMessage(tab, { t: 'quick', name: 'a2', authToken: tab.token, ranked: true });
+    expect(tab.lastError()).toMatchObject({ code: 'INVALID_ACTION', message: expect.stringContaining(R) });
+    clock();
+    mgr.handleMessage(tab, { t: 'create', name: 'a2', authToken: tab.token, ranked: true });
+    expect(tab.lastError()).toMatchObject({ code: 'INVALID_ACTION' });
+    expect(mgr.roomCount).toBe(1);
     expect(mgr.getRoom(R)!.playerCount).toBe(1);
     // The first tab re-sending join for its own seat just gets its welcome again.
     clock();
     mgr.handleMessage(a, { t: 'join', code: R, name: 'a', authToken: a.token });
     expect(a.msgs.filter((m) => m.t === 'welcome').length).toBe(2);
     expect(mgr.getRoom(R)!.playerCount).toBe(1);
+  });
+
+  it('a kicked wallet cannot come back into the same ranked lobby', () => {
+    const { mgr, conn, clock, quick } = setup();
+    const host = conn(1);
+    const R = quick(host, true)!;
+    const victim = conn(1);
+    expect(quick(victim, true)).toBe(R);
+    const room = mgr.getRoom(R)!;
+    mgr.handleMessage(host, { t: 'kick', playerId: victim.welcome()!.playerId });
+    expect(room.playerCount).toBe(1);
+    clock();
+    mgr.handleMessage(victim, { t: 'join', code: R, name: 'back', authToken: victim.token });
+    expect(victim.lastError()).toMatchObject({ code: 'INVALID_ACTION', message: expect.stringMatching(/removed you/) });
+    expect(room.playerCount).toBe(1);
+    // Quick play doesn't put them back either (the room is still the only ranked lobby).
+    expect(quick(victim, true)).not.toBe(R);
+  });
+
+  it('create with isPublic:false makes a private ranked room that quick play never fills', () => {
+    const { mgr, conn, clock, quick } = setup();
+    expect(parseC2S({ t: 'create', name: 'x', ranked: true, isPublic: false })).toEqual({ t: 'create', name: 'x', ranked: true, isPublic: false });
+    expect(parseC2S({ t: 'create', name: 'x', isPublic: 'no' })).toEqual({ t: 'create', name: 'x' });
+    expect(parseC2S({ t: 'quick', name: 'x', isPublic: false })).toEqual({ t: 'quick', name: 'x' });
+    const host = conn(1);
+    clock();
+    mgr.handleMessage(host, { t: 'create', name: 'h', authToken: host.token, ranked: true, isPublic: false });
+    const P = host.welcome()!.code;
+    expect(mgr.getRoom(P)!.settings.isPublic).toBe(false);
+    expect(mgr.getRoom(P)!.ranked).toBe(true);
+    expect(mgr.getRoomsInfo().publicLobbies).toBe(0);
+    const stranger = conn(1);
+    expect(quick(stranger, true)).not.toBe(P);
+    expect(mgr.getRoom(P)!.playerCount).toBe(1);
+    // Friends still join by code.
+    const friend = conn(1);
+    clock();
+    mgr.handleMessage(friend, { t: 'join', code: P, name: 'f', authToken: friend.token });
+    expect(friend.welcome()?.code).toBe(P);
+  });
+
+  it('a server shutdown aborts ranked rounds and gives the tickets back', () => {
+    const { mgr, store, conn, quick } = setup();
+    const players = [conn(1), conn(1), conn(1), conn(1)];
+    const R = quick(players[0], true)!;
+    for (const c of players.slice(1)) expect(quick(c, true)).toBe(R);
+    mgr.handleMessage(players[0], { t: 'start' });
+    const addresses = mgr.getRoom(R)!.playerIds().map((id) => mgr.getRoom(R)!.getPlayer(id)!.address!);
+    for (const a of addresses) expect(store.tickets(a)).toBe(0);
+    mgr.stop();
+    expect(mgr.roomCount).toBe(0);
+    for (const a of addresses) expect(store.tickets(a)).toBe(1);
   });
 
   it('rooms get the store hooks: no bots, private ranked rooms stay out of quick play, start takes tickets, results are recorded', () => {

@@ -18,7 +18,13 @@
 // Intents are kept in server/store.ts (memory + db.json), so a restart between "signed in Phantom"
 // and "confirmed" doesn't lose a burn. Lifetime: open for INTENT_TTL_MS (the transaction's blockTime
 // must fall in that window); unconfirmed intents can still be confirmed for UNCLAIMED_GRACE_MS after
-// that, or for CLAIMED_RETENTION_MS after creation once a confirm call has named a signature for them.
+// that, or for CLAIMED_RETENTION_MS after creation once the chain showed a transaction this wallet
+// signed for it (or the chain could not be asked: an RPC outage must not cost anyone their burn).
+//
+// Abuse limits (a confirm makes the server poll its RPC): at most MAX_SIGNATURES_PER_INTENT distinct
+// signatures per intent (bound before any lookup), MAX_STORED_INTENTS_PER_WALLET stored intents per
+// wallet, and getTransaction lookups budgeted per wallet and in total. A confirm that runs out of
+// budget answers pending (HTTP 202), and the client retries later.
 
 import { randomBytes } from 'node:crypto';
 import { cosmeticById } from '../shared/cosmetics';
@@ -40,9 +46,11 @@ import {
   type MintInfo,
   type SolanaRpc,
 } from './solana';
+import type { ParsedTransactionWithMeta } from '@solana/web3.js';
 import {
   MAX_BURN_INTENTS,
   MAX_RANKED_TICKETS,
+  bindBurnIntentSignature,
   countBurnIntents,
   deleteBurnIntent,
   getBurnByIntent,
@@ -65,6 +73,15 @@ export const UNCLAIMED_GRACE_MS = 15 * 60 * 1000;
 /** An intent a confirm call named a signature for stays confirmable this long after creation. */
 export const CLAIMED_RETENTION_MS = 24 * 60 * 60 * 1000;
 export const MAX_OPEN_INTENTS_PER_WALLET = 5;
+/** Every intent a wallet has stored (open, in its grace period, or claimed) counts toward this. */
+export const MAX_STORED_INTENTS_PER_WALLET = 10;
+/** Distinct signatures confirm calls may name for one intent (the first, plus one re-sign). */
+export const MAX_SIGNATURES_PER_INTENT = 2;
+/** getTransaction lookups per minute: per wallet, and for the whole server (token buckets). */
+export const LOOKUPS_PER_WALLET_PER_MINUTE = 40;
+export const LOOKUPS_PER_MINUTE = 1200;
+/** A cosmetic intent is handed out again (with a fresh transaction) only with this much time left. */
+const REUSE_MIN_LEFT_MS = 2 * 60 * 1000;
 /** Allowed drift between this server's clock and the cluster's blockTime. */
 export const BLOCK_TIME_SKEW_MS = 2 * 60 * 1000;
 export const MEMO_PREFIX = 'AMONGRUGS';
@@ -114,7 +131,53 @@ export interface BurnServiceOptions {
   /** Mint read retry backoff bounds (default 2 s .. 60 s). */
   mintRetryMinMs?: number;
   mintRetryMaxMs?: number;
+  /** getTransaction budgets (default LOOKUPS_PER_WALLET_PER_MINUTE / LOOKUPS_PER_MINUTE). */
+  lookupsPerWalletPerMinute?: number;
+  lookupsPerMinute?: number;
   log?: (...args: unknown[]) => void;
+}
+
+/** Token buckets refilled continuously at `perMinute`, holding at most `burst`. */
+class LookupBudget {
+  private readonly buckets = new Map<string, { tokens: number; at: number }>();
+  constructor(
+    private readonly perMinute: number,
+    private readonly burst: number,
+    private readonly now: () => number,
+  ) {}
+
+  private level(b: { tokens: number; at: number }, t: number): number {
+    return Math.min(this.burst, b.tokens + (Math.max(0, t - b.at) * this.perMinute) / 60_000);
+  }
+
+  take(key: string): boolean {
+    const t = this.now();
+    const b = this.buckets.get(key) ?? { tokens: this.burst, at: t };
+    b.tokens = this.level(b, t);
+    b.at = t;
+    if (b.tokens < 1) {
+      this.buckets.set(key, b);
+      return false;
+    }
+    b.tokens -= 1;
+    this.buckets.set(key, b);
+    if (this.buckets.size > 10_000) {
+      // A full bucket is the same as no bucket.
+      for (const [k, v] of this.buckets) if (this.level(v, t) >= this.burst) this.buckets.delete(k);
+    }
+    return true;
+  }
+}
+
+/** The transaction is `signature`'s own (its first signature) and `wallet` signed it. */
+function signedBy(tx: ParsedTransactionWithMeta, signature: string, wallet: string): boolean {
+  if (tx.transaction?.signatures?.[0] !== signature) return false;
+  return (tx.transaction.message?.accountKeys ?? []).some((k) => k.signer === true && k.pubkey?.toBase58?.() === wallet);
+}
+
+/** No signature was ever named for it and the chain never vouched for it: an abandoned Phantom prompt. */
+function isIdle(i: StoredBurnIntent): boolean {
+  return !i.claimed && !(i.signatures && i.signatures.length > 0);
 }
 
 /** Whole tokens one purchase costs. Mirrors client/src/wallet.ts expectedBurnAmount. */
@@ -155,6 +218,10 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
   const retryMax = opts.mintRetryMaxMs ?? 60_000;
   const log = opts.log ?? ((...args: unknown[]) => console.warn('[burns]', ...args));
   const rpc: SolanaRpc | null = mode === 'live' ? (opts.rpc ?? createConnectionRpc(settings.rpcUrl)) : null;
+  const walletPerMinute = Math.max(1, opts.lookupsPerWalletPerMinute ?? LOOKUPS_PER_WALLET_PER_MINUTE);
+  const globalPerMinute = Math.max(1, opts.lookupsPerMinute ?? LOOKUPS_PER_MINUTE);
+  const walletLookups = new LookupBudget(walletPerMinute, walletPerMinute, now);
+  const globalLookups = new LookupBudget(globalPerMinute, Math.max(1, Math.ceil(globalPerMinute / 6)), now);
 
   if (mode === 'live' && !settings.mint) throw new Error('live burn mode needs a mint');
 
@@ -177,6 +244,7 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
         mintInfo = info;
         setMintDecimals(info.mint, info.decimals);
         retryDelay = retryMin;
+        for (const risk of info.risks ?? []) log(`WARNING: ${risk}.`);
         return true;
       })
       .catch((err: unknown) => {
@@ -256,6 +324,10 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
     }
     const amount = priceOf(settings, purpose, itemId)!;
 
+    /** An intent of this wallet for the same cosmetic that can still be confirmed. */
+    const sameItemIntent = (t: number): StoredBurnIntent | undefined =>
+      purpose === 'cosmetic' ? listBurnIntents(wallet).find((i) => i.purpose === 'cosmetic' && i.itemId === itemId && t <= confirmDeadline(i)) : undefined;
+
     /** Re-run after every await: the profile or the open intents may have changed meanwhile. */
     const checkPurchasable = (): void => {
       const profile = getProfile(wallet);
@@ -264,6 +336,11 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
         throw new BurnError(409, `You already own ${cosmeticById(itemId!)!.name}`);
       }
       if (purpose === 'ranked' && profile.rankedTickets >= MAX_RANKED_TICKETS) throw new BurnError(409, 'You have the maximum number of tickets');
+      // A second burn for an item that is already on its way would burn the price twice for one unlock.
+      const same = sameItemIntent(now());
+      if (same && !isIdle(same)) {
+        throw new BurnError(409, `A burn for ${cosmeticById(itemId!)!.name} is already waiting to confirm. Give it a minute.`);
+      }
     };
     checkPurchasable();
 
@@ -286,8 +363,16 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
       throw new BurnError(503, 'Token burns are unavailable right now');
     }
 
-    const nonce = randomBytes(16).toString('hex');
-    const memo = burnMemo(purpose, itemId, nonce);
+    // An open, untouched intent for the same cosmetic (a rejected Phantom prompt, another tab) is handed
+    // out again with a fresh transaction rather than doubled: both carry the same memo, so they can pay
+    // for the item only once.
+    const candidate = sameItemIntent(now());
+    const reuse =
+      candidate && isIdle(candidate) && now() < candidate.expiresAt - REUSE_MIN_LEFT_MS && candidate.amountRaw === amountRaw.toString() && candidate.decimals === decimals
+        ? candidate
+        : null;
+    const nonce = reuse ? reuse.nonce : randomBytes(16).toString('hex');
+    const memo = reuse ? reuse.memo : burnMemo(purpose, itemId, nonce);
 
     let transaction: string | null = null;
     if (mode === 'live') {
@@ -319,13 +404,40 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
     checkPurchasable();
     const t = now();
     prune(t);
+
+    if (reuse) {
+      const again = getBurnIntent(reuse.id);
+      // The transaction above carries this intent's memo; if the intent changed meanwhile, start over.
+      if (!again || !isIdle(again) || t > confirmDeadline(again)) throw new BurnError(409, 'Your burn request changed. Try again.');
+      const view: BurnIntent = {
+        intentId: again.id,
+        purpose,
+        amount: again.amount,
+        amountRaw: again.amountRaw,
+        memo: again.memo,
+        transaction,
+        expiresAt: again.expiresAt,
+      };
+      if (itemId !== undefined) view.itemId = itemId;
+      return view;
+    }
+
     const open = listBurnIntents(wallet).filter((i) => isOpen(i, t));
     if (open.length >= MAX_OPEN_INTENTS_PER_WALLET) {
       // Make room by dropping the oldest intent nobody ever tried to confirm (an abandoned Phantom
-      // prompt). Intents with a signature in flight are never dropped.
-      const abandoned = open.find((i) => !i.claimed);
+      // prompt). Intents with a signature named for them are never dropped.
+      const abandoned = open.find(isIdle);
       if (!abandoned) throw new BurnError(409, 'Too many burns in progress. Wait for them to confirm.');
       deleteBurnIntent(abandoned.id);
+    }
+    // Every stored intent counts, not only open ones, so nobody piles up intents a day at a time.
+    const stored = listBurnIntents(wallet);
+    if (stored.length >= MAX_STORED_INTENTS_PER_WALLET) {
+      const idle = stored.filter(isIdle);
+      for (const i of idle.slice(0, stored.length - MAX_STORED_INTENTS_PER_WALLET + 1)) deleteBurnIntent(i.id);
+      if (listBurnIntents(wallet).length >= MAX_STORED_INTENTS_PER_WALLET) {
+        throw new BurnError(409, 'Too many unconfirmed burns. Wait for them to confirm or expire.');
+      }
     }
     if (countBurnIntents() >= MAX_BURN_INTENTS) {
       prune(t, true);
@@ -334,7 +446,7 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
 
     let id = randomBytes(16).toString('hex');
     while (getBurnIntent(id) || getBurnByIntent(id)) id = randomBytes(16).toString('hex');
-    const stored: StoredBurnIntent = {
+    const record: StoredBurnIntent = {
       id,
       address: wallet,
       purpose,
@@ -348,17 +460,17 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
       expiresAt: t + INTENT_TTL_MS,
       claimed: false,
     };
-    if (itemId !== undefined) stored.itemId = itemId;
-    if (!putBurnIntent(stored)) throw new BurnError(500, 'Could not save the burn request');
+    if (itemId !== undefined) record.itemId = itemId;
+    if (!putBurnIntent(record)) throw new BurnError(500, 'Could not save the burn request');
 
     const intent: BurnIntent = {
       intentId: id,
       purpose,
       amount,
-      amountRaw: stored.amountRaw,
+      amountRaw: record.amountRaw,
       memo,
       transaction,
-      expiresAt: stored.expiresAt,
+      expiresAt: record.expiresAt,
     };
     if (itemId !== undefined) intent.itemId = itemId;
     return intent;
@@ -366,12 +478,8 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
 
   // ---------- Confirm ----------
 
-  interface InFlight {
-    intentId: string;
-    wallet: string;
-    promise: Promise<ConfirmOutcome>;
-  }
-  const inFlight = new Map<string, InFlight>();
+  /** In-flight confirms by signature + wallet + intent: one caller can never block another's confirm. */
+  const inFlight = new Map<string, Promise<ConfirmOutcome>>();
   const inFlightPerWallet = new Map<string, number>();
 
   /** The intent this confirm is for, after every ownership / state check. Throws BurnError. */
@@ -415,17 +523,30 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
 
   async function confirmLive(intent: StoredBurnIntent, signature: string, wallet: string): Promise<ConfirmOutcome> {
     const deadline = now() + pollTimeoutMs;
-    let tx = null;
+    let tx: ParsedTransactionWithMeta | null = null;
+    /** The chain couldn't be asked (RPC error, or the server-wide lookup budget ran out). */
+    let unasked = false;
     for (;;) {
+      // Out of this wallet's own budget: pending, try later. Out of the server's: same, but it isn't
+      // the player's doing, so their intent is kept as if the chain had vouched for it.
+      if (!walletLookups.take(wallet)) break;
+      if (!globalLookups.take('*')) {
+        unasked = true;
+        break;
+      }
       try {
         tx = await rpc!.getParsedTransaction(signature);
       } catch (err) {
         log('getTransaction failed:', (err as Error)?.message ?? err);
         tx = null;
+        unasked = true;
       }
       if (tx || stopped || now() + pollIntervalMs > deadline) break;
       await sleep(pollIntervalMs);
     }
+    // Keep the intent confirmable for a day only when the chain shows this wallet signed this very
+    // transaction, or when the chain couldn't be asked. Junk signatures never extend an intent.
+    if (tx ? signedBy(tx, signature, wallet) : unasked) markBurnIntentClaimed(intent.id);
     if (!tx) return { status: 'pending' };
     const check = verifyBurn(tx, {
       signature,
@@ -456,11 +577,10 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
     const sig = signature as string;
     prune(now());
 
-    const pending = inFlight.get(sig);
-    if (pending) {
-      if (pending.intentId !== intentId || pending.wallet !== wallet) throw new BurnError(409, 'This transaction is already being confirmed.');
-      return pending.promise;
-    }
+    // The same confirm already running (a client retry): share its answer.
+    const key = `${sig}|${wallet}|${intentId}`;
+    const running = inFlight.get(key);
+    if (running) return running;
 
     const found = intentFor(wallet, intentId, sig);
     if ('receipt' in found) return { status: 'confirmed', receipt: found.receipt };
@@ -469,16 +589,18 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
     if (inFlight.size >= MAX_CONFIRMS_IN_FLIGHT) throw new BurnError(503, 'Busy confirming burns. Try again in a moment.');
     const mine = inFlightPerWallet.get(wallet) ?? 0;
     if (mine >= MAX_CONFIRMS_IN_FLIGHT_PER_WALLET) throw new BurnError(429, 'Too many confirmations at once. Try again in a moment.');
-    // A signature was named for it: the player probably signed, so keep it confirmable longer.
-    markBurnIntentClaimed(found.id);
+    // Bound before the chain is asked: an intent only ever gets a couple of signatures looked up.
+    const bound = bindBurnIntentSignature(found.id, sig, MAX_SIGNATURES_PER_INTENT);
+    if (bound === 'missing') throw new BurnError(404, 'Burn request not found or expired. Start a new one.');
+    if (bound === 'full') throw new BurnError(409, 'This burn request already has a transaction. Start a new one.');
     inFlightPerWallet.set(wallet, mine + 1);
-    const promise = confirmLive({ ...found, claimed: true }, sig, wallet).finally(() => {
-      inFlight.delete(sig);
+    const promise = confirmLive(found, sig, wallet).finally(() => {
+      inFlight.delete(key);
       const left = (inFlightPerWallet.get(wallet) ?? 1) - 1;
       if (left > 0) inFlightPerWallet.set(wallet, left);
       else inFlightPerWallet.delete(wallet);
     });
-    inFlight.set(sig, { intentId, wallet, promise });
+    inFlight.set(key, promise);
     return promise;
   }
 
@@ -497,6 +619,7 @@ export function createBurnService(opts: BurnServiceOptions): BurnService {
         at: b.at,
       };
       if (b.itemId !== undefined) r.itemId = b.itemId;
+      if (b.nameEffect) r.cosmetics = { name: b.nameEffect };
       return r;
     });
     return { mode, totalBurned: totals.totalBurned, burns: totals.burns, recent };

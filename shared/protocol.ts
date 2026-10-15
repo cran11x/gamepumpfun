@@ -54,6 +54,11 @@ export interface RoomView {
    * weekly ranked leaderboard.
    */
   ranked: boolean;
+  /**
+   * Ruggers playing this round (absent in the lobby). Ranked rooms always play maxRuggersFor(players),
+   * whatever settings.ruggers says, so clients must show this rather than compute it.
+   */
+  ruggerCount?: number;
 }
 
 /** Cosmetic item ids equipped per slot (see shared/cosmetics.ts). */
@@ -168,6 +173,13 @@ export interface GameOverView {
   reason: GameOverReason;
   /** playerId -> role for everyone in the game. */
   roles: Record<string, Role>;
+  /** Ranked rooms: weekly points each player still in the room earned this game (playerId -> points). */
+  rankedPoints?: Record<string, number>;
+  /**
+   * Ranked rooms: the game ended because players left (or everyone stayed idle), so it counts as a
+   * no-contest: nobody gets win or survival points, only points for rugs, tasks and correct votes.
+   */
+  noContest?: boolean;
 }
 
 /** Per-client view of the room. Sent at SERVER_TICK_HZ while playing, otherwise on change (>= 2 Hz). */
@@ -199,7 +211,8 @@ export interface Snapshot {
 // ---------- Client -> Server ----------
 
 export type C2S =
-  | { t: 'create'; name: string; authToken?: string; ranked?: boolean }
+  /** isPublic: false makes a private room (code only); omitted keeps the default (public). */
+  | { t: 'create'; name: string; authToken?: string; ranked?: boolean; isPublic?: boolean }
   | { t: 'join'; code: string; name: string; authToken?: string }
   | { t: 'quick'; name: string; authToken?: string; ranked?: boolean }
   | { t: 'rejoin'; code: string; playerId: string; sessionKey: string }
@@ -366,6 +379,8 @@ export interface BurnReceipt {
 export interface BurnRecord {
   shortAddress: string;
   name: string;
+  /** The burner's equipped name effect, so it shows next to their name. */
+  cosmetics?: Pick<EquippedCosmetics, 'name'>;
   amount: number;
   purpose: BurnPurpose;
   itemId?: string;
@@ -386,6 +401,8 @@ export interface RankedEntry {
   address: string;
   shortAddress: string;
   name: string;
+  /** The player's equipped name effect, so it shows on the board. */
+  cosmetics?: Pick<EquippedCosmetics, 'name'>;
   points: number;
   games: number;
   wins: number;

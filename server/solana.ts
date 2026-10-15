@@ -16,6 +16,7 @@ import {
   TOKEN_PROGRAM_ID,
   createBurnCheckedInstruction,
   getAssociatedTokenAddressSync,
+  getPermanentDelegate,
   unpackMint,
 } from '@solana/spl-token';
 import {
@@ -112,6 +113,12 @@ export interface MintInfo {
   decimals: number;
   /** Token program owning the mint: classic Token or Token-2022. */
   programId: string;
+  /**
+   * Things about the mint an operator should know (a live mint authority, a Token-2022 permanent
+   * delegate). Burns still work, and verifyBurn only counts burns from the player's own account, so a
+   * delegate can't pay with other people's tokens; the burn service logs these loudly at startup.
+   */
+  risks?: string[];
 }
 
 /** The mint account is missing or isn't a token mint: a configuration error, not worth retrying. */
@@ -129,15 +136,29 @@ export async function loadMintInfo(rpc: SolanaRpc, mint: string): Promise<MintIn
   if (!info) throw new MintConfigError(`TOKEN_MINT ${mint} does not exist on this cluster`);
   const programId = info.owner.toBase58();
   if (!TOKEN_PROGRAMS.has(programId)) throw new MintConfigError(`TOKEN_MINT ${mint} is not owned by the Token or Token-2022 program`);
-  let decimals: number;
+  let parsed: ReturnType<typeof unpackMint>;
   try {
-    const parsed = unpackMint(mintKey, info, info.owner);
+    parsed = unpackMint(mintKey, info, info.owner);
     if (!parsed.isInitialized) throw new Error('not initialized');
-    decimals = parsed.decimals;
   } catch (err) {
     throw new MintConfigError(`TOKEN_MINT ${mint} is not a valid token mint (${(err as Error).message})`);
   }
-  return { mint, decimals, programId };
+  const risks: string[] = [];
+  if (parsed.mintAuthority) {
+    risks.push(`TOKEN_MINT ${mint} still has a mint authority (${parsed.mintAuthority.toBase58()}): new tokens can be minted, so burns cost whoever holds it nothing`);
+  }
+  let permanentDelegate: PublicKey | null = null;
+  try {
+    permanentDelegate = getPermanentDelegate(parsed)?.delegate ?? null;
+  } catch {
+    permanentDelegate = null;
+  }
+  if (permanentDelegate && !permanentDelegate.equals(PublicKey.default)) {
+    risks.push(`TOKEN_MINT ${mint} has a Token-2022 permanent delegate (${permanentDelegate.toBase58()}) that can burn any holder's tokens; only burns from a player's own account are counted`);
+  }
+  const out: MintInfo = { mint, decimals: parsed.decimals, programId };
+  if (risks.length > 0) out.risks = risks;
+  return out;
 }
 
 // ---------- Building ----------
@@ -263,12 +284,12 @@ export interface BurnExpectation {
 }
 
 export type BurnRejectReason =
-  | 'not_found' // a different transaction came back
+  | 'not_found' // a different transaction came back (or the signature isn't its id)
   | 'no_meta'
   | 'failed' // meta.err set
   | 'not_signer'
-  | 'no_memo'
-  | 'no_burn' // nothing burned of this mint by this wallet
+  | 'no_memo' // no memo, another memo, or more than one memo
+  | 'no_burn' // nothing burned of this mint by this wallet from its own account
   | 'amount' // burned, but less than required
   | 'no_block_time' // can't check the window yet
   | 'window';
@@ -301,19 +322,24 @@ function memoText(ix: AnyInstruction): string | null {
 
 /**
  * Check a landed burn transaction against an intent:
- * - it is the transaction asked for, with meta and `meta.err === null`;
+ * - it is the transaction asked for (the signature is its id, `signatures[0]`), with meta and
+ *   `meta.err === null`;
  * - the wallet signed it;
- * - some memo instruction (top level or inner) is exactly the intent memo;
- * - parsed `burn` / `burnChecked` instructions (top level and inner) whose authority is the wallet
- *   and whose mint is the token's burn at least `amountRaw` in total. A plain `burn` has its mint
- *   resolved through `meta.preTokenBalances`; any instruction whose mint can't be pinned down, or
- *   disagrees with the token balances, is not counted;
+ * - it carries exactly one memo instruction (top level or inner, either memo program), and that memo
+ *   is exactly the intent memo, so one transaction can never pay for two intents;
+ * - parsed `burn` / `burnChecked` instructions (top level and inner) whose authority is the wallet,
+ *   whose account the wallet OWNS (per `meta.preTokenBalances`; a delegate or a Token-2022 permanent
+ *   delegate burning someone else's tokens doesn't count) and whose mint is the token burn at least
+ *   `amountRaw` in total. A plain `burn` has its mint resolved through `meta.preTokenBalances`; any
+ *   instruction whose account, owner or mint can't be pinned down, or disagrees with the token
+ *   balances, is not counted;
  * - blockTime is inside the intent window.
  */
 export function verifyBurn(tx: ParsedTransactionWithMeta | null, exp: BurnExpectation): BurnCheck {
   if (!tx) return { ok: false, reason: 'not_found', message: 'Transaction not found' };
+  // Only the first signature identifies a transaction; a co-signer's signature is not a second id.
   const signatures = tx.transaction?.signatures ?? [];
-  if (!signatures.includes(exp.signature)) return { ok: false, reason: 'not_found', message: 'Transaction not found' };
+  if (signatures[0] !== exp.signature) return { ok: false, reason: 'not_found', message: 'Transaction not found' };
   const meta = tx.meta;
   if (!meta) return { ok: false, reason: 'no_meta', message: 'The transaction has no status yet' };
   if (meta.err !== null) return { ok: false, reason: 'failed', message: 'The burn transaction failed on-chain' };
@@ -326,15 +352,16 @@ export function verifyBurn(tx: ParsedTransactionWithMeta | null, exp: BurnExpect
   const all: AnyInstruction[] = [...tx.transaction.message.instructions];
   for (const inner of meta.innerInstructions ?? []) all.push(...inner.instructions);
 
-  if (!all.some((ix) => memoText(ix) === exp.memo)) {
+  const memos = all.filter((ix) => MEMO_PROGRAMS.has(keyString(ix.programId)));
+  if (memos.length !== 1 || memoText(memos[0]) !== exp.memo) {
     return { ok: false, reason: 'no_memo', message: "The transaction doesn't carry this burn's memo" };
   }
 
-  // account address -> mint, from the token balances before the transaction ran.
-  const mintOf = new Map<string, string>();
+  // account address -> {mint, owner}, from the token balances before the transaction ran.
+  const balanceOf = new Map<string, { mint: string; owner: string | undefined }>();
   for (const b of meta.preTokenBalances ?? []) {
     const key = accountKeys[b.accountIndex]?.pubkey;
-    if (key && typeof b.mint === 'string') mintOf.set(key, b.mint);
+    if (key && typeof b.mint === 'string') balanceOf.set(key, { mint: b.mint, owner: typeof b.owner === 'string' ? b.owner : undefined });
   }
 
   let burned = 0n;
@@ -345,13 +372,16 @@ export function verifyBurn(tx: ParsedTransactionWithMeta | null, exp: BurnExpect
     const info = parsed.info;
     if (parsed.type !== 'burn' && parsed.type !== 'burnChecked') continue;
     if (info.authority !== exp.wallet || typeof info.account !== 'string') continue;
-    const balanceMint = mintOf.get(info.account);
+    // The tokens must be the wallet's own: an unknown owner fails closed.
+    const balance = balanceOf.get(info.account);
+    if (!balance || balance.owner !== exp.wallet) continue;
+    const balanceMint = balance.mint;
     let mint: unknown;
     let amount: unknown;
     if (parsed.type === 'burnChecked') {
       mint = info.mint;
       amount = (info.tokenAmount as { amount?: unknown } | undefined)?.amount;
-      if (balanceMint !== undefined && balanceMint !== mint) continue;
+      if (balanceMint !== mint) continue;
     } else {
       // Plain burn: the mint comes from the account's token balance; a parsed `mint`, when present, must agree.
       mint = balanceMint;
@@ -361,7 +391,7 @@ export function verifyBurn(tx: ParsedTransactionWithMeta | null, exp: BurnExpect
     if (mint !== exp.mint || typeof amount !== 'string' || !DIGITS_RE.test(amount)) continue;
     burned += BigInt(amount);
   }
-  if (burned === 0n) return { ok: false, reason: 'no_burn', message: "The transaction doesn't burn the token from your wallet" };
+  if (burned === 0n) return { ok: false, reason: 'no_burn', message: "The transaction doesn't burn the token from your own token account" };
   if (burned < exp.amountRaw) return { ok: false, reason: 'amount', message: 'The transaction burned less than the price' };
 
   const blockTime = tx.blockTime;

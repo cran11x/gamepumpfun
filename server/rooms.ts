@@ -17,7 +17,7 @@ import {
   type RoomProfileLike,
   type WalletIdentity,
 } from './game';
-import { consumeRankedTickets, getProfile, recordGameResults, recordRankedResults } from './store';
+import { consumeRankedTickets, getProfile, recordGameResults, recordRankedResults, refundRankedTickets } from './store';
 
 /** SPEC: 4 letters from this alphabet (no I or O). */
 export const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -69,6 +69,8 @@ export interface RoomManagerOptions {
   consumeRankedTickets?: (addresses: string[]) => ConsumeTicketsResult;
   /** Weekly ranked points at game over (server/store.ts). */
   recordRankedResults?: (records: RankedResultRecordLike[]) => void;
+  /** Tickets back for ranked rounds aborted by a shutdown (server/store.ts). */
+  refundRankedTickets?: (addresses: string[]) => void;
   /** Lifetime stats at game over (server/store.ts). */
   recordGameResults?: (records: GameResultRecordLike[]) => void;
 }
@@ -95,6 +97,7 @@ export class RoomManager {
   private readonly profileOf: NonNullable<RoomManagerOptions['profileOf']>;
   private readonly consumeTickets: NonNullable<RoomManagerOptions['consumeRankedTickets']>;
   private readonly recordRanked: NonNullable<RoomManagerOptions['recordRankedResults']>;
+  private readonly refundTickets: NonNullable<RoomManagerOptions['refundRankedTickets']>;
   private readonly recordGame: NonNullable<RoomManagerOptions['recordGameResults']>;
   private timer: ReturnType<typeof setInterval> | null = null;
   /** Failed room lookups per client IP, and IPs blocked from lookups until a time. */
@@ -114,6 +117,7 @@ export class RoomManager {
     this.profileOf = opts.profileOf ?? ((address) => getProfile(address));
     this.consumeTickets = opts.consumeRankedTickets ?? ((addresses) => consumeRankedTickets(addresses));
     this.recordRanked = opts.recordRankedResults ?? ((records) => recordRankedResults(records));
+    this.refundTickets = opts.refundRankedTickets ?? ((addresses) => void refundRankedTickets(addresses));
     this.recordGame = opts.recordGameResults ?? ((records) => recordGameResults(records));
     this.lookupFails = new RateLimiter(LOOKUP_FAIL_LIMIT, LOOKUP_FAIL_WINDOW_MS, 50_000, this.now);
   }
@@ -126,10 +130,18 @@ export class RoomManager {
     this.timer = setInterval(() => this.tick(), Math.round(1000 / SERVER_TICK_HZ));
   }
 
+  /** Stop ticking and close every room. Ranked rounds in progress give their tickets back (Room.abort). */
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    for (const code of [...this.rooms.keys()]) this.destroy(code);
+    for (const [code, room] of [...this.rooms]) {
+      try {
+        room.abort();
+      } catch (err) {
+        this.log(`room ${code} abort failed`, err);
+      }
+      this.destroy(code);
+    }
   }
 
   /** Tick every room; destroy the ones with no humans left. */
@@ -183,7 +195,7 @@ export class RoomManager {
         conn.send({ t: 'pong', ts: msg.ts, serverNow: this.now() });
         return;
       case 'create':
-        this.create(conn, msg.name, msg.authToken, msg.ranked === true);
+        this.create(conn, msg.name, msg.authToken, msg.ranked === true, msg.isPublic);
         return;
       case 'join':
         this.join(conn, msg.code, msg.name, msg.authToken);
@@ -212,17 +224,32 @@ export class RoomManager {
 
   // ---------- Create / join / quick / rejoin / leave ----------
 
-  private create(conn: Conn, name: string, authToken: string | undefined, ranked: boolean): void {
+  private create(conn: Conn, name: string, authToken: string | undefined, ranked: boolean, isPublic?: boolean): void {
     if (!this.joinAllowed(conn)) return;
     if (this.rooms.size >= MAX_ROOMS) return this.error(conn, 'INVALID_ACTION', 'Server is full, try again soon');
     const wallet = this.resolveWallet(authToken);
     // Checked before leaving the current room, so a refused ranked create keeps your seat.
     if (ranked) {
-      const denied = rankedEntryError(wallet, this.profileOf);
+      const denied = rankedEntryError(wallet, this.profileOf) ?? this.otherRankedSeat(conn, wallet);
       if (denied) return this.error(conn, denied.code, denied.message);
     }
     this.leave(conn);
-    this.seat(conn, this.createRoom({ ranked, forcePublic: false }), name, wallet);
+    this.seat(conn, this.createRoom({ ranked, isPublic }), name, wallet);
+  }
+
+  /**
+   * One ranked seat per wallet across the server: a wallet seated in another ranked room (another tab)
+   * can't take a second one, so one ticket can't hold seats in several lobbies and nobody plays two
+   * ranked games at once. The room this connection is about to leave doesn't count.
+   */
+  private otherRankedSeat(conn: Conn, wallet: WalletIdentity | null): { code: ErrorCode; message: string } | null {
+    if (!wallet) return null;
+    const current = conn.binding?.code;
+    for (const room of this.rooms.values()) {
+      if (!room.ranked || room.code === current || !room.hasWallet(wallet.address)) continue;
+      return { code: 'INVALID_ACTION', message: `This wallet already has a seat in ranked room ${room.code}. Leave it first.` };
+    }
+    return null;
   }
 
   private join(conn: Conn, rawCode: string, name: string, authToken?: string): void {
@@ -246,6 +273,8 @@ export class RoomManager {
     const wallet = this.resolveWallet(authToken);
     const allowed = room.checkJoin(wallet);
     if (!allowed.ok) return this.error(conn, allowed.code, allowed.message);
+    const elsewhere = room.ranked ? this.otherRankedSeat(conn, wallet) : null;
+    if (elsewhere) return this.error(conn, elsewhere.code, elsewhere.message);
     this.leave(conn);
     this.seat(conn, room, name, wallet);
   }
@@ -259,7 +288,7 @@ export class RoomManager {
     if (!this.joinAllowed(conn)) return;
     const wallet = this.resolveWallet(authToken);
     if (ranked) {
-      const denied = rankedEntryError(wallet, this.profileOf);
+      const denied = rankedEntryError(wallet, this.profileOf) ?? this.otherRankedSeat(conn, wallet);
       if (denied) return this.error(conn, denied.code, denied.message);
     }
     const current = conn.binding?.code;
@@ -274,7 +303,7 @@ export class RoomManager {
     }
     if (!best && this.rooms.size >= MAX_ROOMS) return this.error(conn, 'INVALID_ACTION', 'Server is full, try again soon');
     this.leave(conn);
-    this.seat(conn, best ?? this.createRoom({ ranked, forcePublic: true }), name, wallet);
+    this.seat(conn, best ?? this.createRoom({ ranked, isPublic: true }), name, wallet);
   }
 
   private rejoin(conn: Conn, rawCode: string, playerId: string, sessionKey: string): void {
@@ -345,7 +374,8 @@ export class RoomManager {
 
   // ---------- Internals ----------
 
-  private createRoom(opts: { ranked: boolean; forcePublic: boolean }): Room {
+  /** `isPublic` undefined keeps the default (public), true/false sets it (ranked rooms allow it too). */
+  private createRoom(opts: { ranked: boolean; isPublic?: boolean }): Room {
     const code = this.newCode();
     const room = new Room({
       code,
@@ -353,7 +383,7 @@ export class RoomManager {
       rng: this.rng,
       send: (playerId, msg) => this.sendTo(code, playerId, msg),
       ticker: this.ticker(),
-      settings: opts.forcePublic ? { isPublic: true } : undefined,
+      settings: typeof opts.isPublic === 'boolean' ? { isPublic: opts.isPublic } : undefined,
       ranked: opts.ranked,
       createBotBrain: (init) => new BotBrain(init),
       botName: (i) => botName(i),
@@ -361,6 +391,7 @@ export class RoomManager {
       profileOf: this.profileOf,
       consumeRankedTickets: this.consumeTickets,
       recordRankedResults: this.recordRanked,
+      refundRankedTickets: this.refundTickets,
       onPlayerRemoved: (playerId) => this.unbind(code, playerId),
       log: (m, e) => this.log(`room ${code}: ${m}`, e),
     });

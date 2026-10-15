@@ -31,6 +31,7 @@ import {
   USE_RANGE,
   VENT_RANGE,
   maxRuggersFor,
+  rankedPointsFor,
   type GameSettings,
 } from '../shared/constants';
 import { COSMETIC_SLOTS, isCosmeticForSlot } from '../shared/cosmetics';
@@ -296,6 +297,8 @@ export interface RoomOptions {
   consumeRankedTickets?: (addresses: string[]) => ConsumeTicketsResult;
   /** Ranked game over: weekly points (server/store.ts `recordRankedResults`). */
   recordRankedResults?: (records: RankedResultRecordLike[]) => void;
+  /** Ranked round aborted by a shutdown: one ticket back to each seated player (server/store.ts). */
+  refundRankedTickets?: (addresses: string[]) => void;
   /** Called after a player has been removed so the socket layer can unbind them. */
   onPlayerRemoved?: (playerId: string, reason: RemoveReason) => void;
   log?: (message: string, err?: unknown) => void;
@@ -358,6 +361,11 @@ export interface PlayerState {
    * Freezing them means nobody, a ghost included, can signal anything by re-equipping mid-game.
    */
   roundCosmetics: EquippedCosmetics | undefined;
+  /**
+   * Did something this round: an accepted move, a task, a vote, a rug, a report, a sabotage or fix, a
+   * vent. Ranked pays win and survival points only to players who did (no AFK farming).
+   */
+  active: boolean;
 }
 
 interface ActiveSabotage {
@@ -450,6 +458,13 @@ export class Room {
   private readonly profileOfFn?: (address: string) => RoomProfileLike | null;
   private readonly consumeTicketsFn?: (addresses: string[]) => ConsumeTicketsResult;
   private readonly recordRankedFn?: (records: RankedResultRecordLike[]) => void;
+  private readonly refundTicketsFn?: (addresses: string[]) => void;
+  /** Ranked: wallets the host kicked. They can't come back into this room. */
+  private readonly kickedAddresses = new Set<string>();
+  /** Ruggers playing the current round (0 in the lobby). */
+  private roundRuggers = 0;
+  /** True while a removal's win check runs: a game that ends there ended because players left. */
+  private checkingRemoval = false;
   /** Profiles read during one tick's snapshots (every viewer's snapshot shows the same players). */
   private profileCache: Map<string, RoomProfileLike | null> | null = null;
   private readonly onPlayerRemoved?: (playerId: string, reason: RemoveReason) => void;
@@ -494,6 +509,7 @@ export class Room {
     this.profileOfFn = opts.profileOf;
     this.consumeTicketsFn = opts.consumeRankedTickets;
     this.recordRankedFn = opts.recordRankedResults;
+    this.refundTicketsFn = opts.refundRankedTickets;
     this.onPlayerRemoved = opts.onPlayerRemoved;
     this.log = opts.log ?? ((m, e) => console.error(`[room ${opts.code}] ${m}`, e ?? ''));
     // Ranked settings are locked to the defaults; only isPublic may differ.
@@ -591,6 +607,9 @@ export class Room {
       if (wallet && this.hasWallet(wallet.address)) {
         return { ok: false, code: 'INVALID_ACTION', message: 'This wallet already has a seat in this room' };
       }
+      if (wallet && this.kickedAddresses.has(wallet.address)) {
+        return { ok: false, code: 'INVALID_ACTION', message: 'The host removed you from this room' };
+      }
     }
     return { ok: true };
   }
@@ -647,6 +666,38 @@ export class Room {
   /** Explicit `leave`: removed immediately in any phase. */
   leave(playerId: string): void {
     this.removePlayer(playerId, 'left');
+  }
+
+  /**
+   * The server is going away (shutdown or deploy) and nobody can finish this round. In a ranked round,
+   * every player still seated gets their ticket back (all at once), and players who already left keep
+   * their leftEarly. Then the room is disposed.
+   */
+  abort(): void {
+    if (this.disposed) return;
+    const phase = this._phase;
+    const inRound = phase === 'roleReveal' || phase === 'playing' || phase === 'meeting' || phase === 'ejection';
+    if (this.ranked && inRound) {
+      const seated = [...this.players.values()].filter((p) => p.address).map((p) => p.address as string);
+      if (seated.length > 0) {
+        try {
+          if (this.refundTicketsFn) this.refundTicketsFn(seated);
+          else this.log('ranked round aborted without a refundRankedTickets hook');
+        } catch (err) {
+          this.log('refundRankedTickets failed', err);
+        }
+      }
+      const left = this.departed.filter((p) => p.address).map((p) => this.leftEarlyRecord(p));
+      this.departed = [];
+      if (left.length > 0 && this.recordRankedFn) {
+        try {
+          this.recordRankedFn(left);
+        } catch (err) {
+          this.log('recordRankedResults failed', err);
+        }
+      }
+    }
+    this.dispose();
   }
 
   /** Stop everything (room destroyed). */
@@ -851,6 +902,8 @@ export class Room {
     if (!this.requireHostInLobby(p)) return;
     const target = this.players.get(targetId);
     if (!target || target.id === p.id) return this.err(p, 'INVALID_ACTION', 'Cannot kick that player');
+    // Ranked: a kicked wallet can't simply join again (kick churn, flapping sockets blocking START).
+    if (this.ranked && target.address) this.kickedAddresses.add(target.address);
     if (!target.isBot) this.safeSend(target.id, { t: 'event', event: { kind: 'kicked' } });
     this.removePlayer(target.id, 'kicked');
   }
@@ -921,8 +974,10 @@ export class Room {
       p.stats = freshStats();
       p.facing = 1;
       p.roundCosmetics = this.liveCosmetics(p);
+      p.active = false;
       this.placeAtSpawn(p, now);
     });
+    this.roundRuggers = ruggerCount;
     this.bodies = [];
     this.sabotage = null;
     this.sabotageReadyAt = now + POST_MEETING_COOLDOWN_MS;
@@ -976,6 +1031,7 @@ export class Room {
       return;
     }
     p.moveBudget -= d;
+    if (d > 0) p.active = true;
     p.x = x;
     p.y = y;
     p.facing = facing;
@@ -1040,6 +1096,7 @@ export class Room {
     if (now - p.openedAt < TASK_MIN_MS[station.kind]) return this.err(p, 'INVALID_ACTION', 'Too fast, finish the task');
     if (dist(p, station) > USE_RANGE * 1.5) return this.err(p, 'INVALID_ACTION', 'Too far from the station');
     p.activeStationId = null;
+    p.active = true;
     this.dirty = true;
     // Ruggers' tasks are fake: closing them is all that happens.
     if (p.role !== 'holder' || task.done) return;
@@ -1073,6 +1130,7 @@ export class Room {
     this.bodies.push(body);
     p.killReadyAt = now + this._settings.killCooldown * 1000;
     p.stats.rugs++;
+    p.active = true;
     const recipients = new Map<string, PlayerState>([
       [p.id, p],
       [target.id, target],
@@ -1089,6 +1147,7 @@ export class Room {
     const body = this.bodies.find((b) => b.id === bodyId);
     if (!body) return this.err(p, 'INVALID_ACTION', 'Nothing to report');
     if (dist(p, body) > REPORT_RANGE) return this.err(p, 'INVALID_ACTION', 'Too far to report');
+    p.active = true;
     this.startMeeting(p, 'report', body.color);
   }
 
@@ -1099,6 +1158,7 @@ export class Room {
     if (this.sabotage?.kind === 'devDump') return this.err(p, 'INVALID_ACTION', 'Stop the DEV DUMP first');
     if (dist(p, EMERGENCY_BUTTON) > EMERGENCY_RANGE) return this.err(p, 'INVALID_ACTION', 'Too far from the SPACES button');
     p.emergencyLeft--;
+    p.active = true;
     this.startMeeting(p, 'emergency');
   }
 
@@ -1159,6 +1219,7 @@ export class Room {
       if (!t || !t.alive) return this.err(p, 'INVALID_ACTION', 'Cannot vote for that player');
     }
     m.votes.set(p.id, target);
+    p.active = true;
     this.dirty = true;
     this.checkAllVoted();
   }
@@ -1205,8 +1266,9 @@ export class Room {
       if (ejected.role === 'rugger' && m) {
         for (const [voterId, target] of m.votes) {
           if (target !== ejected.id) continue;
+          // Only a Holder's vote is a correct read: a Rugger voting out a partner (or himself) isn't.
           const voter = this.players.get(voterId);
-          if (voter) voter.stats.correctVotes++;
+          if (voter && voter.role === 'holder') voter.stats.correctVotes++;
         }
       }
     }
@@ -1251,6 +1313,7 @@ export class Room {
     const sab: ActiveSabotage = { kind, startedAt: now, stations, holds: new Map(stations.map((id) => [id, new Set<string>()])) };
     if (kind === 'devDump') sab.endsAt = now + DEV_DUMP_DURATION_MS;
     this.sabotage = sab;
+    p.active = true;
     this.emit({ kind: 'sabotageStarted', sabotage: kind });
     this.dirty = true;
   }
@@ -1270,6 +1333,7 @@ export class Room {
       if (dist(p, station) > USE_RANGE) return this.err(p, 'INVALID_ACTION', 'Too far from the BUY WALL');
       this.dropHolds(p.id);
       s.holds.get(stationId)?.add(p.id);
+      p.active = true;
       this.dirty = true;
       // Fixed the moment both BUY WALLs are held, so a hold made in time never loses to tick timing.
       if (this.bothWallsHeld(s)) this.fixSabotage();
@@ -1278,6 +1342,7 @@ export class Room {
     if (action !== 'done') return;
     if (!p.alive || p.ventId !== null) return this.err(p, 'INVALID_ACTION', 'Cannot fix right now');
     if (dist(p, station) > USE_RANGE * 1.5) return this.err(p, 'INVALID_ACTION', 'Too far from the console');
+    p.active = true;
     this.fixSabotage();
   }
 
@@ -1338,6 +1403,7 @@ export class Room {
     for (const seen of this.interest.values()) seen.delete(p.id);
     p.ventId = vent.id;
     p.activeStationId = null;
+    p.active = true;
     this.dropHolds(p.id);
     this.teleport(p, vent.x, vent.y, this.now());
     this.dirty = true;
@@ -1349,6 +1415,7 @@ export class Room {
     const next = ventById(ventId);
     if (!current || !next || !current.links.includes(next.id)) return this.err(p, 'INVALID_ACTION', 'Bridges are not linked');
     p.ventId = next.id;
+    p.active = true;
     this.teleport(p, next.x, next.y, this.now());
     this.dirty = true;
   }
@@ -1423,6 +1490,7 @@ export class Room {
     this.ejection = null;
     this.gameOver = null;
     this.departed = [];
+    this.roundRuggers = 0;
     let slot = 0;
     for (const p of this.players.values()) {
       p.role = 'holder';
@@ -1435,6 +1503,7 @@ export class Room {
       p.emergencyLeft = this._settings.emergencyMeetings;
       p.stats = freshStats();
       p.roundCosmetics = undefined;
+      p.active = false;
       p.slot = slot++;
       this.placeAtSpawn(p, now);
     }
@@ -1471,6 +1540,9 @@ export class Room {
   }
 
   private endGame(winner: Winner, reason: GameOverReason): true {
+    // Ranked: a game that ends because players left is a no-contest (no farming wins with alts or
+    // colluders who quit, or by quitting with open tasks).
+    const noContest = this.ranked && this.checkingRemoval;
     this._phase = 'gameOver';
     this.phaseEndsAt = undefined;
     this.sabotage = null;
@@ -1489,16 +1561,27 @@ export class Room {
     const headline = winner === 'holders' ? 'GRADUATED: Holders win' : 'RUGGED: Ruggers win';
     const reveal = ruggerNames.length ? ` Rugger${ruggerNames.length === 1 ? '' : 's'}: ${ruggerNames.join(', ')}.` : '';
     this.system(`${headline}, ${REASON_TEXT[reason]}.${reveal}`);
-    this.recordResults(winner);
+    if (noContest) this.system('Ranked: players left, so this game is a no-contest. No win points this time.');
+    const points = this.recordResults(winner, noContest);
+    if (this.ranked) {
+      this.gameOver.rankedPoints = points;
+      if (noContest) this.gameOver.noContest = true;
+    }
     this.dirty = true;
     return true;
   }
 
-  private recordResults(winner: Winner): void {
+  private leftEarlyRecord(p: PlayerState): RankedResultRecordLike {
+    return { address: p.address as string, role: p.role, won: false, rugs: 0, tasksDone: 0, correctVotes: 0, survived: false, leftEarly: true };
+  }
+
+  /** Lifetime and (ranked) weekly results. Returns the weekly points of the players still in the room. */
+  private recordResults(winner: Winner, noContest: boolean): Record<string, number> {
     const departed = this.departed;
     this.departed = [];
     const records: GameResultRecordLike[] = [];
     const ranked: RankedResultRecordLike[] = [];
+    const points: Record<string, number> = {};
     const seen = new Set<string>();
     const add = (p: PlayerState, left: boolean) => {
       if (!p.address || seen.has(p.address)) return;
@@ -1514,21 +1597,24 @@ export class Room {
         wasRugged: p.stats.wasRugged,
       });
       if (!this.ranked) return;
-      // SPEC: a player removed before the end gets leftEarly instead of everything else.
-      ranked.push(
-        left
-          ? { address: p.address, role: p.role, won: false, rugs: 0, tasksDone: 0, correctVotes: 0, survived: false, leftEarly: true }
-          : {
-              address: p.address,
-              role: p.role,
-              won: teamWon,
-              rugs: p.stats.rugs,
-              tasksDone: p.stats.tasksDone,
-              correctVotes: p.stats.correctVotes,
-              survived: p.alive,
-              leftEarly: false,
-            },
-      );
+      // SPEC: a player removed before the end gets leftEarly instead of everything else. Win and
+      // survival points also need a real game: not a no-contest, still connected at the end (not
+      // sitting out the reconnect grace), and active during the round (not AFK).
+      const credited = !noContest && p.connected && p.active;
+      const record: RankedResultRecordLike = left
+        ? this.leftEarlyRecord(p)
+        : {
+            address: p.address,
+            role: p.role,
+            won: teamWon && credited,
+            rugs: p.stats.rugs,
+            tasksDone: p.stats.tasksDone,
+            correctVotes: p.stats.correctVotes,
+            survived: p.alive && credited,
+            leftEarly: false,
+          };
+      ranked.push(record);
+      if (!left) points[p.id] = rankedPointsFor(record);
     };
     for (const p of this.players.values()) add(p, false);
     for (const p of departed) add(p, true);
@@ -1542,7 +1628,7 @@ export class Room {
     if (ranked.length > 0) {
       if (!this.recordRankedFn) {
         this.log('ranked game over without a recordRankedResults hook');
-        return;
+        return points;
       }
       try {
         this.recordRankedFn(ranked);
@@ -1550,11 +1636,12 @@ export class Room {
         this.log('recordRankedResults failed', err);
       }
     }
+    return points;
   }
 
   // ---------- Removal and host migration ----------
 
-  private removePlayer(playerId: string, reason: RemoveReason): void {
+  private removePlayer(playerId: string, reason: RemoveReason, opts: { deferChecks?: boolean } = {}): void {
     const p = this.players.get(playerId);
     if (!p) return;
     const phase = this._phase;
@@ -1582,7 +1669,19 @@ export class Room {
       this.log('onPlayerRemoved threw', err);
     }
     // A removed player counts as dead with no body; their tasks leave the curve.
-    if (inRound && !this.checkWin()) this.checkAllVoted();
+    if (inRound && !opts.deferChecks) this.checkAfterRemoval();
+  }
+
+  /** Win / all-voted checks after players left. A game that ends here ended because of the departures. */
+  private checkAfterRemoval(): void {
+    this.checkingRemoval = true;
+    let ended: boolean;
+    try {
+      ended = this.checkWin();
+    } finally {
+      this.checkingRemoval = false;
+    }
+    if (!ended) this.checkAllVoted();
   }
 
   /** The oldest remaining human becomes host (connected ones first). Bots never host. */
@@ -1630,12 +1729,20 @@ export class Room {
     }
   }
 
+  /**
+   * Remove every seat whose reconnect grace ran out, all of them before a single win check: players
+   * who dropped at the same moment are treated the same (all leftEarly), whatever the removal order.
+   */
   private expireDisconnected(now: number): void {
-    for (const p of [...this.players.values()]) {
-      if (!p.isBot && !p.connected && p.disconnectedAt !== null && now - p.disconnectedAt >= RECONNECT_GRACE_MS) {
-        this.removePlayer(p.id, 'timeout');
-      }
+    const expired: string[] = [];
+    for (const p of this.players.values()) {
+      if (!p.isBot && !p.connected && p.disconnectedAt !== null && now - p.disconnectedAt >= RECONNECT_GRACE_MS) expired.push(p.id);
     }
+    if (expired.length === 0) return;
+    const phase = this._phase;
+    const inRound = phase === 'roleReveal' || phase === 'playing' || phase === 'meeting' || phase === 'ejection';
+    for (const id of expired) this.removePlayer(id, 'timeout', { deferChecks: true });
+    if (inRound) this.checkAfterRemoval();
   }
 
   private advanceTimers(now: number): void {
@@ -1728,12 +1835,16 @@ export class Room {
       taskProgress: this.progressFor(viewer),
       sabotage: this.sabotageView(),
     };
+    if (phase !== 'lobby' && this.roundRuggers > 0) snap.room.ruggerCount = this.roundRuggers;
     const endsAt = phase === 'meeting' ? this.meeting?.stageEndsAt : this.phaseEndsAt;
     if (endsAt !== undefined) snap.phaseEndsAt = endsAt;
     if (phase !== 'lobby') snap.me = this.meView(viewer);
     if (phase === 'meeting' && this.meeting) snap.meeting = this.meetingView(viewer, this.meeting);
     if (phase === 'ejection' && this.ejection) snap.ejection = { ...this.ejection };
-    if (phase === 'gameOver' && this.gameOver) snap.gameOver = { ...this.gameOver, roles: { ...this.gameOver.roles } };
+    if (phase === 'gameOver' && this.gameOver) {
+      snap.gameOver = { ...this.gameOver, roles: { ...this.gameOver.roles } };
+      if (this.gameOver.rankedPoints) snap.gameOver.rankedPoints = { ...this.gameOver.rankedPoints };
+    }
     return snap;
   }
 
@@ -2126,6 +2237,7 @@ export class Room {
       lastChatAt: -Infinity,
       stats: freshStats(),
       roundCosmetics: undefined,
+      active: false,
     };
   }
 

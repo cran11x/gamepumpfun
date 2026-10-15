@@ -31,6 +31,7 @@ import {
   getRankedLeaderboard,
   isCosmeticSlot,
   isLeaderboardSort,
+  isImpersonatingName,
   sanitizeProfileName,
   setProfileName,
   type EquipError,
@@ -276,6 +277,9 @@ export function createApiRouter(deps: ApiDeps): Router {
     if (typeof raw !== 'string') return fail(res, 400, 'Expected { name }');
     const name = sanitizeProfileName(raw);
     if (!name) return fail(res, 400, "Name can't be empty");
+    if (isImpersonatingName(name, (req as AuthedRequest).profile!.address)) {
+      return fail(res, 400, "That name looks like another wallet's address. Pick something else.");
+    }
     const profile = setProfileName((req as AuthedRequest).profile!.address, name);
     if (!profile) return fail(res, 401, 'Not signed in');
     res.json(profile);

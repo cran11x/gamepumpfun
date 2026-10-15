@@ -76,6 +76,8 @@ export function parseC2S(raw: unknown): C2S | null {
       const msg: Extract<C2S, { t: 'create' | 'quick' }> = authToken ? { t: raw.t, name, authToken } : { t: raw.t, name };
       // Only a literal `true` asks for ranked; anything else is a normal room.
       if (raw.ranked === true) msg.ranked = true;
+      // Only create picks visibility (quick play always makes public rooms).
+      if (raw.t === 'create' && typeof raw.isPublic === 'boolean') (msg as Extract<C2S, { t: 'create' }>).isPublic = raw.isPublic;
       return msg;
     }
     case 'join': {

@@ -9,8 +9,10 @@ import { WebSocket, WebSocketServer, type RawData } from 'ws';
 import { GAME_NAME } from '../shared/constants';
 import type { C2S, S2C } from '../shared/protocol';
 import { clientKey, createApiRouter } from './api';
+import { ConfigError, getBurnSettings } from './config';
 import { parseC2S } from './game/validate';
 import { RoomManager, type Binding, type Conn } from './rooms';
+import { flushStore } from './store';
 
 const PORT = (() => {
   const n = Number(process.env.PORT);
@@ -118,14 +120,22 @@ function upgradeClientKey(app: express.Express, req: http.IncomingMessage): stri
 
 /**
  * SPEC: the server refuses to start in burn mock mode when NODE_ENV=production, because mock burns
- * accept fake signatures (free ranked tickets and cosmetics). Matched loosely so a stray space or
- * capital can't slip past.
+ * accept fake signatures (free ranked tickets and cosmetics). It also refuses mock mode next to a real
+ * TOKEN_MINT. Matched loosely so a stray space or capital can't slip past; server/config.ts
+ * getBurnSettings is the source of truth and is asked as well.
  */
 function refuseMockBurnsInProduction(): void {
   const mode = (process.env.BURN_MODE ?? '').trim().toLowerCase();
   const env = (process.env.NODE_ENV ?? '').trim().toLowerCase();
   if (mode === 'mock' && env === 'production') {
     console.error('[server] BURN_MODE=mock is refused when NODE_ENV=production. Unset BURN_MODE to use real burns.');
+    process.exit(1);
+  }
+  try {
+    getBurnSettings();
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    console.error(`[server] ${err.message}`);
     process.exit(1);
   }
 }
@@ -287,7 +297,9 @@ function main(): void {
     shuttingDown = true;
     console.log(`[server] ${signal}: shutting down`);
     clearInterval(heartbeat);
+    // Aborted ranked rounds refund their tickets here; write that out before anything else can fail.
     manager.stop();
+    flushStore();
     for (const ws of wss.clients) {
       try {
         ws.close(1001, 'server restarting');

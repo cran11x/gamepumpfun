@@ -38,6 +38,7 @@ import {
   CLAIMED_RETENTION_MS,
   INTENT_TTL_MS,
   MAX_OPEN_INTENTS_PER_WALLET,
+  MAX_STORED_INTENTS_PER_WALLET,
   UNCLAIMED_GRACE_MS,
   burnMemo,
   createBurnService,
@@ -66,6 +67,8 @@ import {
   equipCosmetic,
   flushStore,
   getBurnBySignature,
+  getBurnIntent,
+  getBurnTotals,
   getProfile,
   getRankedLeaderboard,
   grantBurn,
@@ -101,6 +104,8 @@ function uiTokenAmount(raw: bigint, decimals: number) {
   return { amount: raw.toString(), decimals, uiAmount: ui, uiAmountString: String(ui) };
 }
 
+const getBurnIntentSigs = (id: string): string[] => getBurnIntent(id)?.signatures ?? [];
+
 async function burnError(p: Promise<unknown>): Promise<BurnError> {
   try {
     await p;
@@ -135,13 +140,16 @@ afterAll(() => {
 
 // ---------------------------------------------------------------- mint accounts
 
-/** Raw mint account data. Token-2022 mints get a MetadataPointer extension, like pump.fun's. */
-function mintAccountData(decimals: number, token2022 = false): Buffer {
+/**
+ * Raw mint account data. Token-2022 mints get a MetadataPointer extension, like pump.fun's, and
+ * optionally a PermanentDelegate one; `mintAuthority` leaves the mint authority live.
+ */
+function mintAccountData(decimals: number, token2022 = false, opts: { mintAuthority?: string; permanentDelegate?: string } = {}): Buffer {
   const base = Buffer.alloc(MINT_SIZE);
   MintLayout.encode(
     {
-      mintAuthorityOption: 0,
-      mintAuthority: PublicKey.default,
+      mintAuthorityOption: opts.mintAuthority ? 1 : 0,
+      mintAuthority: opts.mintAuthority ? new PublicKey(opts.mintAuthority) : PublicKey.default,
       supply: 1_000_000_000n * 10n ** BigInt(decimals),
       decimals,
       isInitialized: true,
@@ -155,8 +163,16 @@ function mintAccountData(decimals: number, token2022 = false): Buffer {
   tlv.writeUInt16LE(ExtensionType.MetadataPointer, 0);
   tlv.writeUInt16LE(64, 2);
   Buffer.from(nacl.randomBytes(64)).copy(tlv, 4);
+  const entries = [tlv];
+  if (opts.permanentDelegate) {
+    const pd = Buffer.alloc(4 + 32);
+    pd.writeUInt16LE(ExtensionType.PermanentDelegate, 0);
+    pd.writeUInt16LE(32, 2);
+    new PublicKey(opts.permanentDelegate).toBuffer().copy(pd, 4);
+    entries.push(pd);
+  }
   // Mint, zero padding up to the token-account size, the account type byte (1 = mint), then TLV entries.
-  return Buffer.concat([base, Buffer.alloc(ACCOUNT_SIZE - MINT_SIZE), Buffer.from([1]), tlv]);
+  return Buffer.concat([base, Buffer.alloc(ACCOUNT_SIZE - MINT_SIZE), Buffer.from([1]), ...entries]);
 }
 
 // ---------------------------------------------------------------- jsonParsed transaction fixtures
@@ -186,6 +202,8 @@ interface BurnTxFixture {
   balanceMint?: string;
   /** Leave the burned account out of pre/postTokenBalances. */
   noBalances?: boolean;
+  /** Owner the token balances report for the burned account (default the wallet); null leaves it out. */
+  balanceOwner?: string | null;
   recentBlockhash?: string;
 }
 
@@ -244,10 +262,11 @@ function burnTxFixture(f: BurnTxFixture): Json {
   }
 
   const before = f.amountRaw * 3n;
+  const owner = f.balanceOwner === undefined ? f.wallet : f.balanceOwner;
   const balance = (raw: bigint) => ({
     accountIndex,
     mint: f.balanceMint ?? f.mint,
-    owner: f.wallet,
+    ...(owner === null ? {} : { owner }),
     programId: f.programId,
     uiTokenAmount: uiTokenAmount(raw, f.decimals),
   });
@@ -513,6 +532,9 @@ describe('burn transaction builder', () => {
     // The client accepts exactly this transaction for this intent.
     const intent: BurnIntent = { intentId: 'cd'.repeat(16), purpose: 'cosmetic', itemId: 'skin_gold', amount: 60_000, amountRaw: '60000000000', memo, transaction: b64, expiresAt: 0 };
     expect(checkBurnTransaction(tx, { owner, mint: mint.mint, intent })).toBeNull();
+    // The client never signs a burn it can't pin to the configured mint.
+    expect(checkBurnTransaction(tx, { owner, mint: null, intent })).toBe('no token mint configured');
+    expect(checkBurnTransaction(tx, { owner, mint: randomKey(), intent })).toBe('burns a different token');
   });
 
   it('prices purchases server-side and keeps raw amounts inside a u64', () => {
@@ -575,6 +597,28 @@ describe('mint introspection', () => {
     const mint = randomKey();
     chain.mints.set(mint, { owner: TOKEN22, data: mintAccountData(9, true) });
     expect(await loadMintInfo(createConnectionRpc(RPC_URL, { fetch: chain.fetch }), mint)).toEqual({ mint, decimals: 9, programId: TOKEN22 });
+  });
+
+  it('reports a live mint authority and a Token-2022 permanent delegate as risks', async () => {
+    const chain = createChain();
+    const rpc = createConnectionRpc(RPC_URL, { fetch: chain.fetch });
+    const authority = randomKey();
+    const delegate = randomKey();
+    const minted = randomKey();
+    chain.mints.set(minted, { owner: TOKEN, data: mintAccountData(6, false, { mintAuthority: authority }) });
+    const a = await loadMintInfo(rpc, minted);
+    expect(a.risks).toHaveLength(1);
+    expect(a.risks![0]).toMatch(/mint authority/);
+    const pd = randomKey();
+    chain.mints.set(pd, { owner: TOKEN22, data: mintAccountData(6, true, { permanentDelegate: delegate }) });
+    const b = await loadMintInfo(rpc, pd);
+    expect(b.decimals).toBe(6);
+    expect(b.risks).toEqual([expect.stringMatching(new RegExp(`permanent delegate \\(${delegate}\\)`))]);
+    // The burn service says so loudly once the mint is read.
+    const logs: string[] = [];
+    const service = createBurnService({ settings: liveSettings(pd), rpc, log: (...args) => logs.push(args.join(' ')) });
+    expect(await service.ready()).toBe(true);
+    expect(logs.some((l) => /WARNING: .*permanent delegate/.test(l))).toBe(true);
   });
 
   it('separates configuration errors from RPC outages', async () => {
@@ -692,6 +736,46 @@ describe('verifyBurn (jsonParsed through a web3.js Connection)', () => {
     const fx = fixture();
     expect(verifyBurn(await viaConnection(fx), expectation(fx, { signature: randomSig() }))).toMatchObject({ ok: false, reason: 'not_found' });
     expect(verifyBurn(null, expectation(fx))).toMatchObject({ ok: false, reason: 'not_found' });
+  });
+
+  it("rejects a burn from someone else's token account (a delegate, or a Token-2022 permanent delegate)", async () => {
+    // The wallet is the burn authority and signer, but the balances say the tokens belong to a victim.
+    const victim = walletKey();
+    expect(await check(fixture({ balanceOwner: victim }))).toMatchObject({ ok: false, reason: 'no_burn' });
+    expect(await check(fixture({ balanceOwner: victim, programId: TOKEN22 }))).toMatchObject({ ok: false, reason: 'no_burn' });
+    expect(await check(fixture({ balanceOwner: victim, kind: 'burn' }))).toMatchObject({ ok: false, reason: 'no_burn' });
+    // No owner reported, or no balance at all for the account: fail closed.
+    expect(await check(fixture({ balanceOwner: null }))).toMatchObject({ ok: false, reason: 'no_burn' });
+    expect(await check(fixture({ noBalances: true }))).toMatchObject({ ok: false, reason: 'no_burn' });
+  });
+
+  it('only accepts the transaction id (signatures[0]), never a co-signer signature', async () => {
+    const fx = fixture();
+    const coSigner = walletKey();
+    const second = randomSig();
+    fx.transaction.message.accountKeys.splice(1, 0, { pubkey: coSigner, signer: true, source: 'transaction', writable: false });
+    for (const b of [...fx.meta.preTokenBalances, ...fx.meta.postTokenBalances]) b.accountIndex += 1;
+    fx.meta.preBalances.splice(1, 0, 1_000_000);
+    fx.meta.postBalances.splice(1, 0, 1_000_000);
+    fx.transaction.signatures.push(second);
+    // An indexer that also resolves secondary signatures hands back the same transaction.
+    const parsed = await viaConnection(fx);
+    expect(verifyBurn(parsed, expectation(fx))).toMatchObject({ ok: true });
+    expect(verifyBurn(parsed, expectation(fx, { signature: second }))).toMatchObject({ ok: false, reason: 'not_found' });
+  });
+
+  it('needs exactly one memo, so one transaction can never pay for two intents', async () => {
+    const otherIntent = burnMemo('ranked', undefined, 'ab'.repeat(16));
+    const two = fixture();
+    two.transaction.message.instructions.push({ parsed: otherIntent, program: 'spl-memo', programId: MEMO, stackHeight: null });
+    expect(await check(two)).toMatchObject({ ok: false, reason: 'no_memo' });
+    // The same memo twice, or a second one as an inner instruction, is refused too.
+    const twice = fixture();
+    twice.transaction.message.instructions.push({ parsed: memo, program: 'spl-memo', programId: MEMO, stackHeight: null });
+    expect(await check(twice)).toMatchObject({ ok: false, reason: 'no_memo' });
+    const inner = fixture();
+    inner.meta.innerInstructions.push({ index: 0, instructions: [{ parsed: otherIntent, program: 'spl-memo', programId: MEMO, stackHeight: 2 }] });
+    expect(await check(inner)).toMatchObject({ ok: false, reason: 'no_memo' });
   });
 });
 
@@ -871,17 +955,22 @@ describe('burn service (live, fake RPC)', () => {
     // Mallory's own intent can't be paid with Alice's burn (wrong signer/authority, wrong memo).
     const own = await service.createIntent(mallory.address, { purpose: 'ranked' });
     expect((await burnError(service.confirm(mallory.address, { intentId: own.intentId, signature: sig }))).status).toBe(400);
-    // And while Alice's confirm is in flight, nobody else can ride on it.
+    // While Alice's confirm is in flight, Mallory naming the same signature neither rides on it nor
+    // blocks it (the old in-flight lock answered a final 409 that made Alice's client drop the burn).
     chain.hideNew = true;
     const intent2 = await service.createIntent(alice.address, { purpose: 'ranked' });
     const sig2 = chain.land(intent2.transaction!);
     const inFlight = service.confirm(alice.address, { intentId: intent2.intentId, signature: sig2 });
-    expect((await burnError(service.confirm(mallory.address, { intentId: own.intentId, signature: sig2 }))).status).toBe(409);
+    const own2 = await service.createIntent(mallory.address, { purpose: 'ranked' });
+    expect(await service.confirm(mallory.address, { intentId: own2.intentId, signature: sig2 })).toEqual({ status: 'pending' });
     expect(await inFlight).toEqual({ status: 'pending' });
+    chain.hidden.clear();
+    expect((await burnError(service.confirm(mallory.address, { intentId: own2.intentId, signature: sig2 }))).status).toBe(400);
+    expect(await service.confirm(alice.address, { intentId: intent2.intentId, signature: sig2 })).toMatchObject({ status: 'confirmed' });
     // Alice's own burn still pays for her own intent.
     expect(await service.confirm(alice.address, { intentId: intent.intentId, signature: sig })).toMatchObject({ status: 'confirmed' });
     expect(getProfile(mallory.address)!.rankedTickets).toBe(0);
-    expect(getProfile(alice.address)!.rankedTickets).toBe(1);
+    expect(getProfile(alice.address)!.rankedTickets).toBe(2);
   });
 
   it('rejects failed transactions, short burns and burns outside the window', async () => {
@@ -911,25 +1000,134 @@ describe('burn service (live, fake RPC)', () => {
     const p = player();
     const unclaimed = await service.createIntent(p.address, { purpose: 'ranked' });
     const claimed = await service.createIntent(p.address, { purpose: 'ranked' });
+    const junked = await service.createIntent(p.address, { purpose: 'ranked' });
+    // The chain shows the signed transaction but has no block time yet: pending, and claimed.
+    const sigClaimed = chain.land(claimed.transaction!, { blockTime: null });
     chain.hideNew = true;
-    const sigClaimed = chain.land(claimed.transaction!);
     const sigUnclaimed = chain.land(unclaimed.transaction!);
     expect(await service.confirm(p.address, { intentId: claimed.intentId, signature: sigClaimed })).toEqual({ status: 'pending' });
+    // A signature the chain has never seen does not extend an intent.
+    expect(await service.confirm(p.address, { intentId: junked.intentId, signature: randomSig() })).toEqual({ status: 'pending' });
 
     clock.now = T0 + INTENT_TTL_MS + UNCLAIMED_GRACE_MS + 1;
     chain.hidden.clear();
+    chain.txs.get(sigClaimed)!.blockTime = Math.floor(T0 / 1000) + 5;
     const gone = await burnError(service.confirm(p.address, { intentId: unclaimed.intentId, signature: sigUnclaimed }));
     expect([404, 409]).toContain(gone.status);
+    expect([404, 409]).toContain((await burnError(service.confirm(p.address, { intentId: junked.intentId, signature: randomSig() }))).status);
     // The claimed one is still confirmable (its burn landed inside the window).
     expect(await service.confirm(p.address, { intentId: claimed.intentId, signature: sigClaimed })).toMatchObject({ status: 'confirmed' });
 
+    // An RPC outage can't tell whether the burn landed, so it keeps the intent too.
+    chain.hideNew = false;
     const third = await service.createIntent(p.address, { purpose: 'ranked' });
-    chain.hideNew = true;
     const sig3 = chain.land(third.transaction!);
+    chain.failing.add('getTransaction');
     expect(await service.confirm(p.address, { intentId: third.intentId, signature: sig3 })).toEqual({ status: 'pending' });
+    chain.failing.delete('getTransaction');
+    clock.now += INTENT_TTL_MS + UNCLAIMED_GRACE_MS + 1;
+    chain.txs.get(sig3)!.blockTime = Math.floor((clock.now - INTENT_TTL_MS - UNCLAIMED_GRACE_MS) / 1000);
+    expect(await service.confirm(p.address, { intentId: third.intentId, signature: sig3 })).toMatchObject({ status: 'confirmed' });
+
+    const fourth = await service.createIntent(p.address, { purpose: 'ranked' });
+    const sig4 = chain.land(fourth.transaction!, { blockTime: null });
+    expect(await service.confirm(p.address, { intentId: fourth.intentId, signature: sig4 })).toEqual({ status: 'pending' });
     clock.now += CLAIMED_RETENTION_MS + 1;
+    expect([404, 409]).toContain((await burnError(service.confirm(p.address, { intentId: fourth.intentId, signature: sig4 }))).status);
+  });
+
+  it('binds at most two signatures to an intent before asking the chain', async () => {
+    const { service, chain, player } = setupLive();
+    const p = player();
+    const intent = await service.createIntent(p.address, { purpose: 'ranked' });
+    const lookups = () => chain.calls.filter((c) => c.method === 'getTransaction').length;
+    expect(await service.confirm(p.address, { intentId: intent.intentId, signature: randomSig() })).toEqual({ status: 'pending' });
+    expect(await service.confirm(p.address, { intentId: intent.intentId, signature: randomSig() })).toEqual({ status: 'pending' });
+    const before = lookups();
+    const third = await burnError(service.confirm(p.address, { intentId: intent.intentId, signature: randomSig() }));
+    expect(third.status).toBe(409);
+    expect(third.message).toMatch(/already has a transaction/);
+    expect(lookups()).toBe(before);
+    // The bound signatures stay usable (a client retry).
+    expect(await service.confirm(p.address, { intentId: intent.intentId, signature: getBurnIntentSigs(intent.intentId)[0] })).toEqual({ status: 'pending' });
+  });
+
+  it('caps every stored intent of a wallet, not only open ones', async () => {
+    const { service, player, clock } = setupLive();
+    const p = player();
+    const bindJunk = async () => {
+      const intent = await service.createIntent(p.address, { purpose: 'ranked' });
+      expect(await service.confirm(p.address, { intentId: intent.intentId, signature: randomSig() })).toEqual({ status: 'pending' });
+    };
+    for (let i = 0; i < MAX_OPEN_INTENTS_PER_WALLET; i++) await bindJunk();
+    // Past the open window but inside the grace: none is open, all five are still stored.
+    clock.now += INTENT_TTL_MS + 1;
+    for (let i = 0; i < MAX_OPEN_INTENTS_PER_WALLET - 1; i++) await bindJunk();
+    clock.now += INTENT_TTL_MS + 1;
+    await bindJunk();
+    expect(MAX_STORED_INTENTS_PER_WALLET).toBe(2 * MAX_OPEN_INTENTS_PER_WALLET);
+    // One open intent, ten stored: the stored cap refuses.
+    const capped = await burnError(service.createIntent(p.address, { purpose: 'ranked' }));
+    expect(capped.status).toBe(409);
+    expect(capped.message).toMatch(/Too many unconfirmed burns/);
+    // Once the old ones expire there is room again.
+    clock.now += UNCLAIMED_GRACE_MS;
+    expect((await service.createIntent(p.address, { purpose: 'ranked' })).intentId).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  it('budgets getTransaction lookups per wallet and server-wide', async () => {
+    const { service, chain, player, clock } = setupLive({ service: { lookupsPerWalletPerMinute: 3, lookupsPerMinute: 1000 } });
+    const p = player();
+    const lookups = () => chain.calls.filter((c) => c.method === 'getTransaction').length;
+    const a = await service.createIntent(p.address, { purpose: 'ranked' });
+    expect(await service.confirm(p.address, { intentId: a.intentId, signature: randomSig() })).toEqual({ status: 'pending' });
+    expect(lookups()).toBe(3);
+    // Out of budget: answered pending without asking the chain, and the junk intent isn't kept longer.
+    const b = await service.createIntent(p.address, { purpose: 'ranked' });
+    expect(await service.confirm(p.address, { intentId: b.intentId, signature: randomSig() })).toEqual({ status: 'pending' });
+    expect(lookups()).toBe(3);
+    // The budget refills with time; a real burn then confirms.
+    clock.now += 60_000;
+    const c = await service.createIntent(p.address, { purpose: 'ranked' });
+    expect(await service.confirm(p.address, { intentId: c.intentId, signature: chain.land(c.transaction!) })).toMatchObject({ status: 'confirmed' });
+
+    // Server-wide budget: when it runs out the player's intent is kept (it isn't their doing).
+    const tight = setupLive({ service: { lookupsPerMinute: 6 } });
+    const q = tight.player();
+    const r = tight.player();
+    const qi = await tight.service.createIntent(q.address, { purpose: 'ranked' });
+    expect(await tight.service.confirm(q.address, { intentId: qi.intentId, signature: randomSig() })).toEqual({ status: 'pending' });
+    const ri = await tight.service.createIntent(r.address, { purpose: 'ranked' });
+    tight.chain.hideNew = true;
+    const rsig = tight.chain.land(ri.transaction!);
+    expect(await tight.service.confirm(r.address, { intentId: ri.intentId, signature: rsig })).toEqual({ status: 'pending' });
+    tight.clock.now += INTENT_TTL_MS + UNCLAIMED_GRACE_MS + 1;
+    tight.chain.hidden.clear();
+    tight.chain.txs.get(rsig)!.blockTime = Math.floor(T0 / 1000) + 5;
+    expect(await tight.service.confirm(r.address, { intentId: ri.intentId, signature: rsig })).toMatchObject({ status: 'confirmed' });
+  });
+
+  it('hands out the same intent for the same cosmetic, and refuses one already on its way', async () => {
+    const { service, chain, player } = setupLive();
+    const p = player();
+    const first = await service.createIntent(p.address, { purpose: 'cosmetic', itemId: 'skin_holo' });
+    // A rejected Phantom prompt, or a second tab: same intent and memo, fresh transaction.
+    chain.blockhash = randomKey();
+    const again = await service.createIntent(p.address, { purpose: 'cosmetic', itemId: 'skin_holo' });
+    expect(again).toMatchObject({ intentId: first.intentId, memo: first.memo, amountRaw: first.amountRaw, expiresAt: first.expiresAt });
+    expect(again.transaction).not.toBe(first.transaction);
+    // Other items and tickets are separate.
+    expect((await service.createIntent(p.address, { purpose: 'cosmetic', itemId: 'rug_galaxy' })).intentId).not.toBe(first.intentId);
+    // Once a signature was named for it, another burn for the same item is refused before signing.
+    chain.hideNew = true;
+    const sig = chain.land(again.transaction!);
+    expect(await service.confirm(p.address, { intentId: first.intentId, signature: sig })).toEqual({ status: 'pending' });
+    const dup = await burnError(service.createIntent(p.address, { purpose: 'cosmetic', itemId: 'skin_holo' }));
+    expect(dup.status).toBe(409);
+    expect(dup.message).toMatch(/already waiting to confirm/);
     chain.hidden.clear();
-    expect([404, 409]).toContain((await burnError(service.confirm(p.address, { intentId: third.intentId, signature: sig3 }))).status);
+    expect(await service.confirm(p.address, { intentId: first.intentId, signature: sig })).toMatchObject({ status: 'confirmed' });
+    expect((await burnError(service.createIntent(p.address, { purpose: 'cosmetic', itemId: 'skin_holo' }))).message).toMatch(/already own/);
   });
 
   it('caps open intents per wallet, dropping abandoned ones first', async () => {
@@ -1045,6 +1243,12 @@ describe('burn service (mock and off)', () => {
     expect(getBurnConfig({ BURN_MODE: 'mock', NODE_ENV: 'production' }).mode).toBe('off');
     expect(getBurnSettings({ BURN_MODE: 'mock' }).mode).toBe('mock');
     expect(getBurnSettings({ BURN_MODE: 'mock', NODE_ENV: 'development' }).mode).toBe('mock');
+    // Matched loosely: a capital or a stray space can't slip past.
+    expect(() => getBurnSettings({ BURN_MODE: ' Mock ', NODE_ENV: 'Production ' })).toThrow(ConfigError);
+    // Never next to a real token mint (or a mistyped one), whatever NODE_ENV says.
+    expect(() => getBurnSettings({ BURN_MODE: 'mock', TOKEN_MINT: randomKey() })).toThrow(/TOKEN_MINT/);
+    expect(() => getBurnSettings({ BURN_MODE: 'mock', TOKEN_MINT: 'typo', NODE_ENV: 'development' })).toThrow(ConfigError);
+    expect(getBurnConfig({ BURN_MODE: 'mock', TOKEN_MINT: randomKey() }).mode).toBe('off');
 
     // The API router builds the process-wide service at startup, so the server refuses to start.
     const saved = { BURN_MODE: process.env.BURN_MODE, NODE_ENV: process.env.NODE_ENV };
@@ -1058,6 +1262,27 @@ describe('burn service (mock and off)', () => {
         else process.env[k] = v;
       }
     }
+  });
+
+  it('keeps mock-mode data in its own file, so nothing fake carries over to live burns', () => {
+    const saved = process.env.BURN_MODE;
+    const address = walletKey();
+    try {
+      process.env.BURN_MODE = 'mock';
+      resetStore();
+      upsertProfile(address, T0);
+      expect(grantBurn({ signature: mockSig(), intentId: 'aa'.repeat(16), address, purpose: 'ranked', amount: 50_000, amountRaw: '50000000000', at: T0 }).ok).toBe(true);
+      flushStore();
+      expect(fs.existsSync(path.join(dir, 'db.mock.json'))).toBe(true);
+      expect(fs.existsSync(path.join(dir, 'db.json'))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.BURN_MODE;
+      else process.env.BURN_MODE = saved;
+    }
+    // A live (or off) server reads db.json: the mock ticket is not there.
+    resetStore();
+    expect(getProfile(address)).toBeNull();
+    expect(getBurnTotals().burns).toBe(0);
   });
 
   it('reads the burn configuration from the environment', () => {
@@ -1206,8 +1431,9 @@ describe('weekly ranked points', () => {
       [b, 5 + 40 + 5, 2, 1],
       [c, 32 + 9, 2, 1],
       [a, 40, 2, 1],
-      [d, RANKED_POINTS.leftEarly, 1, 0],
     ]);
+    // d only left early (negative points): not on the board.
+    expect(current.entries.some((e) => e.address === d)).toBe(false);
     expect(current.entries[0]).toMatchObject({ shortAddress: shortAddress(b), name: shortAddress(b), rugs: 2, correctVotes: 0 });
     expect(current.entries[1].correctVotes).toBe(1);
 
@@ -1215,7 +1441,7 @@ describe('weekly ranked points', () => {
     expect(previous.weekId).toBe('2026-W41');
     expect(previous.entries).toEqual([expect.objectContaining({ address: a, points: 50, games: 1, wins: 1, rugs: 2 })]);
     // A week later, this week becomes "previous".
-    expect(getRankedLeaderboard('previous', now + 7 * 86_400_000).entries.map((e) => e.address)).toEqual([b, c, a, d]);
+    expect(getRankedLeaderboard('previous', now + 7 * 86_400_000).entries.map((e) => e.address)).toEqual([b, c, a]);
     expect(getRankedLeaderboard('current', now + 7 * 86_400_000).entries).toEqual([]);
   });
 
