@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   BASE_SPEED,
   BASE_VISION,
+  GHOST_SPEED_MULT,
   CHAT_RATE_LIMIT_MS,
   DEFAULT_SETTINGS,
   DEV_DUMP_DURATION_MS,
@@ -22,15 +23,24 @@ import {
   maxRuggersFor,
   type GameSettings,
 } from '../shared/constants';
-import { circleFree, lineOfSight } from '../shared/geometry';
+import { circleFree, lineOfSight, moveWithCollision } from '../shared/geometry';
 import { EMERGENCY_BUTTON, SPAWN_POINTS, TASK_MIN_MS, sabotageStationById, stationById, ventById } from '../shared/map';
 import type { C2S, ChatMessage, ErrorCode, GameEvent, S2C, Snapshot } from '../shared/protocol';
-import { Room, type BotBrainInit, type BotBrainLike, type GameResultRecordLike, type RemoveReason } from '../server/game';
+import {
+  INTEREST_HOLD_MS,
+  INTEREST_PROBE_PX,
+  Room,
+  type BotBrainInit,
+  type BotBrainLike,
+  type GameResultRecordLike,
+  type RemoveReason,
+} from '../server/game';
 import { mulberry32 } from '../server/game/rng';
 import { clampSettings, sanitizeChat, sanitizeName } from '../server/game/sanitize';
 import { tallyVotes } from '../server/game/tally';
 import { parseC2S } from '../server/game/validate';
 import { RoomManager, type Conn } from '../server/rooms';
+import { bridgePops, ventsInSight } from '../client/src/game/bridgeSight';
 
 const at = (tx: number, ty: number) => ({ x: (tx + 0.5) * TILE, y: (ty + 0.5) * TILE });
 
@@ -89,6 +99,19 @@ class Harness {
   advance(ms: number): void {
     this.t += ms;
     this.room.tick();
+  }
+  /** Let interest management catch up after `place` teleports: holds from earlier positions run out. */
+  settle(): void {
+    this.advance(INTEREST_HOLD_MS + 50);
+  }
+  /** Walk `id` with real `move` messages at 20 Hz, `steps` times by (dx, dy). */
+  walk(id: string, dx: number, dy: number, steps: number): void {
+    for (let i = 0; i < steps; i++) {
+      this.t += 50;
+      const p = this.p(id);
+      this.send(id, { t: 'move', x: p.x + dx, y: p.y + dy, facing: dx < 0 ? -1 : 1, moving: true });
+      this.room.tick();
+    }
   }
   start(): void {
     this.send(this.host, { t: 'start' });
@@ -419,6 +442,43 @@ describe('movement', () => {
       hop(BASE_SPEED * (gap / 1000));
     }
     expect(p.teleportSeq).toBe(seq1);
+  });
+
+  it('the budget reset scales with speed, so a fast ghost\'s first step after a round restart is accepted', () => {
+    const h = new Harness({ players: 6, settings: { playerSpeed: 2, discussionTime: 0 } });
+    h.start();
+    scatter(h);
+    const [r] = h.ruggers();
+    const [ghost, caller] = h.holders();
+    h.advance(POST_MEETING_COOLDOWN_MS);
+    h.kill(r, ghost);
+    expect(h.p(ghost).alive).toBe(false);
+    h.place(caller, { x: EMERGENCY_BUTTON.x, y: EMERGENCY_BUTTON.y - 85 });
+    h.send(caller, { t: 'emergency' });
+    for (const id of h.room.playerIds()) if (h.p(id).alive) h.send(id, { t: 'vote', target: 'skip' });
+    h.advance(MEETING_RESULTS_MS);
+    expect(h.room.phase).toBe('ejection');
+    h.advance(EJECTION_MS);
+    expect(h.room.phase).toBe('playing');
+    // One 50 ms tick of ghost movement at playerSpeed 2 (200 * 2 * 1.25 * 0.05 = 25 px), sent in the very
+    // tick play resumed, as bots do: nothing has refilled yet, so this is the reset budget alone.
+    const g = h.p(ghost);
+    const seq = g.teleportSeq;
+    const step = BASE_SPEED * 2 * GHOST_SPEED_MULT * 0.05;
+    expect(step).toBe(25);
+    h.send(ghost, { t: 'move', x: g.x + step, y: g.y, facing: 1, moving: true });
+    expect(g.teleportSeq).toBe(seq);
+    // A living player at that speed after a slow (80 ms) first tick, too.
+    const live = h.p(caller);
+    const liveSeq = live.teleportSeq;
+    const liveX = live.x;
+    h.send(caller, { t: 'move', x: live.x + BASE_SPEED * 2 * 0.08, y: live.y, facing: 1, moving: true });
+    expect(live.teleportSeq).toBe(liveSeq);
+    expect(live.x).toBe(liveX + 32);
+    // Still a budget: right after a restart a ghost can't jump 250 px.
+    h.t += 50;
+    h.send(ghost, { t: 'move', x: g.x + 250, y: g.y, facing: 1, moving: true });
+    expect(g.teleportSeq).toBe(seq + 1);
   });
 
   it('ignores moves faster than every 25 ms and moves outside playing', () => {
@@ -1288,6 +1348,7 @@ describe('interest management (snapshots while playing)', () => {
     h.place(holder, at(27, 11));
     h.place(walled, at(27, 16));
     expect(lineOfSight(at(27, 11), at(27, 16))).toBe(false);
+    h.settle();
     let ids = h.snap(holder).players.map((p) => p.id);
     expect(ids).toContain(holder);
     expect(ids).not.toContain(walled);
@@ -1342,7 +1403,9 @@ describe('interest management (snapshots while playing)', () => {
     h.place(other, { x: 2300, y: 300 });
     h.place(r1, { x: 2380, y: 1300 });
     h.place(r2, { x: v.x + 10, y: v.y });
+    h.settle();
     expect(h.snap(holder).players.map((p) => p.id)).toContain(r2);
+    // In plain view: gone at once (no hold for bridges), as the holder's client shows it.
     h.send(r2, { t: 'vent', action: 'enter', ventId: v.id });
     const hs = h.snap(holder);
     const ids = hs.players.map((p) => p.id);
@@ -1366,20 +1429,219 @@ describe('interest management (snapshots while playing)', () => {
     h.place(holder, row(0));
     h.place(other, row(250));
     h.place(r, row(500));
+    h.settle();
     expect(h.snap(holder).players.map((p) => p.id)).toContain(other);
     expect(h.snap(holder).players.map((p) => p.id)).not.toContain(r); // 500 > 300 + 120
     expect(h.snap(r).players.map((p) => p.id)).toContain(holder); // 500 <= 450 + 120
     h.advance(POST_MEETING_COOLDOWN_MS);
     h.send(r, { t: 'sabotage', kind: 'fud' });
     expect(h.snap(holder).players.map((p) => p.id)).toContain(other); // fog is still closing in
-    h.advance(600);
+    h.advance(450);
+    expect(h.snap(holder).players.map((p) => p.id)).toContain(other); // still closing in
+    h.advance(150);
     expect(BASE_VISION * FUD_VISION_MULT + 120).toBeLessThan(250);
+    expect(h.snap(holder).players.map((p) => p.id)).toContain(other); // held a little longer
+    h.advance(INTEREST_HOLD_MS);
     expect(h.snap(holder).players.map((p) => p.id)).not.toContain(other);
     expect(h.snap(r).players.map((p) => p.id)).toContain(holder); // ruggers are not affected
     h.place(holder, sabotageStationById('fud_fix')!);
     h.send(holder, { t: 'fix', stationId: 'fud_fix', action: 'done' });
     h.place(holder, row(0));
     expect(h.snap(holder).players.map((p) => p.id)).toContain(other);
+  });
+
+  it('keeps sending a player for INTEREST_HOLD_MS after it last qualified, then drops it', () => {
+    const h = new Harness({ players: 5 });
+    h.start();
+    const [a, b] = h.holders();
+    h.place(a, at(27, 11));
+    h.place(b, at(27, 9));
+    h.settle();
+    expect(h.snap(a).players.map((p) => p.id)).toContain(b);
+    h.place(b, at(27, 16)); // behind the wall band
+    h.advance(INTEREST_HOLD_MS - 50);
+    expect(h.snap(a).players.find((p) => p.id === b)).toMatchObject({ x: at(27, 16).x, y: at(27, 16).y }); // live position
+    h.advance(100);
+    expect(h.snap(a).players.map((p) => p.id)).not.toContain(b);
+    // Back in sight: sent again at once.
+    h.place(b, at(27, 9));
+    expect(h.snap(a).players.map((p) => p.id)).toContain(b);
+  });
+
+  it('tests line of sight from ahead along the viewer\'s velocity, so a walking viewer sees round corners in time', () => {
+    const h = new Harness({ players: 5 });
+    h.start();
+    const [a, b] = h.holders();
+    const target = at(31, 17); // in the liquidity pool, seen through the door from far enough east
+    const hidden = (e: { x: number; y: number }) =>
+      [[0, 0], [PLAYER_RADIUS, 0], [-PLAYER_RADIUS, 0], [0, PLAYER_RADIUS], [0, -PLAYER_RADIUS]].every(
+        ([ox, oy]) => !lineOfSight(e, { x: target.x + ox, y: target.y + oy }),
+      );
+    // Find a spot on row 11 where neither the viewer nor any probe sees the target, but a point 72 px
+    // ahead (360 ms at 200 px/s) does: only the lookahead can include it there.
+    const P = INTEREST_PROBE_PX;
+    let eye: { x: number; y: number } | null = null;
+    for (let x = at(26, 11).x; x <= at(31, 11).x && !eye; x++) {
+      const e = { x, y: at(28, 11).y };
+      const probes = [[0, 0], [P, 0], [-P, 0], [0, P], [0, -P]].map(([dx, dy]) => moveWithCollision(e.x, e.y, dx, dy));
+      if (probes.every(hidden) && !hidden({ x: e.x + 72, y: e.y })) eye = e;
+    }
+    expect(eye).not.toBeNull();
+    if (!eye) return;
+    h.place(b, target);
+    h.place(a, { x: eye.x - 30, y: eye.y });
+    h.settle();
+    expect(h.snap(a).players.map((p) => p.id)).not.toContain(b);
+    h.walk(a, 10, 0, 3); // 200 px/s east, arriving at `eye`
+    expect(h.p(a).x).toBe(eye.x);
+    expect(h.snap(a).players.map((p) => p.id)).toContain(b);
+    // Standing still at the same spot, nothing is ahead of the server's copy: dropped after the hold.
+    h.t += 50;
+    h.send(a, { t: 'move', x: eye.x, y: eye.y, facing: 1, moving: false });
+    h.settle();
+    expect(h.snap(a).players.map((p) => p.id)).not.toContain(b);
+  });
+
+  it('also tests from probes around the viewer, stopped by walls', () => {
+    const h = new Harness({ players: 5 });
+    h.start();
+    const [a, b, c] = h.holders();
+    const eye = at(29, 11);
+    const target = at(30, 16); // in the door corridor, hidden from `eye` but seen from a probe east of it
+    expect(lineOfSight(eye, target)).toBe(false);
+    expect(lineOfSight({ x: eye.x + 64, y: eye.y }, target)).toBe(true);
+    h.place(a, eye);
+    h.place(b, target);
+    h.place(c, at(27, 16)); // behind the thick wall band: no probe reaches past the wall
+    h.settle();
+    const ids = h.snap(a).players.map((p) => p.id);
+    expect(ids).toContain(b);
+    expect(ids).not.toContain(c);
+  });
+
+  describe('a rugger entering a bridge', () => {
+    // Launchpad: the bridge at tile (25, 7) and open floor east of it along row 7.
+    function setup() {
+      const h = new Harness({ players: 8, settings: { ruggers: 2 } });
+      h.start();
+      const [r, r2] = h.ruggers();
+      const [far, near, other] = h.holders();
+      const v = ventById('v_launch')!;
+      h.place(r, { x: v.x + 20, y: v.y });
+      h.place(far, { x: v.x + 20 + 360, y: v.y }); // in reach (300 + 120), outside drawn vision (300)
+      h.place(near, { x: v.x + 120, y: v.y }); // plainly sees r
+      h.place(other, { x: 2300, y: 300 });
+      h.place(r2, { x: 2380, y: 1300 });
+      for (const id of h.room.playerIds()) if (![r, far, near].includes(id)) h.place(id, { x: 2300 + (id === r2 ? 80 : 0), y: 300 });
+      h.settle();
+      expect(h.snap(far).players.map((p) => p.id)).toContain(r);
+      expect(h.snap(near).players.map((p) => p.id)).toContain(r);
+      const pre = { x: h.p(r).x, y: h.p(r).y };
+      h.send(r, { t: 'vent', action: 'enter', ventId: v.id });
+      expect(h.p(r).ventId).toBe(v.id);
+      return { h, r, r2, far, near, v, pre };
+    }
+
+    /** The last snapshot the room broadcast to `id`. */
+    function lastSent(h: Harness, id: string): Snapshot {
+      const snaps = h.outbox(id).filter((m): m is Snapshot => m.t === 'snap');
+      expect(snaps.length).toBeGreaterThan(0);
+      return snaps[snaps.length - 1];
+    }
+
+    it('vanishes at once for every holder, in plain view or not; fellow ruggers see the truth', () => {
+      const { h, r, r2, far, near } = setup();
+      expect(h.snap(near).players.map((p) => p.id)).not.toContain(r);
+      expect(h.snap(far).players.map((p) => p.id)).not.toContain(r);
+      expect(h.snap(r2).players.find((p) => p.id === r)).toMatchObject({ inVent: true, isRugger: true });
+    });
+
+    it('is absent from the very next snapshot of a holder who had it in interest but out of plain view', () => {
+      const { h, r, far, pre } = setup();
+      // `far` was receiving r through interest only: beyond its drawn vision, inside the margin.
+      expect(Math.hypot(pre.x - h.p(far).x, pre.y - h.p(far).y)).toBeGreaterThan(BASE_VISION);
+      expect(Math.hypot(pre.x - h.p(far).x, pre.y - h.p(far).y)).toBeLessThanOrEqual(BASE_VISION + 120);
+      const before = h.outbox(far).length;
+      h.advance(50);
+      const next = h.outbox(far).slice(before).filter((m): m is Snapshot => m.t === 'snap');
+      expect(next.length).toBe(1);
+      expect(next[0].players.map((p) => p.id)).not.toContain(r);
+      // Nothing takes its place, and no hold brings it back while it stays inside.
+      for (let i = 0; i < 20; i++) {
+        h.advance(50);
+        expect(lastSent(h, far).players.map((p) => p.id)).not.toContain(r);
+      }
+    });
+
+    it('is sent again at once when it comes out in interest, and not through any hold when it comes out far away', () => {
+      const { h, r, far, v } = setup();
+      h.advance(500);
+      h.send(r, { t: 'vent', action: 'exit' });
+      const real = h.snap(far).players.find((p) => p.id === r)!;
+      expect({ x: real.x, y: real.y, moving: real.moving, inVent: real.inVent }).toEqual({ x: v.x, y: v.y, moving: false, inVent: undefined });
+      // A rugger coming out far away is not sent through any hold.
+      h.send(r, { t: 'vent', action: 'enter', ventId: v.id });
+      expect(h.snap(far).players.map((p) => p.id)).not.toContain(r);
+      h.send(r, { t: 'vent', action: 'move', ventId: 'v_pool_n' });
+      h.send(r, { t: 'vent', action: 'exit' });
+      h.place(far, { x: 2300, y: 340 });
+      h.settle();
+      expect(h.snap(far).players.map((p) => p.id)).not.toContain(r);
+    });
+
+    it('pops the hatch it comes out of for a holder who had it in interest out of plain view (client bridgePops)', () => {
+      const h = new Harness({ players: 5, settings: { ruggers: 1 } });
+      h.start();
+      const [r] = h.ruggers();
+      const [holder, ...rest] = h.holders();
+      const a = ventById('v_launch')!;
+      const b = ventById('v_pool_n')!;
+      expect(a.links).toContain(b.id);
+      const eye = { x: 1340, y: 515 };
+      const rpos = { x: a.x + 20, y: a.y };
+      const canSee = (x: number, y: number) => Math.hypot(x - eye.x, y - eye.y) <= BASE_VISION && lineOfSight(eye, { x, y });
+      expect(canSee(b.x, b.y)).toBe(true); // the holder watches the hatch the rugger will come out of...
+      expect(canSee(rpos.x, rpos.y)).toBe(false); // ...but not the spot where it goes in,
+      expect(Math.hypot(rpos.x - eye.x, rpos.y - eye.y)).toBeLessThanOrEqual(BASE_VISION + 120);
+      expect(lineOfSight(eye, rpos)).toBe(true); // which is still in its interest.
+      for (const id of rest) h.place(id, { x: 2300, y: 300 });
+      h.place(holder, eye);
+      h.place(r, rpos);
+      h.settle();
+      const snaps: Snapshot[] = [];
+      const tick = () => {
+        h.advance(50);
+        snaps.push(lastSent(h, holder));
+      };
+      tick();
+      expect(snaps[0].players.map((p) => p.id)).toContain(r);
+      h.send(r, { t: 'vent', action: 'enter', ventId: a.id });
+      tick();
+      expect(snaps[1].players.map((p) => p.id)).not.toContain(r);
+      tick();
+      h.send(r, { t: 'vent', action: 'move', ventId: b.id });
+      tick();
+      tick();
+      expect(snaps.slice(1).every((s) => !s.players.some((p) => p.id === r))).toBe(true);
+      h.send(r, { t: 'vent', action: 'exit' });
+      tick();
+      expect(snaps[snaps.length - 1].players.find((p) => p.id === r)).toMatchObject({ x: b.x, y: b.y, moving: false });
+      const pops: string[] = [];
+      for (let i = 1; i < snaps.length; i++) {
+        const vents = bridgePops({
+          prevPrev: snaps[i - 2] ?? null,
+          prev: snaps[i - 1],
+          snap: snaps[i],
+          me: snaps[i].me!,
+          canSee,
+          ventsSeenBefore: ventsInSight(canSee),
+          departed: new Set(),
+        });
+        pops.push(...vents.map((v) => v.id));
+      }
+      // The exit pops; the entry, out of the holder's view, does not.
+      expect(pops).toEqual([b.id]);
+    });
   });
 
   it('ghosts, bots, and non-playing phases', () => {
@@ -1555,33 +1817,83 @@ describe('review fixes', () => {
     });
   });
 
-  it('chat sent while a player is disconnected is re-sent once on rejoin, with no ghost chat for the living', () => {
+  it('a rejoining player gets the visible chat backlog: meeting and system for all, ghost chat for the dead only', () => {
     const h = new Harness({ players: 6, settings: { discussionTime: 30 } });
+    h.send(h.ids[0], { t: 'chat', text: 'lobby gm' });
     h.start();
     scatter(h);
     h.advance(POST_MEETING_COOLDOWN_MS);
     const [r] = h.ruggers();
     const [victim, reporter, eve] = h.holders();
     h.kill(r, victim);
+    h.send(victim, { t: 'chat', text: 'ghost before the meeting' });
     const body = h.snap(reporter).bodies[0];
     h.place(reporter, { x: body.x + 30, y: body.y });
     h.send(reporter, { t: 'report', bodyId: victim });
+    h.t += CHAT_RATE_LIMIT_MS;
     h.send(reporter, { t: 'chat', text: 'before eve left' });
     h.room.setDisconnected(eve);
     h.clearOutbox();
     h.t += CHAT_RATE_LIMIT_MS;
     h.send(reporter, { t: 'chat', text: 'eve check this' });
     h.send(victim, { t: 'chat', text: 'ghost whisper' });
+    expect(h.chats(eve)).toEqual([]); // an offline seat gets nothing live
     h.room.rejoin(eve, h.p(eve).sessionKey);
-    expect(h.chats(eve)).toEqual([]);
-    h.room.sendMissedChatTo(eve);
+    h.room.sendChatBacklogTo(eve);
     const texts = h.chats(eve).map((c) => c.text);
-    expect(texts).toContain('eve check this');
+    // A reloaded client starts empty: the earlier lines come back too (the client drops duplicates).
+    expect(texts).toEqual(expect.arrayContaining(['before eve left', 'eve check this']));
+    expect(texts.some((t) => t.startsWith('Game started'))).toBe(true);
+    expect(texts.some((t) => t.includes('found a rugged bag'))).toBe(true);
     expect(texts).not.toContain('ghost whisper');
-    expect(texts).not.toContain('before eve left'); // already delivered, never duplicated
+    expect(texts).not.toContain('ghost before the meeting');
+    // The log was cleared at game start.
+    expect(texts).not.toContain('lobby gm');
+    // Same lines, same order and fields as sent live, so duplicates can be dropped by (ts, fromId, channel, text).
+    const live = h.chats(reporter);
     h.clearOutbox();
-    h.room.sendMissedChatTo(eve);
-    expect(h.chats(eve)).toEqual([]);
+    h.room.sendChatBacklogTo(reporter);
+    const replay = h.chats(reporter);
+    for (const m of live.filter((c) => c.channel !== 'ghost')) expect(replay).toContainEqual(m);
+    // The dead get ghost lines as well.
+    h.clearOutbox();
+    h.room.sendChatBacklogTo(victim);
+    expect(h.chats(victim).map((c) => c.text)).toEqual(expect.arrayContaining(['ghost before the meeting', 'ghost whisper', 'eve check this']));
+  });
+
+  it('the chat log keeps the last 100 lines and only lobby lines survive back to lobby', () => {
+    const h = new Harness({ players: 4 });
+    const [a, b] = h.ids;
+    for (let i = 0; i < 120; i++) {
+      h.t += CHAT_RATE_LIMIT_MS;
+      h.send(i % 2 ? a : b, { t: 'chat', text: `line ${i}` });
+    }
+    h.clearOutbox();
+    h.room.sendChatBacklogTo(a);
+    const texts = h.chats(a).map((c) => c.text);
+    expect(texts.length).toBe(100);
+    expect(texts[0]).toBe('line 20');
+    expect(texts.at(-1)).toBe('line 119');
+
+    h.start();
+    const [r] = h.ruggers();
+    h.advance(POST_MEETING_COOLDOWN_MS);
+    h.send(r, { t: 'sabotage', kind: 'devDump' });
+    h.advance(DEV_DUMP_DURATION_MS);
+    expect(h.room.phase).toBe('gameOver');
+    h.t += CHAT_RATE_LIMIT_MS;
+    h.send(a, { t: 'chat', text: 'gg' });
+    h.send(h.host, { t: 'backToLobby' });
+    expect(h.room.phase).toBe('lobby');
+    h.clearOutbox();
+    h.room.sendChatBacklogTo(b);
+    expect(h.chats(b).map((c) => [c.channel, c.text])).toEqual([['lobby', 'gg']]);
+    // A new player joining the lobby gets the lobby backlog, their own join line included.
+    const c = h.room.addHuman({ name: 'late' });
+    if (!c.ok) throw new Error(c.message);
+    h.clearOutbox(); // (the live join line goes nowhere in production: the seat isn't bound yet)
+    h.room.sendChatBacklogTo(c.player.id);
+    expect(h.chats(c.player.id).map((m) => m.text)).toEqual(['gg', 'late joined']);
   });
 });
 
@@ -1632,31 +1944,78 @@ describe('RoomManager room lookups', () => {
     expect(wrongKey).toEqual(missing);
   });
 
-  it('limits failed lookups per IP: after 30 a minute, join and rejoin answer RATE_LIMITED', () => {
+  it('limits failed joins per IP to 30 a minute; a failed rejoin is always REJOIN_FAILED and never counts', () => {
     const { mgr, conn, w, clock } = setup();
     const socks = [conn(), conn(), conn()]; // several sockets from one IP share the budget
-    for (let i = 0; i < 30; i++) {
+    // Stale sessions (e.g. after a deploy) must always hear REJOIN_FAILED so the client drops them.
+    for (let i = 0; i < 50; i++) {
       const s = socks[i % socks.length];
       mgr.handleMessage(s, { t: 'rejoin', code: 'ZZZZ', playerId: 'p_x', sessionKey: 'x' });
       expect(s.lastError()!.code).toBe('REJOIN_FAILED');
     }
+    for (let i = 0; i < 30; i++) {
+      const s = socks[i % socks.length];
+      clock(300); // past the per-socket join cooldown
+      mgr.handleMessage(s, { t: 'join', code: 'ZZZZ', name: 'x' });
+      expect(s.lastError()!.code).toBe('ROOM_NOT_FOUND');
+    }
     const s = socks[0];
-    mgr.handleMessage(s, { t: 'rejoin', code: 'ZZZZ', playerId: 'p_x', sessionKey: 'x' });
+    clock(300);
+    mgr.handleMessage(s, { t: 'join', code: 'ZZZY', name: 'x' });
     expect(s.lastError()!.code).toBe('RATE_LIMITED');
-    // Blocked: the real code gets the same answer, and join can't be used to probe either.
-    mgr.handleMessage(s, { t: 'rejoin', code: w.code, playerId: 'p_x', sessionKey: 'x' });
-    expect(s.lastError()!.code).toBe('RATE_LIMITED');
-    clock(1000);
+    // Blocked: a join to the real code gets the same answer, so join can't probe.
+    clock(300);
     mgr.handleMessage(s, { t: 'join', code: w.code, name: 'intruder' });
     expect(s.lastError()!.code).toBe('RATE_LIMITED');
     expect(s.welcome()).toBeUndefined();
+    // Rejoin still answers REJOIN_FAILED for a missing room and for the real one alike.
+    mgr.handleMessage(s, { t: 'rejoin', code: 'ZZZZ', playerId: 'p_x', sessionKey: 'x' });
+    const missing = s.lastError()!;
+    mgr.handleMessage(s, { t: 'rejoin', code: w.code, playerId: w.playerId, sessionKey: 'wrong' });
+    expect(s.lastError()).toEqual(missing);
+    expect(missing).toEqual({ t: 'error', code: 'REJOIN_FAILED', message: 'Could not restore your seat' });
     // Another IP is unaffected; the block lifts after the window.
     const fresh = conn('other-ip');
-    mgr.handleMessage(fresh, { t: 'rejoin', code: 'ZZZZ', playerId: 'p_x', sessionKey: 'x' });
-    expect(fresh.lastError()!.code).toBe('REJOIN_FAILED');
+    mgr.handleMessage(fresh, { t: 'join', code: 'ZZZZ', name: 'x' });
+    expect(fresh.lastError()!.code).toBe('ROOM_NOT_FOUND');
     clock(60_000);
     mgr.handleMessage(s, { t: 'join', code: w.code, name: 'late' });
     expect(s.welcome()?.code).toBe(w.code);
+  });
+
+  it('welcome, then the chat backlog, then the snapshot: a reload mid-meeting gets the meeting chat back', () => {
+    const { mgr, conn, w } = setup();
+    const host = conn('host-ip');
+    mgr.handleMessage(host, { t: 'rejoin', code: w.code, playerId: w.playerId, sessionKey: w.sessionKey });
+    const room = mgr.getRoom(w.code)!;
+    const eve = conn('eve-ip');
+    mgr.handleMessage(eve, { t: 'join', code: w.code, name: 'eve' });
+    const ew = eve.welcome()!;
+    for (let i = 0; i < 2; i++) mgr.handleMessage(host, { t: 'addBot' });
+    mgr.handleMessage(host, { t: 'chat', text: 'lobby line' });
+    expect(eve.msgs.some((m) => m.t === 'chat' && m.text === 'lobby line')).toBe(true);
+    // Eve reloads: a fresh socket rejoins and gets welcome, the backlog, then a snapshot.
+    mgr.disconnect(eve);
+    const eve2 = conn('eve-ip');
+    mgr.handleMessage(eve2, { t: 'rejoin', code: w.code, playerId: ew.playerId, sessionKey: ew.sessionKey });
+    const kinds = eve2.msgs.map((m) => m.t);
+    expect(kinds[0]).toBe('welcome');
+    expect(kinds.indexOf('snap')).toBeGreaterThan(kinds.lastIndexOf('chat'));
+    const texts = eve2.msgs.flatMap((m) => (m.t === 'chat' ? [m.text] : []));
+    expect(texts).toEqual(expect.arrayContaining(['host joined', 'eve joined', 'lobby line']));
+    expect(room.phase).toBe('lobby');
+    // A rejoin loop on the same socket gets welcome and snapshot again, but not the backlog again.
+    eve2.msgs = [];
+    for (let i = 0; i < 3; i++) mgr.handleMessage(eve2, { t: 'rejoin', code: w.code, playerId: ew.playerId, sessionKey: ew.sessionKey });
+    expect(eve2.msgs.filter((m) => m.t === 'welcome').length).toBe(3);
+    expect(eve2.msgs.filter((m) => m.t === 'chat').length).toBe(0);
+    // The seat moving to another socket and back (another tab) replays it again.
+    const tab = conn('eve-ip');
+    mgr.handleMessage(tab, { t: 'rejoin', code: w.code, playerId: ew.playerId, sessionKey: ew.sessionKey });
+    expect(tab.msgs.some((m) => m.t === 'chat' && m.text === 'lobby line')).toBe(true);
+    eve2.msgs = [];
+    mgr.handleMessage(eve2, { t: 'rejoin', code: w.code, playerId: ew.playerId, sessionKey: ew.sessionKey });
+    expect(eve2.msgs.some((m) => m.t === 'chat' && m.text === 'lobby line')).toBe(true);
   });
 
   it('join failures count too, and a real seat key still rejoins from a blocked IP', () => {

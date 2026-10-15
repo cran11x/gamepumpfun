@@ -33,7 +33,7 @@ import {
   maxRuggersFor,
   type GameSettings,
 } from '../shared/constants';
-import { circleFree, dist, lineOfSight } from '../shared/geometry';
+import { circleFree, dist, lineOfSight, moveWithCollision, type Vec } from '../shared/geometry';
 import {
   EMERGENCY_BUTTON,
   SABOTAGE_STATIONS,
@@ -89,6 +89,12 @@ const MOVE_BUDGET_WINDOW_MS = 1000;
 const MOVE_SPEED_TOLERANCE = 1.5;
 const MOVE_SLACK_PX = 24;
 /**
+ * After a teleport, a rejoin or a pause in play the budget restarts at this much refill time plus the
+ * slack, so the first step after a round restart fits at any speed (a ghost at playerSpeed 2 covers
+ * 25 px in one 50 ms tick).
+ */
+const MOVE_RESET_WINDOW_MS = 150;
+/**
  * Anti wall-jump: besides `circleFree` at the destination (SPEC), the straight segment between the
  * last accepted position and the new one must stay clear for a circle of half the player radius.
  * Legit sliding around a convex corner keeps that chord >= ~9.9 px from the corner, so 7 px never
@@ -107,8 +113,24 @@ const IDLE_SNAPSHOT_MS = 500;
 const INTEREST_MARGIN_PX = 120;
 /** FUD shrinks holders' interest radius only after this long, while the client's fog closes in. */
 const FUD_INTEREST_DELAY_MS = 500;
-/** Chat lines kept for a disconnected player and re-sent when they rejoin. */
-const MISSED_CHAT_MAX = 100;
+/**
+ * The client draws from its predicted position, which leads the server's copy of the viewer by about
+ * 2x one-way latency + 50..150 ms. Line of sight is therefore also tested from points this far ahead
+ * along the viewer's recent velocity (walked with collision, as the client would), which covers up to
+ * ~100 ms one-way latency...
+ */
+const INTEREST_LOOKAHEAD_MS: readonly number[] = [120, 240, 360];
+/** ...and from four probes this far around it, cut short by walls so they never see through one. */
+export const INTEREST_PROBE_PX = 64;
+/**
+ * Once sent, a player keeps being sent until this long after it last qualified, so nobody flickers.
+ * Short, because a modified client can read everyone it is sent, around corners included.
+ */
+export const INTEREST_HOLD_MS = 300;
+/** The viewer's velocity is measured over its accepted moves of about this long (capped at its speed). */
+const VELOCITY_WINDOW_MS = 200;
+/** Chat lines kept per room and replayed (by visibility) to a player who joins or rejoins. */
+const CHAT_LOG_MAX = 100;
 /** Color index used for system chat lines that are not about a specific player (Gold Bag). */
 const SYSTEM_COLOR = 8;
 const BOT_QUEUE_MAX = 256;
@@ -227,6 +249,8 @@ export interface PlayerState {
   /** Movement budget in px (see MOVE_BUDGET_WINDOW_MS) and when it was last refilled. */
   moveBudget: number;
   budgetAt: number;
+  /** Recent accepted positions (oldest first), for the viewer velocity used by interest management. */
+  trail: Array<{ x: number; y: number; t: number }>;
   teleportSeq: number;
   tasks: TaskAssignment[];
   activeStationId: string | null;
@@ -235,8 +259,6 @@ export interface PlayerState {
   ventId: string | null;
   emergencyLeft: number;
   lastChatAt: number;
-  /** Chat delivered while the socket was disconnected, re-sent on rejoin. */
-  missedChat: ChatMessage[];
   stats: PlayerStats;
 }
 
@@ -345,6 +367,10 @@ export class Room {
   /** Wallet-linked players removed mid-game (recorded as losses at game over). */
   private departed: PlayerState[] = [];
   private readonly bots = new Map<string, BotEntry>();
+  /** Interest management: viewerId -> (targetId -> last time the target qualified). */
+  private readonly interest = new Map<string, Map<string, number>>();
+  /** The last CHAT_LOG_MAX chat lines, replayed by visibility on join and rejoin. */
+  private chatLog: ChatMessage[] = [];
   private joinCounter = 0;
   private dirty = true;
   private lastBroadcastAt = -Infinity;
@@ -712,6 +738,7 @@ export class Room {
     this.ejection = null;
     this.gameOver = null;
     this.departed = [];
+    this.chatLog = [];
     this._phase = 'roleReveal';
     this.phaseEndsAt = now + ROLE_REVEAL_MS;
     this.emit({ kind: 'gameStarted' });
@@ -731,6 +758,7 @@ export class Room {
       p.moving = false;
     }
     this.sabotageReadyAt = now + POST_MEETING_COOLDOWN_MS;
+    this.resetInterest();
     this.dirty = true;
   }
 
@@ -741,8 +769,7 @@ export class Room {
     const now = this.now();
     if (now - p.lastMoveMsgAt < MOVE_MIN_INTERVAL_MS) return;
     p.lastMoveMsgAt = now;
-    const speed = BASE_SPEED * this._settings.playerSpeed * (p.alive ? 1 : GHOST_SPEED_MULT);
-    const rate = (speed * MOVE_SPEED_TOLERANCE) / 1000; // px per ms
+    const rate = this.moveRate(p); // px per ms
     const cap = rate * MOVE_BUDGET_WINDOW_MS + MOVE_SLACK_PX;
     p.moveBudget = Math.min(cap, p.moveBudget + rate * Math.max(0, now - p.budgetAt));
     p.budgetAt = now;
@@ -762,6 +789,15 @@ export class Room {
     p.facing = facing;
     p.moving = moving;
     p.lastMoveAt = now;
+    const trail = p.trail;
+    trail.push({ x, y, t: now });
+    while (trail.length > 8 || (trail.length > 2 && now - trail[1].t > VELOCITY_WINDOW_MS)) trail.shift();
+  }
+
+  /** Budget refill rate in px/ms: 1.5x the player's speed (ghosts are faster). */
+  private moveRate(p: PlayerState): number {
+    const speed = BASE_SPEED * this._settings.playerSpeed * (p.alive ? 1 : GHOST_SPEED_MULT);
+    return (speed * MOVE_SPEED_TOLERANCE) / 1000;
   }
 
   private placeAtSpawn(p: PlayerState, now: number): void {
@@ -780,8 +816,9 @@ export class Room {
   /** After a teleport or a pause in play the client starts over from the server position. */
   private resetMoveBudget(p: PlayerState, now: number): void {
     p.lastMoveAt = now;
-    p.moveBudget = MOVE_SLACK_PX;
+    p.moveBudget = this.moveRate(p) * MOVE_RESET_WINDOW_MS + MOVE_SLACK_PX;
     p.budgetAt = now;
+    p.trail = [{ x: p.x, y: p.y, t: now }];
   }
 
   // ---------- Tasks ----------
@@ -1101,6 +1138,8 @@ export class Room {
     const vent = ventById(ventId);
     if (!vent) return this.err(p, 'INVALID_ACTION', 'Unknown bridge');
     if (dist(p, vent) > VENT_RANGE) return this.err(p, 'INVALID_ACTION', 'Too far from the bridge');
+    // Gone from every non-rugger's snapshots at once, with no hold (see interestView).
+    for (const seen of this.interest.values()) seen.delete(p.id);
     p.ventId = vent.id;
     p.activeStationId = null;
     this.dropHolds(p.id);
@@ -1173,6 +1212,8 @@ export class Room {
     if (this._phase !== 'gameOver') return this.err(p, 'INVALID_ACTION', 'The game is not over');
     for (const q of [...this.players.values()]) if (!q.isBot && !q.connected) this.removePlayer(q.id, 'timeout');
     this.resetToLobby();
+    // The lobby keeps only lobby chat, like the clients do when they see the lobby again.
+    this.chatLog = this.chatLog.filter((m) => m.channel === 'lobby');
   }
 
   private resetToLobby(): void {
@@ -1294,6 +1335,8 @@ export class Room {
     const inRound = phase === 'roleReveal' || phase === 'playing' || phase === 'meeting' || phase === 'ejection';
     this.players.delete(playerId);
     this.bots.delete(playerId);
+    this.interest.delete(playerId);
+    for (const seen of this.interest.values()) seen.delete(playerId);
     this.dropHolds(playerId);
     const m = this.meeting;
     if (m) {
@@ -1474,9 +1517,14 @@ export class Room {
     const viewerIsRugger = viewer.role === 'rugger';
     // Meeting cards show who is dead; outside meetings the living never receive ghosts.
     const includeDead = phase === 'meeting';
-    // While playing, the living only receive the players they could plausibly see (interest management),
-    // so a player out of view and a rugger inside a bridge look the same to a holder: simply absent.
-    const reach = phase === 'playing' && !seeAll ? this.visionRadius(viewer) + INTEREST_MARGIN_PX : -1;
+    // While playing, the living only receive the players they could plausibly see (interest management).
+    // Players leaving view linger INTEREST_HOLD_MS; a rugger entering a bridge is dropped at once.
+    const filtered = phase === 'playing' && !seeAll;
+    const reach = filtered ? this.visionRadius(viewer) + INTEREST_MARGIN_PX : 0;
+    // The viewer's sample points, worked out only once some target needs more than the direct check.
+    let eyes: Vec[] | null = null;
+    const getEyes = () => (eyes ??= this.viewPoints(viewer));
+    const now = this.now();
     for (const p of this.players.values()) {
       const vented = p.ventId !== null;
       if (seeAll) {
@@ -1493,8 +1541,12 @@ export class Room {
         out.push(this.playerView(p, true, vented));
         continue;
       }
+      if (filtered && p.id !== viewer.id) {
+        const v = this.interestView(viewer, p, getEyes, reach, now);
+        if (v) out.push(v);
+        continue;
+      }
       if (vented) continue;
-      if (reach >= 0 && p.id !== viewer.id && !this.inInterest(viewer, p, reach)) continue;
       out.push(this.playerView(p, false, false));
     }
     return out;
@@ -1510,21 +1562,110 @@ export class Room {
   }
 
   /**
-   * Within `reach` and in line of sight. Lenient so players don't pop at wall edges: the center or any
-   * of four points one player radius off it counts.
+   * What a living viewer receives of another living player while playing (null: nothing).
+   * A player is sent while it qualifies (see `qualifies`) and for INTEREST_HOLD_MS after. A rugger in a
+   * bridge is never sent, with no hold, so a holder's client never draws them lingering on the hatch.
    */
-  private inInterest(viewer: PlayerState, p: PlayerState, reach: number): boolean {
-    const dx = p.x - viewer.x;
-    const dy = p.y - viewer.y;
+  private interestView(viewer: PlayerState, p: PlayerState, eyes: () => readonly Vec[], reach: number, now: number): PlayerView | null {
+    let seen = this.interest.get(viewer.id);
+    if (!seen) this.interest.set(viewer.id, (seen = new Map()));
+    if (p.ventId !== null) {
+      seen.delete(p.id);
+      return null;
+    }
+    if (this.qualifies(viewer, eyes, p, reach)) {
+      seen.set(p.id, now);
+      return this.playerView(p, false, false);
+    }
+    const at = seen.get(p.id);
+    if (at !== undefined && now - at <= INTEREST_HOLD_MS) return this.playerView(p, false, false);
+    seen.delete(p.id);
+    return null;
+  }
+
+  /**
+   * Within `reach` of the viewer and in line of sight from it or any of its sample points (`viewPoints`) to the
+   * target's center or to any of four points one player radius off it, so nobody pops at wall edges or
+   * when the viewer's predicted position rounds a corner ahead of the server's copy.
+   */
+  private qualifies(viewer: PlayerState, getEyes: () => readonly Vec[], target: Vec, reach: number): boolean {
+    const dx = target.x - viewer.x;
+    const dy = target.y - viewer.y;
     if (dx * dx + dy * dy > reach * reach) return false;
-    if (lineOfSight(viewer, p)) return true;
+    if (lineOfSight(viewer, target)) return true;
+    const eyes = getEyes();
+    for (const e of eyes) if (lineOfSight(e, target)) return true;
     const r = PLAYER_RADIUS;
-    return (
-      lineOfSight(viewer, { x: p.x + r, y: p.y }) ||
-      lineOfSight(viewer, { x: p.x - r, y: p.y }) ||
-      lineOfSight(viewer, { x: p.x, y: p.y + r }) ||
-      lineOfSight(viewer, { x: p.x, y: p.y - r })
-    );
+    const q = { x: 0, y: 0 };
+    for (const e of eyes) {
+      for (let i = 0; i < 4; i++) {
+        q.x = target.x + (i === 0 ? r : i === 1 ? -r : 0);
+        q.y = target.y + (i === 2 ? r : i === 3 ? -r : 0);
+        if (lineOfSight(e, q)) return true;
+      }
+    }
+    return false;
+  }
+
+  /** Where the viewer's client may be drawing from: its server position, points ahead along its velocity, probes. */
+  private viewPoints(viewer: PlayerState): Vec[] {
+    const eyes: Vec[] = [{ x: viewer.x, y: viewer.y }];
+    const v = this.velocityOf(viewer);
+    if (v) {
+      let x = viewer.x;
+      let y = viewer.y;
+      let t = 0;
+      for (const ahead of INTEREST_LOOKAHEAD_MS) {
+        const q = moveWithCollision(x, y, v.x * (ahead - t), v.y * (ahead - t));
+        if (Math.abs(q.x - x) + Math.abs(q.y - y) < 1) break; // stuck against a wall
+        eyes.push(q);
+        x = q.x;
+        y = q.y;
+        t = ahead;
+      }
+    }
+    const d = INTEREST_PROBE_PX;
+    for (let i = 0; i < 4; i++) {
+      const dx = i === 0 ? d : i === 1 ? -d : 0;
+      const dy = i === 2 ? d : i === 3 ? -d : 0;
+      // Walked like a move, so a probe stops at a wall instead of looking through it.
+      const q = moveWithCollision(viewer.x, viewer.y, dx, dy);
+      if (Math.abs(q.x - viewer.x) + Math.abs(q.y - viewer.y) >= PLAYER_RADIUS / 2) eyes.push(q);
+    }
+    return eyes;
+  }
+
+  /** The viewer's recent velocity in px/ms from its accepted moves, capped at its speed; null when standing. */
+  private velocityOf(p: PlayerState): Vec | null {
+    const trail = p.trail;
+    const last = trail[trail.length - 1];
+    if (!p.moving || !last || trail.length < 2 || this.now() - last.t > MOVING_TIMEOUT_MS) return null;
+    // The newest sample at least half a window older than the last one, so a bunch of moves arriving
+    // together doesn't read as a sprint; but not one from before the player set off.
+    let first: { x: number; y: number; t: number } | null = null;
+    for (let i = trail.length - 2; i >= 0; i--) {
+      const e = trail[i];
+      if (first && last.t - e.t > 2 * VELOCITY_WINDOW_MS) break;
+      first = e;
+      if (last.t - e.t >= VELOCITY_WINDOW_MS / 2) break;
+    }
+    const dt = first ? last.t - first.t : 0;
+    if (!first || dt <= 0) return null;
+    let vx = (last.x - first.x) / dt;
+    let vy = (last.y - first.y) / dt;
+    const max = this.moveRate(p) / MOVE_SPEED_TOLERANCE;
+    const len = Math.hypot(vx, vy);
+    if (len < 1e-3) return null;
+    if (len > max) {
+      vx *= max / len;
+      vy *= max / len;
+    }
+    return { x: vx, y: vy };
+  }
+
+  /** Forget interest state (a new round, everyone teleported). */
+  private resetInterest(): void {
+    this.interest.clear();
   }
 
   /** A ghost on a living viewer's meeting card: who and dead, never where the ghost is floating. */
@@ -1637,22 +1778,24 @@ export class Room {
   }
 
   private deliverChat(msg: ChatMessage, to: Iterable<PlayerState>): void {
+    this.chatLog.push(msg);
+    if (this.chatLog.length > CHAT_LOG_MAX) this.chatLog.shift();
     for (const p of to) {
       if (p.isBot) this.queueBot(p.id, { type: 'chat', msg: { ...msg } });
+      // A seat that is offline gets the line from the chat log when it rejoins.
       else if (p.connected) this.safeSend(p.id, msg);
-      else {
-        // Nobody is listening on that seat right now: keep the line for the rejoin.
-        p.missedChat.push(msg);
-        if (p.missedChat.length > MISSED_CHAT_MAX) p.missedChat.shift();
-      }
     }
   }
 
-  /** Re-send the chat a player missed while disconnected (call after the rejoin welcome + snapshot). */
-  sendMissedChatTo(playerId: string): void {
+  /**
+   * Replay the chat log to a player who just joined or rejoined (a reloaded client starts empty), by
+   * visibility at replay time: lobby, system and meeting lines for everyone, ghost lines for the dead.
+   * Lines the client already has come again unchanged, so it can drop them by (ts, fromId, channel, text).
+   */
+  sendChatBacklogTo(playerId: string): void {
     const p = this.players.get(playerId);
-    if (!p || p.isBot || !p.connected) return;
-    for (const msg of p.missedChat.splice(0)) this.safeSend(p.id, msg);
+    if (!p || p.isBot) return;
+    for (const msg of this.chatLog) if (msg.channel !== 'ghost' || !p.alive) this.safeSend(p.id, msg);
   }
 
   private system(text: string, color: number = SYSTEM_COLOR): void {
@@ -1708,6 +1851,7 @@ export class Room {
       lastMoveMsgAt: -Infinity,
       moveBudget: MOVE_SLACK_PX,
       budgetAt: now,
+      trail: [],
       teleportSeq: 0,
       tasks: [],
       activeStationId: null,
@@ -1716,7 +1860,6 @@ export class Room {
       ventId: null,
       emergencyLeft: this._settings.emergencyMeetings,
       lastChatAt: -Infinity,
-      missedChat: [],
       stats: freshStats(),
     };
   }

@@ -82,7 +82,7 @@ Avoid slurs. Never use the word "jeet". Keep jokes about trench culture, not rea
 ### Movement
 - The client reports `move {x, y, facing, moving}` at about 20 Hz. The server accepts it only in `playing`, and only when the player is not in a bridge.
 - **Validation:** each player has a movement budget in px, where `speed = BASE_SPEED * settings.playerSpeed` (times `GHOST_SPEED_MULT` for ghosts).
-  - The budget refills at `speed * 1.5` per second, up to a cap of `speed * 1.5 * 1 s + 24px`. It is reset to `24px` on every teleport, at `playing` start, on rejoin and on bridge exit.
+  - The budget refills at `speed * 1.5` per second, up to a cap of `speed * 1.5 * 1 s + 24px`. It is reset to `speed * 1.5 * 0.15 s + 24px` on every teleport, at `playing` start, on rejoin and on bridge exit, so the first step after a restart fits at any speed (ghosts included).
   - Reject the move if it is farther than the budget; an accepted move spends its distance. Sustained speed is therefore capped at 1.5x however often moves are sent, while a client that stalled for up to a second can still catch up.
   - For living players, also reject it if `!circleFree(x, y)` or the straight path from the last position crosses a solid cell.
   - Ghosts may be anywhere inside the world bounds.
@@ -151,12 +151,15 @@ Avoid slurs. Never use the word "jeet". Keep jokes about trench culture, not rea
 - **`vent enter`:** a living rugger within `VENT_RANGE` of the vent, in `playing`. The player is placed at the vent position (`teleportSeq++`).
 - **`vent move`:** only to a linked vent; the player is placed at the new vent (`teleportSeq++`).
 - **`vent exit`:** the player stays at the vent position.
-- **While in a bridge:** no kill, no tasks, and no movement messages are accepted. Non-ruggers don't receive the player in snapshots.
+- **While in a bridge:** no kill, no tasks, and no movement messages are accepted. Non-ruggers don't receive the player in snapshots (see Snapshot visibility).
 
 ### Snapshot visibility
 - **Living non-rugger viewer:** receives living players except vented ruggers. Never receives ghosts. `isRugger` is never set.
 - **Living rugger viewer:** receives living players (vented fellow ruggers included, with `inVent`). Fellow ruggers get `isRugger: true`.
-- **Interest management (phase `playing`, living viewers, bots included):** another living player is sent only when it is within the viewer's vision radius + 120 px and in line of sight (`lineOfSight` to its center or to any of 4 points `PLAYER_RADIUS` off it, so nobody pops at wall edges). The vision radius is `BASE_VISION * crewVision` for holders (times `FUD_VISION_MULT` during FUD, from 500 ms after it starts, while the client's fog closes in) and `BASE_VISION * ruggerVision` for ruggers. Fellow ruggers always receive each other. A player out of view and a rugger inside a bridge look the same: simply absent.
+- **Interest management (phase `playing`, living viewers, bots included):** another living player qualifies when it is within the viewer's vision radius + 120 px and in line of sight (`lineOfSight` to its center or to any of 4 points `PLAYER_RADIUS` off it, so nobody pops at wall edges). The vision radius is `BASE_VISION * crewVision` for holders (times `FUD_VISION_MULT` during FUD, from 500 ms after it starts, while the client's fog closes in) and `BASE_VISION * ruggerVision` for ruggers. Fellow ruggers always receive each other.
+  - Line of sight is tested from several viewer points, because the client draws from its predicted position, which leads the server's copy by about 2x one-way latency + 50..150 ms: the server position, points 120/240/360 ms ahead along the viewer's recent velocity (from its accepted moves, capped at its speed, walked with `moveWithCollision`), and 4 probes 64 px around it (also walked with collision, so they stop at walls).
+  - A qualifying player is sent, and keeps being sent for 300 ms after it last qualified (hysteresis), so players rarely pop in late (measured: none over 50 ms up to 100 ms one-way latency in the pop-in simulations) and don't flicker at view edges. The hold is kept short because a modified client can read every player it is sent, around corners included.
+  - A rugger inside a bridge is never sent to non-ruggers, with no hold: from the moment a rugger enters a bridge, no holder receives them, whether or not they were in view, so an honest holder's client never draws a rugger lingering on the hatch. A rugger who comes out is sent again as soon as they qualify, so a holder who can see the hatch gets them standing on it in the next snapshot (the client's "came out" hatch pop). A modified client can therefore infer a bridge entry when a rugger who was inside its interest margin, but not plainly visible, disappears at once instead of after the 300 ms hold.
 - **Meetings:** living viewers receive every player for the meeting cards, ghosts included, but a ghost's position is replaced by its spawn point (`moving: false`).
 - **Dead viewer (ghost):** receives everyone, including ghosts, with `isRugger` set for ruggers.
 - **gameOver:** everyone receives everyone with `isRugger`.
@@ -168,6 +171,7 @@ Avoid slurs. Never use the word "jeet". Keep jokes about trench culture, not rea
 - **playing:** only ghosts can chat, on the `ghost` channel.
 - **Limits:** messages longer than `MAX_CHAT_LENGTH` are cut, control characters are stripped, and empty messages are dropped. Rate limit is 1 message per `CHAT_RATE_LIMIT_MS` per player.
 - **System messages:** `channel 'system'` for joins, leaves and game events.
+- **Chat log:** each room keeps its last 100 lines. It is cleared at game start, and on `backToLobby` only lobby lines are kept. On join and rejoin the server replays it after `welcome` and before the snapshot (once per socket and seat), by visibility at replay time: lobby, system and meeting lines for everyone, ghost lines only for dead players. Replayed lines are identical to the live ones, so the client drops duplicates by (ts, fromId, channel, text).
 
 ### Win check (runs after kills, ejections, task completions and player removals)
 1. All holders' tasks done (curve = 1) → **holders** win, reason `tasks`.
@@ -179,11 +183,11 @@ On game over, call `recordGameResults` for wallet-linked players. The host can s
 
 ### Disconnects and rejoin
 - **On socket close:** mark the player `disconnected` and keep them for `RECONNECT_GRACE_MS`.
-- **`rejoin {code, playerId, sessionKey}`** within the grace period restores the seat and sends `welcome` again, a snapshot, and the chat lines that were sent to the seat while it was disconnected (at most 100).
+- **`rejoin {code, playerId, sessionKey}`** within the grace period restores the seat and sends `welcome` again, the chat backlog (see Chat) and a snapshot.
 - **After the grace period:** remove the player. If they were alive in a game, treat them as dead with no body, and exclude their tasks from the curve. Run the win check.
 - **Leaving the lobby:** removes the player immediately when they send `leave`.
 - **Bad rejoin:** send `REJOIN_FAILED` with the same message whether the room is missing or the seat/key is wrong, so rejoin can't probe for private room codes.
-- **Failed lookups:** at most 30 failed room lookups (a `join` to a code with no room, any failed `rejoin`) per client IP per minute. Past that, `join` and failing `rejoin`s get `RATE_LIMITED` until the minute ends; a rejoin with a valid seat key still works.
+- **Failed lookups:** at most 30 failed joins (a `join` to a code with no room) per client IP per minute. Past that, `join` gets `RATE_LIMITED` until the minute ends. `rejoin` is not limited: a failed rejoin always gets `REJOIN_FAILED` (so the client drops its stale session), and a rejoin with a valid seat key always works.
 
 ### Snapshots
 - Per-client, see `Snapshot` in `protocol.ts`.
@@ -194,7 +198,7 @@ On game over, call `recordGameResults` for wallet-linked players. The host can s
 
 | File | Owner | Exports |
 |---|---|---|
-| `server/index.ts` | server-core | Starts express + ws on `PORT` (default 8787). Mounts `createApiRouter` at `/api`. Serves `dist/client` statically when present (SPA fallback to `index.html`). WebSocket path `/ws`, max payload 4 KB, per-socket rate limit, at most 20 concurrent sockets per client IP (`MAX_SOCKETS_PER_IP`; IPs keyed like the HTTP API, honoring `TRUST_PROXY`). |
+| `server/index.ts` | server-core | Starts express + ws on `PORT` (default 8787). Mounts `createApiRouter` at `/api`. Serves `dist/client` statically when present (SPA fallback to `index.html`). WebSocket path `/ws`, max payload 4 KB, per-socket rate limit, at most 64 concurrent sockets per client IP (`MAX_SOCKETS_PER_IP`; IPs keyed like the HTTP API, honoring `TRUST_PROXY`). A socket over the cap first gets `{t:'error', code:'RATE_LIMITED', message:'Too many connections from your network'}`, then is closed with 1008. |
 | `server/rooms.ts` | server-core | `RoomManager`: create, join, quick, rejoin, cleanup, the 20 Hz tick loop, `getRoomsInfo()`. |
 | `server/game.ts` (+ `server/game/*.ts`) | server-core | `Room` / game state machine with an injectable clock and send function so it is unit-testable without sockets. |
 | `server/bots.ts` | bots | `BotBrain` (see below), `botName(i)`. |

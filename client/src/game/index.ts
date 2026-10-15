@@ -2,23 +2,15 @@
 // prediction, move reporting, remote interpolation, interactions, hotkeys and actions.
 // Rendering is delegated to render/.
 
-import {
-  BASE_SPEED,
-  BASE_VISION,
-  FUD_VISION_MULT,
-  GHOST_SPEED_MULT,
-  INTERP_DELAY_MS,
-  PLAYER_RADIUS,
-  VENT_RANGE,
-} from '../../../shared/constants';
+import { BASE_SPEED, BASE_VISION, FUD_VISION_MULT, GHOST_SPEED_MULT, INTERP_DELAY_MS, PLAYER_RADIUS } from '../../../shared/constants';
 import { moveWithCollision, type Vec } from '../../../shared/geometry';
-import { SABOTAGE_STATIONS, stationById, ventById, VENTS, WORLD_H, WORLD_W, type Vent } from '../../../shared/map';
+import { SABOTAGE_STATIONS, stationById, ventById, WORLD_H, WORLD_W } from '../../../shared/map';
 import type { GameEvent, MeView, PlayerView, SabotageKind, Snapshot } from '../../../shared/protocol';
 import type { AppContext, AudioApi, GameApi, Interactions, MinigameTarget, SoundName, UiApi } from '../context';
 import { Renderer, type RenderPlayer, type WorldView } from '../render/index';
 import { COLORS } from '../render/palette';
 import { hashString } from '../render/util';
-import { vanishedInView } from './bridgeSight';
+import { bridgePops, ventsInSight } from './bridgeSight';
 import { Input, type InputVector } from './input';
 import { computeInteractions, NO_INTERACTIONS } from './interactions';
 import { InterpClock, RemoteInterpolator } from './interp';
@@ -45,19 +37,6 @@ function clamp(v: number, lo: number, hi: number): number {
 function findPlayer(list: readonly PlayerView[], id: string): PlayerView | undefined {
   for (const p of list) if (p.id === id) return p;
   return undefined;
-}
-
-function ventNear(x: number, y: number, range: number): Vent | null {
-  let best: Vent | null = null;
-  let bd = range * range;
-  for (const v of VENTS) {
-    const d = (v.x - x) * (v.x - x) + (v.y - y) * (v.y - y);
-    if (d <= bd) {
-      bd = d;
-      best = v;
-    }
-  }
-  return best;
 }
 
 export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi {
@@ -111,6 +90,10 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
   let prevSnap: Snapshot | null = null;
   /** The snapshot before prevSnap (bridge detection extrapolates where a vanished player was heading). */
   let prevPrevSnap: Snapshot | null = null;
+  /** Bridges whose hatch was in our fog when prevSnap arrived (see bridgePops). */
+  let ventsSeen: ReadonlySet<string> = new Set();
+  /** Players who left the room this game: they vanish without using a bridge. */
+  const departed = new Set<string>();
   let backdropSnap: Snapshot | null = null;
   let backdropColors: readonly number[] = NO_COLORS;
   const guards = new Map<string, number>();
@@ -193,6 +176,7 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
     clock.reset();
     prevSnap = null;
     prevPrevSnap = null;
+    departed.clear();
   }
 
   /** Stop local movement right now (the stop is reported on the next send slot). */
@@ -309,6 +293,10 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
         break;
       case 'gameStarted':
         renderer.resetForNewGame();
+        departed.clear();
+        break;
+      case 'playerLeft':
+        departed.add(ev.playerId);
         break;
       case 'kicked':
         resetLocal();
@@ -318,43 +306,15 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
     }
   }
 
-  /** Bridge hatch pops for other players entering/leaving bridges in plain sight. */
+  /** Bridge hatch pops for other players entering/leaving bridges in plain sight (see bridgePops). */
   function detectBridgeUse(prevPrev: Snapshot | null, prev: Snapshot | null, snap: Snapshot, me: MeView): void {
-    if (!prev || prev.phase !== 'playing' || snap.phase !== 'playing') return;
-    const popped = new Set<string>();
-    const pop = (v: Vent | null) => {
-      if (!v || popped.has(v.id) || !renderer.canSee(v.x, v.y)) return;
-      popped.add(v.id);
-      renderer.effects.hatch(v.x, v.y);
-      sound('vent');
-    };
-    // Ruggers get fellow ruggers' `inVent` and ghosts see everyone: for them a player who appears or
-    // vanishes never used a bridge. Living holders have to infer it.
-    const inferVents = me.alive && me.role !== 'rugger';
     const seen = (x: number, y: number) => renderer.canSee(x, y);
-    // Came out of a bridge: now visible and outside, previously absent or inside.
-    for (const p of snap.players) {
-      if (p.id === me.id || p.inVent || !p.alive) continue;
-      const q = findPlayer(prev.players, p.id);
-      if (q && !q.inVent) continue;
-      if (!q && !inferVents) continue;
-      pop(ventNear(p.x, p.y, 6));
+    if (prev) {
+      const vents = bridgePops({ prevPrev, prev, snap, me, canSee: seen, ventsSeenBefore: ventsSeen, departed });
+      for (const v of vents) renderer.effects.hatch(v.x, v.y);
+      if (vents.length > 0) sound('vent');
     }
-    // Went into a bridge: was outside, now inside or gone (and not because they got rugged).
-    for (const q of prev.players) {
-      if (q.id === me.id || q.inVent || !q.alive || q.disconnected) continue;
-      const p = findPlayer(snap.players, q.id);
-      if (p && !p.inVent) continue;
-      if (p && !p.alive) continue;
-      if (!p) {
-        if (!inferVents || snap.bodies.some((b) => b.id === q.id)) continue;
-        // Interest management also drops players who leave our line of sight or reach: only a vanish in
-        // plain view (where they were and where they were heading) is a bridge.
-        const before = prevPrev?.phase === 'playing' ? findPlayer(prevPrev.players, q.id) : undefined;
-        if (!vanishedInView(seen, q, before ?? null)) continue;
-      }
-      pop(p ? ventNear(p.x, p.y, 6) : ventNear(q.x, q.y, VENT_RANGE + 10));
-    }
+    ventsSeen = snap.phase === 'playing' ? ventsInSight(seen) : new Set();
   }
 
   // ---------- simulation ----------
