@@ -47,6 +47,13 @@ npm run build && npm run e2e   # Playwright: e2e/smoke.mjs (3 browsers + bots pl
 npm run e2e:smoke / npm run e2e:ranked   # one suite
 ```
 
+**Real on-chain burns.** `e2e/chain-burn.mjs` runs the live burn flow against a real Solana runtime:
+1. It signs in, burns for a ranked ticket and a cosmetic through the API, and sends the server-built transactions.
+2. It checks that the token balance and the **supply** drop by exactly the price.
+3. It checks the grants, replay rejection and idempotent confirms.
+
+It works with a local `solana-test-validator` (no faucet limits) or devnet, for both classic SPL Token and Token-2022 mints. The usage is at the top of the file. Last run: 11/11 checks passed for both token programs.
+
 ## Configuration (env)
 
 | Variable | Default | Purpose |
