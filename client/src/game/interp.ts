@@ -149,6 +149,7 @@ export class RemoteInterpolator {
           inVent: !!pb.inVent,
           disconnected: !!pb.disconnected,
           seed: hashString(pb.id) % 1000,
+          cosmetics: pb.cosmetics,
           stamp,
         };
         this.byId.set(pb.id, r);
@@ -167,6 +168,7 @@ export class RemoteInterpolator {
       r.isRugger = !!pb.isRugger;
       r.inVent = !!pb.inVent;
       r.disconnected = !!pb.disconnected;
+      r.cosmetics = pb.cosmetics;
       r.stamp = stamp;
     }
 

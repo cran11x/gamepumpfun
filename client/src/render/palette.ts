@@ -27,6 +27,18 @@ export const FONT_TITLE = 'Bungee, "Space Grotesk", system-ui, sans-serif';
 export const FONT_TEXT = '"Space Grotesk", system-ui, -apple-system, "Segoe UI", sans-serif';
 export const FONT_MONO = '"JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace';
 
+const labelFontCache = new Map<number, string>();
+/** Bold text font for canvas name labels, cached per half-pixel size. */
+export function labelFont(size: number): string {
+  const q = Math.round(size * 2) / 2;
+  let f = labelFontCache.get(q);
+  if (!f) {
+    f = `700 ${q}px ${FONT_TEXT}`;
+    labelFontCache.set(q, f);
+  }
+  return f;
+}
+
 export function playerColor(i: number): { name: string; body: string; dark: string } {
   const n = PLAYER_COLORS.length;
   const idx = Number.isFinite(i) ? ((Math.trunc(i) % n) + n) % n : 0;

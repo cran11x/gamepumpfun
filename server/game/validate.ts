@@ -73,7 +73,10 @@ export function parseC2S(raw: unknown): C2S | null {
       const name = str(raw.name ?? '', MAX_RAW_NAME);
       if (name === null) return null;
       const authToken = token(raw.authToken);
-      return authToken ? { t: raw.t, name, authToken } : { t: raw.t, name };
+      const msg: Extract<C2S, { t: 'create' | 'quick' }> = authToken ? { t: raw.t, name, authToken } : { t: raw.t, name };
+      // Only a literal `true` asks for ranked; anything else is a normal room.
+      if (raw.ranked === true) msg.ranked = true;
+      return msg;
     }
     case 'join': {
       const name = str(raw.name ?? '', MAX_RAW_NAME);

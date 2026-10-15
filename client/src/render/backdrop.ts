@@ -11,6 +11,8 @@ export interface Wanderer {
   x: number;
   y: number;
   color: number;
+  /** Pill skin (a lobby player's equipped skin), if any. */
+  skin?: string;
   facing: 1 | -1;
   moving: boolean;
   walk: number;
@@ -38,13 +40,22 @@ export class Backdrop {
   private readonly rnd = mulberry32(0xa11ce);
   private colorsKey = '';
 
-  /** Keep the pill set in sync with the given colors (lobby players), padded with random ones. */
-  sync(colors: readonly number[]): void {
-    const key = colors.join(',');
+  /**
+   * Keep the pill set in sync with the given colors (lobby players), padded with random ones.
+   * `skins[i]` is the pill skin worn by the player with `colors[i]`.
+   */
+  sync(colors: readonly number[], skins?: readonly (string | undefined)[]): void {
+    const key = skins ? colors.join(',') + '|' + skins.join(',') : colors.join(',');
     if (key === this.colorsKey && this.pills.length > 0) return;
     this.colorsKey = key;
     const wanted: number[] = [];
-    for (const c of colors) if (!wanted.includes(c) && wanted.length < MAX_PILLS) wanted.push(c);
+    const wantedSkins: (string | undefined)[] = [];
+    for (let i = 0; i < colors.length; i++) {
+      const c = colors[i];
+      if (wanted.includes(c) || wanted.length >= MAX_PILLS) continue;
+      wanted.push(c);
+      wantedSkins.push(skins?.[i]);
+    }
     let guard = 0;
     while (wanted.length < MIN_PILLS && guard++ < 100) {
       const c = Math.floor(this.rnd() * PLAYER_COLORS.length);
@@ -55,6 +66,7 @@ export class Backdrop {
       const existing = this.pills[i];
       if (existing) {
         existing.color = wanted[i];
+        existing.skin = wantedSkins[i];
         continue;
       }
       const sp = SPAWN_POINTS[i % SPAWN_POINTS.length];
@@ -62,6 +74,7 @@ export class Backdrop {
         x: sp.x,
         y: sp.y,
         color: wanted[i],
+        skin: wantedSkins[i],
         facing: this.rnd() < 0.5 ? 1 : -1,
         moving: false,
         walk: 0,

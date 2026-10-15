@@ -4,11 +4,12 @@
 import { DEV_DUMP_DURATION_MS, PLAYER_RADIUS } from '../../../shared/constants';
 import { lineOfSight, type Vec } from '../../../shared/geometry';
 import { EMERGENCY_BUTTON, sabotageStationById, stationById, ventById, WORLD_H, WORLD_W } from '../../../shared/map';
-import type { BodyView, Phase, Role, SabotageView } from '../../../shared/protocol';
+import type { BodyView, EquippedCosmetics, Phase, Role, SabotageView } from '../../../shared/protocol';
 import type { Interactions } from '../context';
 import { Backdrop } from './backdrop';
 import { Camera } from './camera';
-import { drawBody, drawGhost, drawLabel, drawPill, drawTag, drawVentMarker, PILL_TOP } from './characters';
+import { drawBody, drawGhost, drawLabel, drawPill, drawTag, drawVentMarker, PILL_TOP, type PillDraw } from './characters';
+import { drawBodyRug, drawNameFx, isKnownRug, labelEffect, skinHeadroom } from './cosmetics';
 import { Effects } from './effects';
 import { Fog } from './fog';
 import { COLORS, FONT_MONO, rgba } from './palette';
@@ -37,6 +38,8 @@ export interface RenderPlayer {
   disconnected: boolean;
   /** Stable per-player animation seed. */
   seed: number;
+  /** Equipped cosmetics (signed-in players). Visual only. */
+  cosmetics?: EquippedCosmetics;
 }
 
 export interface WorldView {
@@ -163,6 +166,7 @@ export class Renderer {
   private readonly items: SortItem[] = [];
   private readonly itemPool: SortItem[] = [];
   private readonly labels: RenderPlayer[] = [];
+  private readonly pillDraw: PillDraw = { x: 0, y: 0, color: 0, facing: 1, moving: false, walk: 0, seed: 0, alpha: 1, skin: undefined };
   private readonly animState: PropAnimState = { emergencyHot: false };
 
   constructor(canvas: HTMLCanvasElement) {
@@ -495,19 +499,20 @@ export class Renderer {
     this.staticMap.draw(g, vr.x0, vr.y0, vr.x1, vr.y1);
     drawPoolWater(g, t, vr.x0, vr.y0, vr.x1, vr.y1);
     const playing = view.phase === 'playing';
-    if (playing) this.drawFloorHighlights(view, t);
 
-    // Y-sorted pass.
+    // Y-sorted pass (bodies' rugs are floor decals, drawn right away under everything else).
     this.items.length = 0;
     this.labels.length = 0;
     this.animState.emergencyHot = playing && view.interactions.use?.type === 'emergency';
     this.pushVisibleProps(vr.x0, vr.y0, vr.x1, vr.y1);
     for (let i = 0; i < view.bodies.length; i++) {
       const b = view.bodies[i];
-      if (b.x < vr.x0 - 40 || b.x > vr.x1 + 40 || b.y < vr.y0 - 40 || b.y > vr.y1 + 40) continue;
+      if (b.x < vr.x0 - 60 || b.x > vr.x1 + 60 || b.y < vr.y0 - 40 || b.y > vr.y1 + 50) continue;
       if (!this.canSee(b.x, b.y)) continue;
+      if (b.rug) drawBodyRug(g, b.x, b.y, b.rug, t);
       this.pushItem(b.y + 6, T_BODY, i);
     }
+    if (playing) this.drawFloorHighlights(view, t);
     const ruggerView = view.role === 'rugger' || view.viewerDead || view.noFog;
     for (let i = 0; i < view.remotes.length; i++) {
       const p = view.remotes[i];
@@ -533,7 +538,7 @@ export class Renderer {
           break;
         case T_BODY: {
           const b = view.bodies[it.i];
-          drawBody(g, b.x, b.y, b.color, t);
+          drawBody(g, b.x, b.y, b.color, t, isKnownRug(b.rug));
           break;
         }
         case T_REMOTE: {
@@ -561,7 +566,7 @@ export class Renderer {
 
     this.effects.drawWorld(g);
     if (playing) this.drawActionHints(view, t);
-    this.drawLabels(view, self);
+    this.drawLabels(view, self, t);
 
     // Fog of war.
     if (this.fogAlpha > 0.01) {
@@ -587,32 +592,50 @@ export class Renderer {
   }
 
   private drawPlayer(p: RenderPlayer, t: number): void {
+    const skin = p.cosmetics?.skin;
     if (!p.alive) {
-      drawGhost(this.g, p.x, p.y, p.color, p.facing, t, p.seed, p.disconnected ? 0.3 : 0.5);
+      drawGhost(this.g, p.x, p.y, p.color, p.facing, t, p.seed, p.disconnected ? 0.3 : 0.5, skin);
       return;
     }
-    drawPill(this.g, { x: p.x, y: p.y, color: p.color, facing: p.facing, moving: p.moving, walk: p.walk, seed: p.seed, alpha: p.disconnected ? 0.45 : 1 }, t);
+    this.drawPillAt(p.x, p.y, p.color, p.facing, p.moving, p.walk, p.seed, p.disconnected ? 0.45 : 1, skin, t);
   }
 
-  private drawLabels(view: WorldView, self: RenderPlayer): void {
+  private drawPillAt(x: number, y: number, color: number, facing: 1 | -1, moving: boolean, walk: number, seed: number, alpha: number, skin: string | undefined, t: number): void {
+    const d = this.pillDraw;
+    d.x = x;
+    d.y = y;
+    d.color = color;
+    d.facing = facing;
+    d.moving = moving;
+    d.walk = walk;
+    d.seed = seed;
+    d.alpha = alpha;
+    d.skin = skin;
+    drawPill(this.g, d, t);
+  }
+
+  private drawLabels(view: WorldView, self: RenderPlayer, t: number): void {
     const size = this.labelSize();
     for (const p of this.labels) {
       const isSelf = p === self;
+      // Rug red for this viewer always wins: a name effect never hides a fellow rugger's red name.
       const red = isSelf ? view.role === 'rugger' : p.isRugger;
       const color = red ? COLORS.rug : '#ffffff';
+      const fx = labelEffect(red, p.cosmetics);
+      const head = skinHeadroom(p.cosmetics?.skin);
       let y: number;
       let alpha = 1;
       if (p.inVent || (isSelf && view.selfVentId)) {
         y = p.y - 24;
         alpha = 0.65;
       } else if (!p.alive) {
-        y = p.y + PILL_TOP - 16;
+        y = p.y + PILL_TOP - 16 - head * 1.3;
         alpha = 0.7;
       } else {
-        y = p.y + PILL_TOP - 6;
+        y = p.y + PILL_TOP - 6 - head;
       }
       if (p.disconnected) alpha *= 0.6;
-      drawLabel(this.g, p.name, p.x, y, color, size, alpha);
+      if (!fx || !drawNameFx(this.g, fx, p.name, p.x, y, size, alpha, t, p.seed)) drawLabel(this.g, p.name, p.x, y, color, size, alpha);
       if (p.disconnected) drawTag(this.g, 'OFFLINE', p.x, y - size * 1.25, size * 0.62, 'rgba(10,12,16,0.85)', '#9aa6b5');
     }
   }
@@ -825,13 +848,14 @@ export class Renderer {
 
   // ---------- home / lobby backdrop ----------
 
-  renderBackdrop(dt: number, t: number, colors: readonly number[]): void {
+  /** `skins[i]`: the pill skin of the player with `colors[i]` (lobby players show their skins). */
+  renderBackdrop(dt: number, t: number, colors: readonly number[], skins?: readonly (string | undefined)[]): void {
     this.beginFrame(REBUILD_BUDGET_BACKDROP_MS);
     const g = this.g;
     const entering = this.mode !== 'backdrop';
     this.mode = 'backdrop';
     this.visAll = true;
-    this.backdrop.sync(colors);
+    this.backdrop.sync(colors, skins);
     this.backdrop.update(dt);
     this.effects.update(dt, false);
     const focus = this.backdrop.focus();
@@ -858,7 +882,7 @@ export class Renderer {
       if (it.type === T_PROP) this.drawProp(it.i, t);
       else {
         const p = pills[it.i];
-        drawPill(g, { x: p.x, y: p.y, color: p.color, facing: p.facing, moving: p.moving, walk: p.walk, seed: p.seed }, t);
+        this.drawPillAt(p.x, p.y, p.color, p.facing, p.moving, p.walk, p.seed, 1, p.skin, t);
       }
     }
     this.effects.drawWorld(g);

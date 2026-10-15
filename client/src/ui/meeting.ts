@@ -7,6 +7,8 @@ import { createChat } from './chat';
 import type { Screen, UiCore } from './core';
 import { clear, clock, h, icon, setDisabled, setHidden, setText, toggleClass } from './dom';
 import { bagSvg, pillDot, pillSvg } from './pill';
+import { applyNameFx } from './names';
+import { createPillPreview, type PillPreview } from './previews';
 
 const SKIP = 'skip';
 
@@ -18,6 +20,7 @@ interface Card {
   dots: HTMLElement;
   confirm: HTMLElement;
   pillKey: string;
+  pv: PillPreview | null;
 }
 
 export function createMeeting(core: UiCore): Screen {
@@ -168,6 +171,7 @@ export function createMeeting(core: UiCore): Screen {
     if (sig === cardsSig) return;
     cardsSig = sig;
     clear(grid);
+    for (const c of cards.values()) c.pv?.destroy();
     cards.clear();
     for (const p of players) {
       const pill = h('span', { class: 'mt-card-pill' });
@@ -213,7 +217,7 @@ export function createMeeting(core: UiCore): Screen {
         }
       });
       grid.append(cardEl);
-      cards.set(p.id, { el: cardEl, pill, name, sub, dots, confirm, pillKey: '' });
+      cards.set(p.id, { el: cardEl, pill, name, sub, dots, confirm, pillKey: '', pv: null });
     }
   }
 
@@ -251,13 +255,27 @@ export function createMeeting(core: UiCore): Screen {
     for (const p of s.players) {
       const c = cards.get(p.id);
       if (!c) continue;
-      const pillKey = `${p.color}|${p.alive}`;
+      const looks = p.cosmetics ?? core.who(p.id)?.cosmetics;
+      // A living pill with a skin is drawn by the world's pill code; everyone else keeps the SVG pill.
+      const skin = p.alive ? looks?.skin : undefined;
+      const pillKey = `${p.color}|${p.alive}|${skin ?? ''}`;
       if (pillKey !== c.pillKey) {
         c.pillKey = pillKey;
-        c.pill.innerHTML = pillSvg(p.color, { variant: p.alive ? 'alive' : 'dead', legs: false });
+        c.pv?.destroy();
+        c.pv = null;
+        if (skin) {
+          c.pv = createPillPreview(52, p.color, { skin }, { cls: 'mt-card-pv', h: 56, zoom: 1.3, seed: p.color * 7 + 1 });
+          c.pill.textContent = '';
+          c.pill.append(c.pv.el);
+        } else {
+          c.pill.innerHTML = pillSvg(p.color, { variant: p.alive ? 'alive' : 'dead', legs: false });
+        }
       }
       setText(c.name, p.name);
-      toggleClass(c.name, 'is-rugger', !!p.isRugger && (viewerRugger || !s.me?.alive));
+      const red = !!p.isRugger && (viewerRugger || !s.me?.alive);
+      toggleClass(c.name, 'is-rugger', red);
+      // Red (fellow rugger / ghost view) always wins over a name effect.
+      applyNameFx(c.name, looks, red);
       const subs: string[] = [];
       if (p.id === me) subs.push('YOU');
       if (p.id === m.callerId) subs.push(m.reason === 'report' ? 'REPORTER' : 'HOST');
@@ -395,6 +413,7 @@ export function createMeeting(core: UiCore): Screen {
     destroy() {
       if (timer !== null) window.clearInterval(timer);
       chat.destroy();
+      for (const c of cards.values()) c.pv?.destroy();
     },
   };
 }

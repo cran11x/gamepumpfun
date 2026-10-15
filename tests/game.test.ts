@@ -25,15 +25,19 @@ import {
 } from '../shared/constants';
 import { circleFree, lineOfSight, moveWithCollision } from '../shared/geometry';
 import { EMERGENCY_BUTTON, SPAWN_POINTS, TASK_MIN_MS, sabotageStationById, stationById, ventById } from '../shared/map';
-import type { C2S, ChatMessage, ErrorCode, GameEvent, S2C, Snapshot } from '../shared/protocol';
+import type { C2S, ChatMessage, EquippedCosmetics, ErrorCode, GameEvent, S2C, Snapshot } from '../shared/protocol';
 import {
   INTEREST_HOLD_MS,
   INTEREST_PROBE_PX,
   Room,
+  equippedFrom,
   type BotBrainInit,
   type BotBrainLike,
+  type ConsumeTicketsResult,
   type GameResultRecordLike,
+  type RankedResultRecordLike,
   type RemoveReason,
+  type RoomProfileLike,
 } from '../server/game';
 import { mulberry32 } from '../server/game/rng';
 import { clampSettings, sanitizeChat, sanitizeName } from '../server/game/sanitize';
@@ -50,6 +54,57 @@ interface HarnessOptions {
   settings?: Partial<GameSettings>;
   wallets?: boolean;
   brains?: (init: BotBrainInit) => BotBrainLike;
+  /** Ranked room. Implies wallets; every harness player gets a profile with one ticket in `store`. */
+  ranked?: boolean;
+  /** Fake profile store wired into the room hooks (created automatically for ranked rooms). */
+  store?: FakeStore;
+}
+
+const walletAddress = (i: number) => `Wallet${i}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`;
+
+interface FakeProfile {
+  rankedTickets: number;
+  cosmetics: { owned: string[]; equipped: EquippedCosmetics };
+}
+
+/** In-memory stand-in for the server/store.ts profile, ticket and ranked functions. */
+class FakeStore {
+  readonly profiles = new Map<string, FakeProfile>();
+  readonly consumeCalls: string[][] = [];
+  readonly ranked: RankedResultRecordLike[][] = [];
+  profileReads = 0;
+  consumeThrows = false;
+
+  add(address: string, tickets = 1, equipped: EquippedCosmetics = {}, owned: string[] = Object.values(equipped)): FakeProfile {
+    const p: FakeProfile = { rankedTickets: tickets, cosmetics: { owned: [...owned], equipped: { ...equipped } } };
+    this.profiles.set(address, p);
+    return p;
+  }
+  equip(address: string, equipped: EquippedCosmetics): void {
+    const p = this.profiles.get(address)!;
+    for (const id of Object.values(equipped)) if (id && !p.cosmetics.owned.includes(id)) p.cosmetics.owned.push(id);
+    p.cosmetics.equipped = { ...equipped };
+  }
+  tickets(address: string): number {
+    return this.profiles.get(address)?.rankedTickets ?? 0;
+  }
+  readonly profileOf = (address: string): RoomProfileLike | null => {
+    this.profileReads++;
+    const p = this.profiles.get(address);
+    // A fresh copy each time, like getProfile.
+    return p ? structuredClone(p) : null;
+  };
+  readonly consume = (addresses: string[]): ConsumeTicketsResult => {
+    this.consumeCalls.push([...addresses]);
+    if (this.consumeThrows) throw new Error('store down');
+    const missing = addresses.filter((a) => this.tickets(a) < 1);
+    if (missing.length > 0) return { ok: false, missing };
+    for (const a of addresses) this.profiles.get(a)!.rankedTickets--;
+    return { ok: true };
+  };
+  readonly record = (records: RankedResultRecordLike[]): void => {
+    this.ranked.push(records.map((r) => ({ ...r })));
+  };
 }
 
 /** A Room with a fake clock, a seeded rng and an in-memory outbox per player. */
@@ -60,8 +115,11 @@ class Harness {
   readonly removed: Array<{ id: string; reason: RemoveReason }> = [];
   readonly room: Room;
   readonly ids: string[] = [];
+  readonly store: FakeStore;
 
   constructor(opts: HarnessOptions = {}) {
+    this.store = opts.store ?? new FakeStore();
+    const wallets = opts.wallets || opts.ranked;
     this.room = new Room({
       code: 'TEST',
       now: () => this.t,
@@ -75,10 +133,15 @@ class Harness {
       recordResults: (r) => this.records.push(r),
       onPlayerRemoved: (id, reason) => this.removed.push({ id, reason }),
       createBotBrain: opts.brains,
+      ranked: opts.ranked,
+      profileOf: this.store.profileOf,
+      consumeRankedTickets: this.store.consume,
+      recordRankedResults: this.store.record,
       log: () => {},
     });
     for (let i = 0; i < (opts.players ?? 5); i++) {
-      const wallet = opts.wallets ? { name: `W${i}`, address: `Wallet${i}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA` } : null;
+      const wallet = wallets ? { name: `W${i}`, address: walletAddress(i) } : null;
+      if (opts.ranked && !this.store.profiles.has(walletAddress(i))) this.store.add(walletAddress(i), 1);
       const r = this.room.addHuman({ name: `p${i}`, wallet });
       if (!r.ok) throw new Error(r.message);
       this.ids.push(r.player.id);
@@ -2030,5 +2093,723 @@ describe('RoomManager room lookups', () => {
     const host2 = conn('shared-nat');
     mgr.handleMessage(host2, { t: 'rejoin', code: w.code, playerId: w.playerId, sessionKey: w.sessionKey });
     expect(host2.welcome()?.playerId).toBe(w.playerId);
+  });
+});
+
+// ---------- Ranked rooms and cosmetics (SPEC "Ranked lobbies and token burns") ----------
+
+describe('ranked rooms', () => {
+  const addr = walletAddress;
+  /** A ranked room with `n` signed-in players holding one ticket each. */
+  const ranked = (n = 4, extra: Partial<HarnessOptions> = {}) => new Harness({ players: n, ranked: true, ...extra });
+  const tickets = (h: Harness, n: number) => Array.from({ length: n }, (_, i) => h.store.tickets(addr(i)));
+  /** End a running game quickly: the ruggers' DEV DUMP runs out. */
+  const endByDevDump = (h: Harness) => {
+    const [r] = h.ruggers();
+    h.advance(POST_MEETING_COOLDOWN_MS);
+    h.send(r, { t: 'sabotage', kind: 'devDump' });
+    h.advance(DEV_DUMP_DURATION_MS);
+    expect(h.room.phase).toBe('gameOver');
+  };
+
+  it('RoomView.ranked is in every snapshot', () => {
+    const h = ranked(4);
+    expect(h.room.ranked).toBe(true);
+    expect(h.snap(h.ids[1]).room.ranked).toBe(true);
+    h.start();
+    expect(h.snap(h.ids[1]).room.ranked).toBe(true);
+    const u = new Harness({ players: 2 });
+    expect(u.room.ranked).toBe(false);
+    expect(u.snap(u.host).room.ranked).toBe(false);
+  });
+
+  it('validates ranked on create and quick', () => {
+    expect(parseC2S({ t: 'quick', name: 'x', ranked: true })).toEqual({ t: 'quick', name: 'x', ranked: true });
+    expect(parseC2S({ t: 'create', name: 'x', authToken: 'tok', ranked: true })).toEqual({ t: 'create', name: 'x', authToken: 'tok', ranked: true });
+    expect(parseC2S({ t: 'quick', name: 'x', ranked: 'yes' })).toEqual({ t: 'quick', name: 'x' });
+    expect(parseC2S({ t: 'create', name: 'x', ranked: 1 })).toEqual({ t: 'create', name: 'x' });
+  });
+
+  describe('join rules', () => {
+    it('needs a signed-in wallet with a profile and a ticket; one seat per wallet', () => {
+      const h = ranked(1);
+      const host = h.host;
+      // Guests, and wallets the store has no profile for: NEED_WALLET.
+      expect(h.room.addHuman({ name: 'guest' })).toMatchObject({ ok: false, code: 'NEED_WALLET' });
+      expect(h.room.addHuman({ name: 'x', wallet: { name: 'X', address: addr(7) } })).toMatchObject({ ok: false, code: 'NEED_WALLET' });
+      // A profile without a ticket: NEED_TICKET.
+      h.store.add(addr(7), 0);
+      expect(h.room.addHuman({ name: 'x', wallet: { name: 'X', address: addr(7) } })).toMatchObject({ ok: false, code: 'NEED_TICKET' });
+      expect(h.room.playerCount).toBe(1);
+      // With a ticket: seated with the profile name and short wallet. Joining takes no ticket.
+      h.store.profiles.get(addr(7))!.rankedTickets = 1;
+      const ok = h.room.addHuman({ name: 'typed', wallet: { name: 'Seven', address: addr(7) } });
+      expect(ok.ok && ok.player.name).toBe('Seven');
+      expect(ok.ok && ok.player.address).toBe(addr(7));
+      expect(h.store.tickets(addr(7))).toBe(1);
+      expect(h.store.consumeCalls).toEqual([]);
+      // The same wallet again (another tab): refused, never seated as a guest the way unranked rooms do.
+      expect(h.room.addHuman({ name: 'tab2', wallet: { name: 'Seven', address: addr(7) } })).toMatchObject({ ok: false, code: 'INVALID_ACTION' });
+      expect(h.room.addHuman({ name: 'host2', wallet: { name: 'W0', address: addr(0) } })).toMatchObject({ ok: false, code: 'INVALID_ACTION' });
+      expect(h.room.playerCount).toBe(2);
+      expect(h.host).toBe(host);
+      // checkJoin gives the same answers without seating anyone.
+      expect(h.room.checkJoin(null)).toMatchObject({ ok: false, code: 'NEED_WALLET' });
+      expect(h.room.checkJoin({ name: 'Seven', address: addr(7) })).toMatchObject({ ok: false, code: 'INVALID_ACTION' });
+      h.store.add(addr(8), 2);
+      expect(h.room.checkJoin({ name: 'E', address: addr(8) })).toEqual({ ok: true });
+      expect(h.room.playerCount).toBe(2);
+      // A malformed ticket count is no ticket.
+      h.store.add(addr(9), Number.NaN);
+      expect(h.room.checkJoin({ name: 'N', address: addr(9) })).toMatchObject({ ok: false, code: 'NEED_TICKET' });
+    });
+
+    it('a store that throws or answers garbage never lets anyone in', () => {
+      for (const profileOf of [
+        () => {
+          throw new Error('disk');
+        },
+        () => ({ rankedTickets: '5' }) as unknown as RoomProfileLike,
+        () => ({ rankedTickets: -3 }),
+      ]) {
+        const room = new Room({ code: 'RANK', now: () => 1, send: () => {}, ranked: true, profileOf, log: () => {} });
+        const r = room.addHuman({ name: 'x', wallet: { name: 'X', address: addr(1) } });
+        expect(r.ok).toBe(false);
+        expect(room.playerCount).toBe(0);
+      }
+      // No profile hook at all: ranked can't verify anything.
+      const bare = new Room({ code: 'RANK', now: () => 1, send: () => {}, ranked: true, log: () => {} });
+      expect(bare.addHuman({ name: 'x', wallet: { name: 'X', address: addr(1) } })).toMatchObject({ ok: false, code: 'NEED_WALLET' });
+    });
+
+    it('a full room and a running game are refused like any room', () => {
+      const h = ranked(10);
+      h.store.add(addr(10), 1);
+      expect(h.room.addHuman({ name: 'x', wallet: { name: 'X', address: addr(10) } })).toMatchObject({ ok: false, code: 'ROOM_FULL' });
+      const g = ranked(4);
+      g.start();
+      g.store.add(addr(10), 1);
+      expect(g.room.addHuman({ name: 'x', wallet: { name: 'X', address: addr(10) } })).toMatchObject({ ok: false, code: 'GAME_IN_PROGRESS' });
+    });
+
+    it('unranked rooms keep their rules: guests welcome, a second seat of a wallet plays as a guest', () => {
+      const h = new Harness({ players: 1, wallets: true });
+      expect(h.room.addHuman({ name: 'guest' }).ok).toBe(true);
+      const dup = h.room.addHuman({ name: 'dup', wallet: { name: 'W0', address: addr(0) } });
+      expect(dup.ok && dup.player.address).toBeUndefined();
+      expect(h.store.profileReads).toBe(0); // tickets are never looked at
+    });
+  });
+
+  describe('no bots, locked settings', () => {
+    it('addBot and removeBot give RANKED_LOCKED', () => {
+      const h = ranked(4);
+      h.send(h.host, { t: 'addBot' });
+      h.send(h.host, { t: 'removeBot' });
+      expect(h.errors(h.host)).toEqual(['RANKED_LOCKED', 'RANKED_LOCKED']);
+      expect(h.room.playerCount).toBe(4);
+      expect(h.room.playerIds().some((id) => h.p(id).isBot)).toBe(false);
+      h.send(h.ids[1], { t: 'addBot' });
+      expect(h.errors(h.ids[1])).toEqual(['NOT_HOST']);
+      expect(h.room.playerCount).toBe(4);
+    });
+
+    it('settings are locked to DEFAULT_SETTINGS except isPublic', () => {
+      const h = ranked(4, { settings: { killCooldown: 60, ruggers: 3, playerSpeed: 2, isPublic: false } });
+      expect(h.room.settings).toEqual({ ...DEFAULT_SETTINGS, isPublic: false });
+      h.send(h.host, { t: 'settings', settings: { killCooldown: 10 } });
+      expect(h.errors(h.host)).toEqual(['RANKED_LOCKED']);
+      expect(h.room.settings).toEqual({ ...DEFAULT_SETTINGS, isPublic: false });
+      // Mixed with a locked change, nothing applies, isPublic included.
+      h.send(h.host, { t: 'settings', settings: { isPublic: true, ruggers: 2 } });
+      expect(h.errors(h.host)).toEqual(['RANKED_LOCKED', 'RANKED_LOCKED']);
+      expect(h.room.settings.isPublic).toBe(false);
+      // isPublic alone, or the full locked settings with isPublic changed, is fine.
+      h.send(h.host, { t: 'settings', settings: { isPublic: true } });
+      expect(h.room.settings).toEqual({ ...DEFAULT_SETTINGS, isPublic: true });
+      h.send(h.host, { t: 'settings', settings: { ...DEFAULT_SETTINGS, isPublic: false } });
+      expect(h.room.settings).toEqual({ ...DEFAULT_SETTINGS, isPublic: false });
+      expect(h.errors(h.host)).toEqual(['RANKED_LOCKED', 'RANKED_LOCKED']);
+      expect(h.snap(h.ids[2]).room.settings).toEqual({ ...DEFAULT_SETTINGS, isPublic: false });
+      expect(h.room.isPublicLobby).toBe(false);
+      h.send(h.ids[1], { t: 'settings', settings: { isPublic: true } });
+      expect(h.errors(h.ids[1])).toEqual(['NOT_HOST']);
+      expect(h.room.settings.isPublic).toBe(false);
+    });
+
+    it('plays maxRuggersFor(players) ruggers, whatever settings.ruggers says', () => {
+      expect(DEFAULT_SETTINGS.ruggers).toBe(1);
+      for (const n of [4, 6, 7, 8, 9, 10]) {
+        const h = ranked(n, { seed: n });
+        h.send(h.host, { t: 'start' });
+        expect(h.room.phase, `n=${n}`).toBe('roleReveal');
+        expect(h.ruggers().length, `n=${n}`).toBe(maxRuggersFor(n));
+      }
+      const u = new Harness({ players: 7, settings: { ruggers: 1 } });
+      u.send(u.host, { t: 'start' });
+      expect(u.ruggers().length).toBe(1);
+    });
+  });
+
+  describe('start takes the tickets', () => {
+    it('one ticket from every player, in one all-or-nothing call', () => {
+      const h = ranked(5);
+      h.store.profiles.get(addr(2))!.rankedTickets = 3;
+      h.send(h.ids[1], { t: 'start' });
+      expect(h.errors(h.ids[1])).toEqual(['NOT_HOST']);
+      expect(h.store.consumeCalls).toEqual([]);
+      h.send(h.host, { t: 'start' });
+      expect(h.room.phase).toBe('roleReveal');
+      expect(h.store.consumeCalls).toEqual([[0, 1, 2, 3, 4].map(addr)]);
+      expect(tickets(h, 5)).toEqual([0, 0, 2, 0, 0]);
+      // A second start can't take more.
+      h.send(h.host, { t: 'start' });
+      expect(h.store.consumeCalls.length).toBe(1);
+    });
+
+    it('a missing ticket starts nothing, takes nothing, and the host gets NEED_TICKET with the names', () => {
+      const h = ranked(5);
+      // Two players spent their ticket after joining (another ranked room of theirs started first).
+      h.store.profiles.get(addr(1))!.rankedTickets = 0;
+      h.store.profiles.get(addr(3))!.rankedTickets = 0;
+      h.clearOutbox();
+      h.send(h.host, { t: 'start' });
+      expect(h.room.phase).toBe('lobby');
+      expect(h.store.consumeCalls.length).toBe(1);
+      expect(tickets(h, 5)).toEqual([1, 0, 1, 0, 1]);
+      expect(h.outbox(h.host).filter((m) => m.t === 'error')).toEqual([{ t: 'error', code: 'NEED_TICKET', message: 'No ranked ticket: W1, W3' }]);
+      for (const id of h.ids.slice(1)) expect(h.errors(id)).toEqual([]);
+      expect(h.events(h.ids[2])).not.toContainEqual({ kind: 'gameStarted' });
+      // The lobby shows who isn't ready yet.
+      const ready = Object.fromEntries(h.snap(h.ids[2]).players.map((p) => [p.name, p.hasTicket]));
+      expect(ready).toEqual({ W0: true, W1: false, W2: true, W3: false, W4: true });
+      // They burn again; now it starts and everyone pays once.
+      h.store.profiles.get(addr(1))!.rankedTickets = 1;
+      h.store.profiles.get(addr(3))!.rankedTickets = 1;
+      h.send(h.host, { t: 'start' });
+      expect(h.room.phase).toBe('roleReveal');
+      expect(tickets(h, 5)).toEqual([0, 0, 0, 0, 0]);
+    });
+
+    it('needs 4 humans, all connected, and a ticket store that answers', () => {
+      const h = ranked(3);
+      h.send(h.host, { t: 'start' });
+      expect(h.errors(h.host)).toEqual(['NOT_ENOUGH_PLAYERS']);
+      h.store.add(addr(3), 1);
+      expect(h.room.addHuman({ name: 'd', wallet: { name: 'W3', address: addr(3) } }).ok).toBe(true);
+      const d = h.room.playerIds()[3];
+      // Nobody pays for a game they aren't here for.
+      h.room.setDisconnected(d);
+      h.send(h.host, { t: 'start' });
+      expect(h.errors(h.host).at(-1)).toBe('INVALID_ACTION');
+      expect(h.store.consumeCalls).toEqual([]);
+      h.room.rejoin(d, h.p(d).sessionKey);
+      // The store failing: nothing starts.
+      h.store.consumeThrows = true;
+      h.send(h.host, { t: 'start' });
+      expect(h.errors(h.host).at(-1)).toBe('NEED_TICKET');
+      expect(h.room.phase).toBe('lobby');
+      h.store.consumeThrows = false;
+      h.send(h.host, { t: 'start' });
+      expect(h.room.phase).toBe('roleReveal');
+      expect(tickets(h, 4)).toEqual([0, 0, 0, 0]);
+    });
+
+    it('without a ticket hook, or with a garbage answer, a ranked room never starts', () => {
+      const answers: Array<((a: string[]) => ConsumeTicketsResult) | undefined> = [
+        undefined,
+        () => ({ ok: 'yes' }) as unknown as ConsumeTicketsResult,
+        () => null as unknown as ConsumeTicketsResult,
+        () => ({ ok: false, missing: 'all' }) as unknown as ConsumeTicketsResult,
+      ];
+      for (const consume of answers) {
+        const sent: S2C[] = [];
+        const room = new Room({
+          code: 'RANK',
+          now: () => 1,
+          send: (_id, m) => sent.push(m),
+          ranked: true,
+          profileOf: () => ({ rankedTickets: 5 }),
+          consumeRankedTickets: consume,
+          log: () => {},
+        });
+        const ids = [0, 1, 2, 3].map((i) => {
+          const r = room.addHuman({ name: `p${i}`, wallet: { name: `W${i}`, address: addr(i) } });
+          if (!r.ok) throw new Error(r.message);
+          return r.player.id;
+        });
+        room.handle(ids[0], { t: 'start' });
+        expect(room.phase).toBe('lobby');
+        expect(sent.filter((m) => m.t === 'error').map((m) => m.t === 'error' && m.code)).toEqual(['NEED_TICKET']);
+      }
+    });
+
+    it('every new round takes a new ticket', () => {
+      const h = ranked(4);
+      for (let i = 0; i < 4; i++) h.store.profiles.get(addr(i))!.rankedTickets = 2;
+      h.start();
+      endByDevDump(h);
+      h.send(h.host, { t: 'backToLobby' });
+      expect(h.room.phase).toBe('lobby');
+      expect(h.snap(h.host).players.map((p) => p.hasTicket)).toEqual([true, true, true, true]);
+      h.send(h.host, { t: 'start' });
+      expect(h.room.phase).toBe('roleReveal');
+      expect(h.store.consumeCalls.length).toBe(2);
+      expect(tickets(h, 4)).toEqual([0, 0, 0, 0]);
+    });
+  });
+
+  describe('results', () => {
+    it('records weekly results at game over; a player who left mid-game gets leftEarly and nothing else', () => {
+      const h = ranked(6, { seed: 3 });
+      h.start();
+      expect(h.ruggers().length).toBe(1);
+      scatter(h);
+      const [r] = h.ruggers();
+      const [victim, quitter, a, b, c] = h.holders();
+      const address = (id: string) => h.p(id).address!;
+      const addrs = Object.fromEntries([r, victim, quitter, a, b, c].map((id) => [id, address(id)]));
+      h.advance(POST_MEETING_COOLDOWN_MS);
+      // The quitter does a task, then leaves for good mid-game.
+      h.doTask(quitter, h.p(quitter).tasks[0].stationId);
+      h.send(quitter, { t: 'leave' });
+      expect(h.room.getPlayer(quitter)).toBeUndefined();
+      h.kill(r, victim);
+      expect(h.room.phase).toBe('playing');
+      // X SPACES: the rugger is voted out.
+      h.place(a, { x: EMERGENCY_BUTTON.x, y: EMERGENCY_BUTTON.y - 85 });
+      h.send(a, { t: 'emergency' });
+      h.advance(DEFAULT_SETTINGS.discussionTime * 1000);
+      h.send(a, { t: 'vote', target: r });
+      h.send(b, { t: 'vote', target: r });
+      h.send(c, { t: 'vote', target: 'skip' });
+      h.send(r, { t: 'vote', target: a });
+      h.advance(MEETING_RESULTS_MS);
+      h.advance(EJECTION_MS);
+      expect(h.snap(a).gameOver).toMatchObject({ winner: 'holders', reason: 'ruggersEjected' });
+
+      expect(h.store.ranked.length).toBe(1);
+      const rec = h.store.ranked[0];
+      expect(rec.length).toBe(6);
+      const of = (id: string) => rec.find((x) => x.address === addrs[id]);
+      expect(of(r)).toEqual({ address: addrs[r], role: 'rugger', won: false, rugs: 1, tasksDone: 0, correctVotes: 0, survived: false, leftEarly: false });
+      expect(of(victim)).toEqual({ address: addrs[victim], role: 'holder', won: true, rugs: 0, tasksDone: 0, correctVotes: 0, survived: false, leftEarly: false });
+      expect(of(a)).toEqual({ address: addrs[a], role: 'holder', won: true, rugs: 0, tasksDone: 0, correctVotes: 1, survived: true, leftEarly: false });
+      expect(of(b)).toMatchObject({ won: true, correctVotes: 1, survived: true, leftEarly: false });
+      expect(of(c)).toMatchObject({ won: true, correctVotes: 0, survived: true, leftEarly: false });
+      // leftEarly replaces everything else, the task done before leaving included.
+      expect(of(quitter)).toEqual({ address: addrs[quitter], role: 'holder', won: false, rugs: 0, tasksDone: 0, correctVotes: 0, survived: false, leftEarly: true });
+      // Lifetime stats are still recorded too (there the task counts, the win doesn't).
+      expect(h.records.length).toBe(1);
+      expect(h.records[0].find((x) => x.address === addrs[quitter])).toMatchObject({ won: false, tasksDone: 1 });
+      // Nothing is recorded twice.
+      h.advance(5000);
+      expect(h.store.ranked.length).toBe(1);
+    });
+
+    it('a reconnect grace that runs out is leftEarly; coming back in time is not. A rugger win pays the rugger', () => {
+      const h = ranked(5, { seed: 11 });
+      h.start();
+      scatter(h);
+      const [r] = h.ruggers();
+      const [gone, back, c, d] = h.holders();
+      const addrs = Object.fromEntries([r, gone, back, c, d].map((id) => [id, h.p(id).address!]));
+      h.room.setDisconnected(gone);
+      h.room.setDisconnected(back);
+      h.advance(RECONNECT_GRACE_MS - 1000);
+      expect(h.room.rejoin(back, h.p(back).sessionKey)).not.toBeNull();
+      h.advance(1000);
+      expect(h.room.getPlayer(gone)).toBeUndefined();
+      expect(h.room.phase).toBe('playing');
+      h.advance(POST_MEETING_COOLDOWN_MS);
+      h.kill(r, c);
+      h.advance(DEFAULT_SETTINGS.killCooldown * 1000);
+      h.kill(r, d);
+      expect(h.snap(r).gameOver).toMatchObject({ winner: 'ruggers', reason: 'parity' });
+      const rec = h.store.ranked[0];
+      const of = (id: string) => rec.find((x) => x.address === addrs[id]);
+      expect(rec.length).toBe(5);
+      expect(of(gone)).toMatchObject({ leftEarly: true, won: false, survived: false });
+      // survived is just "alive at the end"; the store pays the bonus only to holders who won.
+      expect(of(back)).toMatchObject({ leftEarly: false, won: false, survived: true });
+      expect(of(r)).toMatchObject({ role: 'rugger', won: true, rugs: 2, survived: true, leftEarly: false });
+      expect(of(c)).toMatchObject({ won: false, leftEarly: false });
+    });
+
+    it('leaving during the role reveal is leftEarly; leaving after game over changes nothing', () => {
+      const h = ranked(5, { seed: 5 });
+      h.send(h.host, { t: 'start' });
+      const early = h.ids[4];
+      const earlyAddr = h.p(early).address!;
+      h.send(early, { t: 'leave' });
+      h.advance(ROLE_REVEAL_MS);
+      endByDevDump(h);
+      const rec = h.store.ranked[0];
+      expect(rec.find((x) => x.address === earlyAddr)).toMatchObject({ leftEarly: true });
+      expect(rec.filter((x) => x.leftEarly).length).toBe(1);
+      h.send(h.ids[1], { t: 'leave' });
+      expect(h.store.ranked.length).toBe(1);
+    });
+
+    it('unranked games never touch tickets or ranked results', () => {
+      const h = new Harness({ players: 4, wallets: true });
+      for (let i = 0; i < 4; i++) h.store.add(addr(i), 3);
+      h.start();
+      endByDevDump(h);
+      expect(h.records.length).toBe(1);
+      expect(h.store.ranked).toEqual([]);
+      expect(h.store.consumeCalls).toEqual([]);
+      expect(tickets(h, 4)).toEqual([3, 3, 3, 3]);
+    });
+  });
+
+  describe('cosmetics in snapshots', () => {
+    const viewOf = (s: Snapshot, id: string) => s.players.find((p) => p.id === id);
+
+    it('lobby snapshots show signed-in players\' equipped cosmetics, live and the same for every viewer', () => {
+      const h = new Harness({ players: 3, wallets: true });
+      h.store.add(addr(0), 0, { skin: 'skin_gold', name: 'name_fire' });
+      h.store.add(addr(1), 0, {});
+      // addr(2) has no stored profile.
+      const guest = h.room.addHuman({ name: 'guest' });
+      if (!guest.ok) throw new Error('guest');
+      h.send(h.host, { t: 'addBot' });
+      const cos = (viewer: string) => h.snap(viewer).players.map((p) => p.cosmetics);
+      expect(cos(h.ids[1])).toEqual([{ skin: 'skin_gold', name: 'name_fire' }, undefined, undefined, undefined, undefined]);
+      expect(cos(h.ids[0])).toEqual(cos(h.ids[2]));
+      expect(cos(guest.player.id)).toEqual(cos(h.ids[2]));
+      // Equipping in the lobby shows in the next snapshot, through the tick broadcast too.
+      h.store.equip(addr(1), { rug: 'rug_galaxy', skin: 'skin_laser' });
+      h.store.equip(addr(0), { name: 'name_gold' });
+      h.clearOutbox();
+      h.advance(500);
+      const sent = h.outbox(h.ids[2]).filter((m): m is Snapshot => m.t === 'snap').at(-1)!;
+      expect(viewOf(sent, h.ids[0])!.cosmetics).toEqual({ name: 'name_gold' });
+      expect(viewOf(sent, h.ids[1])!.cosmetics).toEqual({ rug: 'rug_galaxy', skin: 'skin_laser' });
+      // Unequipping everything drops the field.
+      h.store.equip(addr(0), {});
+      expect(viewOf(h.snap(h.ids[2]), h.ids[0])!.cosmetics).toBeUndefined();
+    });
+
+    it('one store read per player per tick, however many viewers', () => {
+      const h = new Harness({ players: 8, wallets: true });
+      for (let i = 0; i < 8; i++) h.store.add(addr(i), 0, { skin: 'skin_candles' });
+      h.advance(500);
+      const before = h.store.profileReads;
+      h.advance(500); // one lobby broadcast to 8 viewers
+      expect(h.store.profileReads - before).toBe(8);
+    });
+
+    it('only catalog items equipped in their own slot, and owned, are shown', () => {
+      expect(equippedFrom({ cosmetics: { owned: ['skin_gold', 'name_gold'], equipped: { skin: 'skin_gold', rug: 'name_gold', name: 'nope' } } })).toEqual({ skin: 'skin_gold' });
+      expect(equippedFrom({ cosmetics: { owned: [], equipped: { skin: 'skin_gold' } } })).toBeUndefined();
+      expect(equippedFrom({ cosmetics: { owned: ['rug_dump'], equipped: { rug: 'rug_dump' } } })).toEqual({ rug: 'rug_dump' });
+      expect(equippedFrom(null)).toBeUndefined();
+      expect(equippedFrom({ cosmetics: null })).toBeUndefined();
+      expect(equippedFrom({ cosmetics: { owned: ['x'], equipped: { skin: 42 } as unknown as EquippedCosmetics } })).toBeUndefined();
+      expect(equippedFrom({ cosmetics: { equipped: { ['__proto__' as 'skin']: 'skin_gold' } } })).toBeUndefined();
+      // Through the room: a bad store record can't inject anything into snapshots.
+      const h = new Harness({ players: 2, wallets: true });
+      h.store.add(addr(0), 0, { skin: '<img src=x onerror=alert(1)>', rug: 'rug_gold', name: 'skin_holo' }, ['rug_gold', 'skin_holo']);
+      expect(viewOf(h.snap(h.ids[1]), h.ids[0])!.cosmetics).toEqual({ rug: 'rug_gold' });
+    });
+
+    it('a profile hook that throws costs the cosmetics, not the room', () => {
+      const room = new Room({
+        code: 'COSM',
+        now: () => 1,
+        send: () => {},
+        profileOf: () => {
+          throw new Error('disk');
+        },
+        log: () => {},
+      });
+      const r = room.addHuman({ name: 'a', wallet: { name: 'A', address: addr(0) } });
+      expect(r.ok).toBe(true);
+      const s = room.buildSnapshot(r.ok ? r.player.id : '')!;
+      expect(s.players[0].cosmetics).toBeUndefined();
+      room.tick();
+    });
+
+    it('cosmetics are frozen for the round at start (no signalling by re-equipping) and live again in the lobby', () => {
+      const h = ranked(5);
+      h.store.equip(addr(0), { skin: 'skin_holo' });
+      h.start();
+      const me = h.ids[0];
+      const ghostOrHolder = h.ids[1];
+      h.store.equip(addr(0), { skin: 'skin_shades', name: 'name_glitch' });
+      h.advance(50);
+      expect(viewOf(h.snap(me), me)!.cosmetics).toEqual({ skin: 'skin_holo' });
+      // No store reads at all while the round runs.
+      const reads = h.store.profileReads;
+      h.advance(1000);
+      h.snap(ghostOrHolder);
+      expect(h.store.profileReads).toBe(reads);
+      // No ticket badges outside the lobby either.
+      expect(h.snap(ghostOrHolder).players.every((p) => p.hasTicket === undefined)).toBe(true);
+      endByDevDump(h);
+      expect(viewOf(h.snap(ghostOrHolder), me)!.cosmetics).toEqual({ skin: 'skin_holo' });
+      h.send(h.host, { t: 'backToLobby' });
+      expect(viewOf(h.snap(ghostOrHolder), me)!.cosmetics).toEqual({ skin: 'skin_shades', name: 'name_glitch' });
+    });
+
+    it('a body carries the victim\'s own rug, never the killer\'s', () => {
+      const rugs = ['rug_persian', 'rug_checker', 'rug_dump', 'rug_frog', 'rug_gold'];
+      for (const seed of [1, 2, 3, 4]) {
+        const h = new Harness({ players: 5, wallets: true, seed });
+        rugs.forEach((rug, i) => h.store.add(addr(i), 0, { rug, skin: 'skin_crown' }));
+        h.start();
+        const [r] = h.ruggers();
+        const [victim, watcher] = h.holders();
+        const rugOf = (id: string) => rugs[h.ids.indexOf(id)];
+        scatter(h);
+        h.advance(POST_MEETING_COOLDOWN_MS);
+        h.kill(r, victim);
+        expect(h.room.phase).toBe('playing');
+        // Bodies are the same for everyone: holders, the ghost and the rugger.
+        for (const viewer of [watcher, victim, r]) {
+          const bodies = h.snap(viewer).bodies;
+          expect(bodies).toEqual([{ id: victim, color: h.p(victim).color, x: expect.any(Number), y: expect.any(Number), rug: rugOf(victim) }]);
+          expect(bodies[0].rug).not.toBe(rugOf(r));
+        }
+        // Cosmetics never come with a role: a holder sees the rugger's skin, not that they are one.
+        const seen = h.snap(watcher).players.find((p) => p.id === r);
+        if (seen) expect(seen).toMatchObject({ cosmetics: { rug: rugOf(r), skin: 'skin_crown' } });
+        expect(seen?.isRugger).toBeUndefined();
+      }
+    });
+
+    it('a victim with no rug leaves a bag with no rug field, even when the killer has one', () => {
+      for (let seed = 1; seed < 50; seed++) {
+        const h = new Harness({ players: 5, wallets: true, seed });
+        for (let i = 0; i < 4; i++) h.store.add(addr(i), 0, { rug: 'rug_galaxy' });
+        h.store.add(addr(4), 0, { skin: 'skin_gold' });
+        h.start();
+        const plain = h.ids[4];
+        if (h.p(plain).role !== 'holder') continue;
+        const [r] = h.ruggers();
+        scatter(h);
+        h.advance(POST_MEETING_COOLDOWN_MS);
+        h.kill(r, plain);
+        const watcher = h.holders().find((id) => id !== plain)!;
+        const [body] = h.snap(watcher).bodies;
+        expect(body.id).toBe(plain);
+        expect('rug' in body).toBe(false);
+        return;
+      }
+      throw new Error('no seed made player 4 a holder');
+    });
+  });
+});
+
+describe('RoomManager: ranked rooms and quick play', () => {
+  class FakeConn implements Conn {
+    binding: Conn['binding'] = null;
+    lastJoinAt = -Infinity;
+    msgs: S2C[] = [];
+    token?: string;
+    constructor(readonly ip: string) {}
+    send(m: S2C): void {
+      this.msgs.push(m);
+    }
+    welcome() {
+      return this.msgs.filter((m): m is Extract<S2C, { t: 'welcome' }> => m.t === 'welcome').at(-1);
+    }
+    lastError() {
+      return this.msgs.filter((m): m is Extract<S2C, { t: 'error' }> => m.t === 'error').at(-1);
+    }
+    lastSnap() {
+      return this.msgs.filter((m): m is Snapshot => m.t === 'snap').at(-1);
+    }
+  }
+
+  function setup() {
+    let t = 7_000_000;
+    const store = new FakeStore();
+    const sessions = new Map<string, { name: string; address: string }>();
+    const lifetime: GameResultRecordLike[][] = [];
+    const mgr = new RoomManager({
+      now: () => t,
+      log: () => {},
+      resolveAuth: (token) => (token ? (sessions.get(token) ?? null) : null),
+      profileOf: store.profileOf,
+      consumeRankedTickets: store.consume,
+      recordRankedResults: store.record,
+      recordGameResults: (r) => lifetime.push(r),
+    });
+    let n = 0;
+    /** A connection; given `tickets` it is signed in as a fresh wallet holding that many. */
+    const conn = (tickets?: number) => {
+      const c = new FakeConn(`ip${n}`);
+      mgr.connect(c);
+      if (tickets !== undefined) {
+        const address = walletAddress(100 + n);
+        store.add(address, tickets);
+        c.token = `tok${n}`;
+        sessions.set(c.token, { name: `R${n}`, address });
+      }
+      n++;
+      return c;
+    };
+    /** Past the per-socket join cooldown. */
+    const clock = (ms = 300) => (t += ms);
+    const quick = (c: FakeConn, ranked?: boolean) => {
+      clock();
+      mgr.handleMessage(c, { t: 'quick', name: 'q', authToken: c.token, ...(ranked ? { ranked: true } : {}) });
+      return c.welcome()?.code;
+    };
+    return { mgr, store, sessions, lifetime, conn, clock, quick };
+  }
+
+  it('ranked quick play only joins ranked rooms, and normal quick play only unranked ones', () => {
+    const { mgr, conn, quick } = setup();
+    const U = quick(conn())!;
+    const R = quick(conn(1), true)!;
+    expect(R).not.toBe(U);
+    expect(mgr.getRoom(U)!.ranked).toBe(false);
+    expect(mgr.getRoom(R)!.ranked).toBe(true);
+    expect(mgr.getRoom(R)!.settings.isPublic).toBe(true);
+    expect(quick(conn(1), true)).toBe(R);
+    expect(quick(conn(1), true)).toBe(R); // ranked: 3 players
+    // Normal quick play skips the bigger ranked room, signed in with tickets or not.
+    expect(quick(conn())).toBe(U);
+    const signedIn = conn(1);
+    expect(quick(signedIn)).toBe(U);
+    expect(quick(conn())).toBe(U); // unranked: 4 players
+    // Ranked quick play skips the bigger unranked room.
+    const r = conn(1);
+    expect(quick(r, true)).toBe(R);
+    expect(mgr.roomCount).toBe(2);
+    expect(mgr.getRoom(U)!.playerCount).toBe(4);
+    expect(mgr.getRoom(R)!.playerCount).toBe(4);
+    expect(r.lastSnap()!.room.ranked).toBe(true);
+    expect(signedIn.lastSnap()!.room.ranked).toBe(false);
+    // The signed-in player in the unranked room plays with their wallet, as before.
+    expect(mgr.getRoom(U)!.getPlayer(signedIn.welcome()!.playerId)!.address).toBe(walletAddress(105));
+  });
+
+  it('with only unranked lobbies around, ranked quick play creates a public ranked room (and vice versa)', () => {
+    const { mgr, conn, quick } = setup();
+    const U = quick(conn())!;
+    const R = quick(conn(2), true)!;
+    expect(mgr.getRoom(R)!.ranked).toBe(true);
+    expect(R).not.toBe(U);
+    const mgr2 = setup();
+    const R2 = mgr2.quick(mgr2.conn(1), true)!;
+    const U2 = mgr2.quick(mgr2.conn())!;
+    expect(U2).not.toBe(R2);
+    expect(mgr2.mgr.getRoom(U2)!.ranked).toBe(false);
+  });
+
+  it('create, quick and join into ranked need a wallet and a ticket, checked before leaving your seat', () => {
+    const { mgr, conn, clock, quick } = setup();
+    const host = conn(1);
+    mgr.handleMessage(host, { t: 'create', name: 'h', authToken: host.token, ranked: true });
+    const code = host.welcome()!.code;
+    expect(mgr.getRoom(code)!.ranked).toBe(true);
+    expect(host.lastSnap()!.room.ranked).toBe(true);
+
+    const guest = conn();
+    const home = quick(guest)!;
+    const rooms = mgr.roomCount;
+    const attempts = (c: FakeConn, token?: string): C2S[] => [
+      { t: 'quick', name: 'g', authToken: token, ranked: true },
+      { t: 'create', name: 'g', authToken: token, ranked: true },
+      { t: 'join', code, name: 'g', authToken: token },
+    ];
+    for (const token of [undefined, 'forged-token']) {
+      for (const msg of attempts(guest, token)) {
+        clock();
+        mgr.handleMessage(guest, msg);
+        expect(guest.lastError()!.code).toBe('NEED_WALLET');
+        expect(guest.binding?.code).toBe(home);
+      }
+    }
+    const broke = conn(0);
+    const brokeHome = quick(broke)!;
+    for (const msg of attempts(broke, broke.token)) {
+      clock();
+      mgr.handleMessage(broke, msg);
+      expect(broke.lastError()!.code).toBe('NEED_TICKET');
+      expect(broke.binding?.code).toBe(brokeHome);
+    }
+    expect(mgr.roomCount).toBe(rooms);
+    expect(mgr.getRoom(code)!.playerCount).toBe(1);
+    // With a ticket the same join works, and moves the player out of their old room.
+    const rich = conn(1);
+    const richHome = quick(rich)!;
+    clock();
+    mgr.handleMessage(rich, { t: 'join', code, name: 'r', authToken: rich.token });
+    expect(rich.welcome()!.code).toBe(code);
+    expect(mgr.getRoom(code)!.playerCount).toBe(2);
+    const oldSeat = rich.msgs.find((m): m is Extract<S2C, { t: 'welcome' }> => m.t === 'welcome')!;
+    expect(oldSeat.code).toBe(richHome);
+    expect(mgr.getRoom(richHome)?.getPlayer(oldSeat.playerId)).toBeUndefined();
+    // Creating unranked rooms still needs nothing.
+    const g2 = conn();
+    mgr.handleMessage(g2, { t: 'create', name: 'g2' });
+    expect(mgr.getRoom(g2.welcome()!.code)!.ranked).toBe(false);
+  });
+
+  it('one seat per wallet: a second tab cannot take another seat in the same ranked room', () => {
+    const { mgr, conn, clock, quick } = setup();
+    const a = conn(1);
+    const R = quick(a, true)!;
+    const tab = new FakeConn('ip-tab');
+    tab.token = a.token;
+    mgr.connect(tab);
+    mgr.handleMessage(tab, { t: 'join', code: R, name: 'a2', authToken: tab.token });
+    expect(tab.lastError()).toMatchObject({ code: 'INVALID_ACTION' });
+    expect(mgr.getRoom(R)!.playerCount).toBe(1);
+    // Ranked quick play doesn't send the second tab into the room its wallet already sits in.
+    const other = quick(tab, true)!;
+    expect(other).not.toBe(R);
+    expect(mgr.getRoom(other)!.ranked).toBe(true);
+    expect(mgr.getRoom(R)!.playerCount).toBe(1);
+    // The first tab re-sending join for its own seat just gets its welcome again.
+    clock();
+    mgr.handleMessage(a, { t: 'join', code: R, name: 'a', authToken: a.token });
+    expect(a.msgs.filter((m) => m.t === 'welcome').length).toBe(2);
+    expect(mgr.getRoom(R)!.playerCount).toBe(1);
+  });
+
+  it('rooms get the store hooks: no bots, private ranked rooms stay out of quick play, start takes tickets, results are recorded', () => {
+    const { mgr, conn, clock, quick, store, lifetime } = setup();
+    const players = [conn(1), conn(1), conn(1), conn(1)];
+    const R = quick(players[0], true)!;
+    for (const c of players.slice(1)) expect(quick(c, true)).toBe(R);
+    const room = mgr.getRoom(R)!;
+    const [host] = players;
+    mgr.handleMessage(host, { t: 'addBot' });
+    expect(host.lastError()!.code).toBe('RANKED_LOCKED');
+    mgr.handleMessage(host, { t: 'settings', settings: { isPublic: false } });
+    expect(room.settings.isPublic).toBe(false);
+    // Private: ranked quick play makes a new room instead; the code still works.
+    const late = conn(1);
+    const elsewhere = quick(late, true)!;
+    expect(elsewhere).not.toBe(R);
+    clock();
+    mgr.handleMessage(late, { t: 'join', code: R, name: 'late', authToken: late.token });
+    expect(late.welcome()!.code).toBe(R);
+    expect(mgr.getRoom(elsewhere)).toBeUndefined(); // left empty, destroyed
+    // The lobby shows ticket badges from the store.
+    expect(host.lastSnap()!.players.every((p) => p.hasTicket === true)).toBe(true);
+    const addresses = room.playerIds().map((id) => room.getPlayer(id)!.address!);
+    mgr.handleMessage(host, { t: 'start' });
+    expect(room.phase).toBe('roleReveal');
+    expect(store.consumeCalls).toEqual([addresses]);
+    for (const a of addresses) expect(store.tickets(a)).toBe(0);
+    // Everyone leaves but the last two: the game ends and both stores hear about it.
+    const ids = room.playerIds();
+    const rugger = ids.find((id) => room.getPlayer(id)!.role === 'rugger')!;
+    const quitters = ids.filter((id) => id !== rugger).slice(0, 3);
+    for (const c of [...players, late]) {
+      const b = c.binding;
+      if (b && quitters.includes(b.playerId)) mgr.handleMessage(c, { t: 'leave' });
+    }
+    expect(room.phase).toBe('gameOver');
+    expect(store.ranked.length).toBe(1);
+    expect(store.ranked[0].filter((r) => r.leftEarly).length).toBe(3);
+    expect(lifetime.length).toBe(1);
   });
 });

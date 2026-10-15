@@ -9,18 +9,32 @@ import { shortAddress } from '../shared/protocol';
 import {
   LEADERBOARD_SORTS,
   SESSION_TTL_MS,
+  consumeRankedTickets,
   createSession,
   deleteSession,
+  equipCosmetic,
   flushStore,
+  getBurnByIntent,
+  getBurnBySignature,
+  getBurnIntent,
+  getBurnTotals,
+  getEquippedCosmetics,
   getLeaderboard,
   getProfile,
+  getRankedLeaderboard,
   getSessionAddress,
+  grantBurn,
+  listBurnIntents,
+  pruneBurnIntents,
+  putBurnIntent,
   recordGameResults,
+  recordRankedResults,
   resetStore,
   sanitizeProfileName,
   setProfileName,
   upsertProfile,
   type GameResultRecord,
+  type StoredBurnIntent,
 } from '../server/store';
 
 const ORIGINAL_DATA_DIR = process.env.DATA_DIR;
@@ -60,6 +74,8 @@ describe('profiles', () => {
       name: shortAddress(a),
       stats: { gamesPlayed: 0, wins: 0, holderWins: 0, ruggerWins: 0, rugs: 0, timesRugged: 0, tasksDone: 0, correctVotes: 0 },
       createdAt: 1234,
+      cosmetics: { owned: [], equipped: {} },
+      rankedTickets: 0,
     });
     p.name = 'mutated';
     p.stats.wins = 99;
@@ -67,7 +83,7 @@ describe('profiles', () => {
     expect(again.name).toBe(shortAddress(a));
     expect(again.stats.wins).toBe(0);
     expect(again.createdAt).toBe(1234);
-    expect(Object.keys(again).sort()).toEqual(['address', 'createdAt', 'name', 'stats']);
+    expect(Object.keys(again).sort()).toEqual(['address', 'cosmetics', 'createdAt', 'name', 'rankedTickets', 'stats']);
   });
 
   it('rejects addresses that are not 32-byte base58 keys', () => {
@@ -280,7 +296,7 @@ describe('persistence', () => {
     const raw = fs.readFileSync(dbFile(), 'utf8');
     expect(raw).not.toContain(token);
     const db = JSON.parse(raw);
-    expect(db.version).toBe(1);
+    expect(db.version).toBe(2);
     expect(db.profiles[a].stats.wins).toBe(1);
     expect(Object.keys(db.sessions)).toHaveLength(1);
     expect(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
@@ -341,5 +357,138 @@ describe('persistence', () => {
     expect(p.name).toBe('ok');
     expect(p.stats).toMatchObject({ wins: 2, gamesPlayed: 3, rugs: 0, correctVotes: 0 });
     expect(getProfile('bad-address')).toBeNull();
+  });
+});
+
+describe('migration and burn data', () => {
+  const hex = (n = 16) => Buffer.from(nacl.randomBytes(n)).toString('hex');
+  const mockSig = () => `mock_${hex(8)}`;
+
+  it('loads version 1 files: profiles get no cosmetics and no tickets, and are written back as version 2', () => {
+    const a = newAddress();
+    fs.writeFileSync(
+      dbFile(),
+      JSON.stringify({
+        version: 1,
+        profiles: { [a]: { address: a, name: 'old timer', stats: { gamesPlayed: 4, wins: 2 }, createdAt: 77, lastPlayedAt: 99 } },
+        sessions: {},
+      }),
+    );
+    const p = getProfile(a)!;
+    expect(p).toMatchObject({ name: 'old timer', createdAt: 77, cosmetics: { owned: [], equipped: {} }, rankedTickets: 0 });
+    expect(p.stats).toMatchObject({ gamesPlayed: 4, wins: 2 });
+    expect(getEquippedCosmetics(a)).toEqual({});
+
+    grantBurn({ signature: mockSig(), intentId: hex(), address: a, purpose: 'cosmetic', itemId: 'skin_gold', amount: 60_000, amountRaw: '60000000000', at: 5 });
+    flushStore();
+    const db = JSON.parse(fs.readFileSync(dbFile(), 'utf8'));
+    expect(db.version).toBe(2);
+    expect(db.profiles[a]).toMatchObject({ name: 'old timer', rankedTickets: 0, cosmetics: { owned: ['skin_gold'], equipped: { skin: 'skin_gold' } } });
+    expect(db.burns).toHaveLength(1);
+  });
+
+  it('normalizes stored cosmetics and keeps retired items on disk without serving them', () => {
+    const a = newAddress();
+    fs.writeFileSync(
+      dbFile(),
+      JSON.stringify({
+        version: 2,
+        profiles: {
+          [a]: {
+            address: a,
+            name: 'x',
+            stats: {},
+            createdAt: 1,
+            rankedTickets: 3.7,
+            cosmetics: {
+              owned: ['skin_gold', 'skin_gold', 'rug_frog', 'skin_retired_2025', 'BAD ID', 42, 'name_fire'],
+              // rug_gold is not owned; name slot holds a skin; skin slot is fine.
+              equipped: { skin: 'skin_gold', rug: 'rug_gold', name: 'skin_gold', hat: 'skin_gold' },
+            },
+          },
+        },
+      }),
+    );
+    expect(getProfile(a)).toMatchObject({ rankedTickets: 3, cosmetics: { owned: ['skin_gold', 'rug_frog', 'name_fire'], equipped: { skin: 'skin_gold' } } });
+    expect(equipCosmetic(a, 'rug', 'rug_frog').ok).toBe(true);
+    flushStore();
+    const stored = JSON.parse(fs.readFileSync(dbFile(), 'utf8')).profiles[a].cosmetics;
+    expect(stored.owned).toEqual(['skin_gold', 'rug_frog', 'skin_retired_2025', 'name_fire']);
+    expect(stored.equipped).toEqual({ skin: 'skin_gold', rug: 'rug_frog' });
+  });
+
+  it('refuses a db.json written by a newer version instead of overwriting it', () => {
+    const text = JSON.stringify({ version: 99, profiles: {}, sessions: {}, somethingNew: [1, 2, 3] });
+    fs.writeFileSync(dbFile(), text);
+    expect(() => getProfile(newAddress())).toThrow(/newer/);
+    expect(fs.readFileSync(dbFile(), 'utf8')).toBe(text);
+    expect(fs.readdirSync(dir).some((f) => f.includes('corrupt'))).toBe(false);
+  });
+
+  it('persists burns, intents, tickets and weekly ranked stats', () => {
+    const a = newAddress();
+    upsertProfile(a);
+    const sig = mockSig();
+    const intentId = hex();
+    expect(grantBurn({ signature: sig, intentId, address: a, purpose: 'ranked', amount: 50_000, amountRaw: '50000000000', at: 10 }).ok).toBe(true);
+    const nonce = hex();
+    const intent: StoredBurnIntent = {
+      id: hex(),
+      address: a,
+      purpose: 'cosmetic',
+      itemId: 'rug_galaxy',
+      amount: 80_000,
+      amountRaw: '80000000000',
+      decimals: 6,
+      nonce,
+      memo: `AMONGRUGS cosmetic:rug_galaxy ${nonce}`,
+      mode: 'live',
+      createdAt: 100,
+      expiresAt: 700,
+      claimed: false,
+    };
+    expect(putBurnIntent(intent)).toBe(true);
+    expect(putBurnIntent({ ...intent, id: 'nope' })).toBe(false);
+    expect(putBurnIntent({ ...intent, id: hex(), memo: 'AMONGRUGS cosmetic:rug_galaxy other' })).toBe(false);
+    const week = Date.UTC(2026, 9, 14);
+    recordRankedResults([{ address: a, role: 'rugger', won: true, rugs: 2, tasksDone: 0, correctVotes: 0, survived: true, leftEarly: false }], week);
+    flushStore();
+    expect(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp'))).toEqual([]);
+
+    resetStore();
+    expect(getProfile(a)!.rankedTickets).toBe(1);
+    expect(getBurnBySignature(sig)).toMatchObject({ intentId, amount: 50_000 });
+    expect(getBurnByIntent(intentId)?.signature).toBe(sig);
+    expect(getBurnTotals()).toMatchObject({ totalBurned: 50_000, burns: 1, recent: [{ signature: sig, name: shortAddress(a) }] });
+    expect(getBurnIntent(intent.id)).toEqual(intent);
+    expect(listBurnIntents(a)).toEqual([intent]);
+    expect(getRankedLeaderboard('current', week).entries).toEqual([expect.objectContaining({ address: a, points: 50, rugs: 2 })]);
+    expect(consumeRankedTickets([a])).toEqual({ ok: true });
+    expect(pruneBurnIntents((i) => i.expiresAt < 1000)).toBe(1);
+    expect(getBurnIntent(intent.id)).toBeNull();
+  });
+
+  it('skips corrupt burn records and lets the first record of a signature win', () => {
+    const a = newAddress();
+    const sig = mockSig();
+    const first = { signature: sig, intentId: hex(), address: a, purpose: 'ranked', amount: 5, amountRaw: '5000000', at: 1 };
+    fs.writeFileSync(
+      dbFile(),
+      JSON.stringify({
+        version: 2,
+        profiles: {},
+        sessions: {},
+        burns: [
+          first,
+          { ...first, intentId: hex(), amount: 999 }, // same signature again
+          { ...first, signature: mockSig(), intentId: first.intentId }, // same intent again
+          { ...first, signature: mockSig(), intentId: hex(), purpose: 'cosmetic' }, // cosmetic without an item
+          { ...first, signature: 'x', intentId: hex() },
+          null,
+        ],
+      }),
+    );
+    expect(getBurnTotals()).toMatchObject({ totalBurned: 5, burns: 1 });
+    expect(getBurnBySignature(sig)?.amount).toBe(5);
   });
 });

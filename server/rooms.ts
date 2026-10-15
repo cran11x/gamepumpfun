@@ -8,8 +8,16 @@ import { RateLimiter } from './api';
 import { resolveAuthToken } from './auth';
 import { BotBrain, botName } from './bots';
 import { getPublicConfig } from './config';
-import { Room, type WalletIdentity } from './game';
-import { recordGameResults } from './store';
+import {
+  Room,
+  rankedEntryError,
+  type ConsumeTicketsResult,
+  type GameResultRecordLike,
+  type RankedResultRecordLike,
+  type RoomProfileLike,
+  type WalletIdentity,
+} from './game';
+import { consumeRankedTickets, getProfile, recordGameResults, recordRankedResults } from './store';
 
 /** SPEC: 4 letters from this alphabet (no I or O). */
 export const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -49,6 +57,20 @@ export interface RoomManagerOptions {
   now?: () => number;
   rng?: () => number;
   log?: (message: string, err?: unknown) => void;
+  /*
+   * Store and auth hooks. Production uses the real server/auth.ts and server/store.ts functions;
+   * tests inject fakes.
+   */
+  /** Session token -> signed-in wallet (server/auth.ts `resolveAuthToken`). */
+  resolveAuth?: (token?: string) => { name?: unknown; address?: unknown } | null;
+  /** Stored profile by full address: cosmetics and ranked tickets (server/store.ts `getProfile`). */
+  profileOf?: (address: string) => RoomProfileLike | null;
+  /** All-or-nothing ticket take at ranked start (server/store.ts). */
+  consumeRankedTickets?: (addresses: string[]) => ConsumeTicketsResult;
+  /** Weekly ranked points at game over (server/store.ts). */
+  recordRankedResults?: (records: RankedResultRecordLike[]) => void;
+  /** Lifetime stats at game over (server/store.ts). */
+  recordGameResults?: (records: GameResultRecordLike[]) => void;
 }
 
 const seatKey = (code: string, playerId: string) => `${code}:${playerId}`;
@@ -69,6 +91,11 @@ export class RoomManager {
   private readonly now: () => number;
   private readonly rng: () => number;
   private readonly log: (message: string, err?: unknown) => void;
+  private readonly resolveAuth: NonNullable<RoomManagerOptions['resolveAuth']>;
+  private readonly profileOf: NonNullable<RoomManagerOptions['profileOf']>;
+  private readonly consumeTickets: NonNullable<RoomManagerOptions['consumeRankedTickets']>;
+  private readonly recordRanked: NonNullable<RoomManagerOptions['recordRankedResults']>;
+  private readonly recordGame: NonNullable<RoomManagerOptions['recordGameResults']>;
   private timer: ReturnType<typeof setInterval> | null = null;
   /** Failed room lookups per client IP, and IPs blocked from lookups until a time. */
   private readonly lookupFails: RateLimiter;
@@ -83,6 +110,11 @@ export class RoomManager {
     this.now = opts.now ?? Date.now;
     this.rng = opts.rng ?? Math.random;
     this.log = opts.log ?? ((m, e) => console.error(`[rooms] ${m}`, e ?? ''));
+    this.resolveAuth = opts.resolveAuth ?? ((token) => resolveAuthToken(token));
+    this.profileOf = opts.profileOf ?? ((address) => getProfile(address));
+    this.consumeTickets = opts.consumeRankedTickets ?? ((addresses) => consumeRankedTickets(addresses));
+    this.recordRanked = opts.recordRankedResults ?? ((records) => recordRankedResults(records));
+    this.recordGame = opts.recordGameResults ?? ((records) => recordGameResults(records));
     this.lookupFails = new RateLimiter(LOOKUP_FAIL_LIMIT, LOOKUP_FAIL_WINDOW_MS, 50_000, this.now);
   }
 
@@ -151,13 +183,13 @@ export class RoomManager {
         conn.send({ t: 'pong', ts: msg.ts, serverNow: this.now() });
         return;
       case 'create':
-        this.create(conn, msg.name, msg.authToken);
+        this.create(conn, msg.name, msg.authToken, msg.ranked === true);
         return;
       case 'join':
         this.join(conn, msg.code, msg.name, msg.authToken);
         return;
       case 'quick':
-        this.quick(conn, msg.name, msg.authToken);
+        this.quick(conn, msg.name, msg.authToken, msg.ranked === true);
         return;
       case 'rejoin':
         this.rejoin(conn, msg.code, msg.playerId, msg.sessionKey);
@@ -180,11 +212,17 @@ export class RoomManager {
 
   // ---------- Create / join / quick / rejoin / leave ----------
 
-  private create(conn: Conn, name: string, authToken?: string): void {
+  private create(conn: Conn, name: string, authToken: string | undefined, ranked: boolean): void {
     if (!this.joinAllowed(conn)) return;
     if (this.rooms.size >= MAX_ROOMS) return this.error(conn, 'INVALID_ACTION', 'Server is full, try again soon');
+    const wallet = this.resolveWallet(authToken);
+    // Checked before leaving the current room, so a refused ranked create keeps your seat.
+    if (ranked) {
+      const denied = rankedEntryError(wallet, this.profileOf);
+      if (denied) return this.error(conn, denied.code, denied.message);
+    }
     this.leave(conn);
-    this.seat(conn, this.createRoom(false), name, authToken);
+    this.seat(conn, this.createRoom({ ranked, forcePublic: false }), name, wallet);
   }
 
   private join(conn: Conn, rawCode: string, name: string, authToken?: string): void {
@@ -204,26 +242,39 @@ export class RoomManager {
       return;
     }
     // Check before leaving the current room so a failed join doesn't kick you out of yours.
-    if (room.phase !== 'lobby') return this.error(conn, 'GAME_IN_PROGRESS', 'That game already started');
-    if (room.isFull) return this.error(conn, 'ROOM_FULL', 'Room is full');
+    // Ranked rooms also check the wallet, its ticket and its one seat here.
+    const wallet = this.resolveWallet(authToken);
+    const allowed = room.checkJoin(wallet);
+    if (!allowed.ok) return this.error(conn, allowed.code, allowed.message);
     this.leave(conn);
-    this.seat(conn, room, name, authToken);
+    this.seat(conn, room, name, wallet);
   }
 
-  /** Join the public lobby with the most players, or create a new public room. */
-  private quick(conn: Conn, name: string, authToken?: string): void {
+  /**
+   * Join the public lobby with the most players, or create a new public room. Ranked and unranked never
+   * mix: ranked quick play only considers ranked rooms (that this wallet has no seat in yet), and normal
+   * quick play only unranked ones.
+   */
+  private quick(conn: Conn, name: string, authToken: string | undefined, ranked: boolean): void {
     if (!this.joinAllowed(conn)) return;
+    const wallet = this.resolveWallet(authToken);
+    if (ranked) {
+      const denied = rankedEntryError(wallet, this.profileOf);
+      if (denied) return this.error(conn, denied.code, denied.message);
+    }
     const current = conn.binding?.code;
     let best: Room | undefined;
     for (const room of this.rooms.values()) {
-      if (room.code === current || !room.isPublicLobby) continue;
+      if (room.code === current || room.ranked !== ranked || !room.isPublicLobby) continue;
+      // Entry was checked once above; skip rooms this wallet already sits in (another tab).
+      if (ranked && wallet && room.hasWallet(wallet.address)) continue;
       if (!best || room.playerCount > best.playerCount || (room.playerCount === best.playerCount && room.createdAt < best.createdAt)) {
         best = room;
       }
     }
     if (!best && this.rooms.size >= MAX_ROOMS) return this.error(conn, 'INVALID_ACTION', 'Server is full, try again soon');
     this.leave(conn);
-    this.seat(conn, best ?? this.createRoom(true), name, authToken);
+    this.seat(conn, best ?? this.createRoom({ ranked, forcePublic: true }), name, wallet);
   }
 
   private rejoin(conn: Conn, rawCode: string, playerId: string, sessionKey: string): void {
@@ -268,8 +319,8 @@ export class RoomManager {
     if (room.shouldDestroy()) this.destroy(room.code);
   }
 
-  private seat(conn: Conn, room: Room, name: string, authToken?: string): void {
-    const res = room.addHuman({ name, wallet: this.resolveWallet(authToken) });
+  private seat(conn: Conn, room: Room, name: string, wallet: WalletIdentity | null): void {
+    const res = room.addHuman({ name, wallet });
     if (!res.ok) {
       this.error(conn, res.code, res.message);
       if (room.shouldDestroy()) this.destroy(room.code);
@@ -294,7 +345,7 @@ export class RoomManager {
 
   // ---------- Internals ----------
 
-  private createRoom(forcePublic: boolean): Room {
+  private createRoom(opts: { ranked: boolean; forcePublic: boolean }): Room {
     const code = this.newCode();
     const room = new Room({
       code,
@@ -302,10 +353,14 @@ export class RoomManager {
       rng: this.rng,
       send: (playerId, msg) => this.sendTo(code, playerId, msg),
       ticker: this.ticker(),
-      settings: forcePublic ? { isPublic: true } : undefined,
+      settings: opts.forcePublic ? { isPublic: true } : undefined,
+      ranked: opts.ranked,
       createBotBrain: (init) => new BotBrain(init),
       botName: (i) => botName(i),
-      recordResults: (records) => recordGameResults(records),
+      recordResults: this.recordGame,
+      profileOf: this.profileOf,
+      consumeRankedTickets: this.consumeTickets,
+      recordRankedResults: this.recordRanked,
       onPlayerRemoved: (playerId) => this.unbind(code, playerId),
       log: (m, e) => this.log(`room ${code}: ${m}`, e),
     });
@@ -406,7 +461,7 @@ export class RoomManager {
   private resolveWallet(authToken?: string): WalletIdentity | null {
     if (!authToken) return null;
     try {
-      const profile = resolveAuthToken(authToken);
+      const profile = this.resolveAuth(authToken);
       if (!profile || typeof profile.address !== 'string' || !profile.address) return null;
       return { name: typeof profile.name === 'string' ? profile.name : '', address: profile.address };
     } catch (err) {

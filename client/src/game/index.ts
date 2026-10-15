@@ -29,6 +29,7 @@ const COVER_FADE_MS = 450;
 /** Tolerance for client/server clock skew when checking cooldowns locally. */
 const COOLDOWN_SLACK_MS = 150;
 const NO_COLORS: readonly number[] = [];
+const NO_SKINS: readonly (string | undefined)[] = [];
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
@@ -96,6 +97,7 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
   const departed = new Set<string>();
   let backdropSnap: Snapshot | null = null;
   let backdropColors: readonly number[] = NO_COLORS;
+  let backdropSkins: readonly (string | undefined)[] = NO_SKINS;
   const guards = new Map<string, number>();
   const vec: InputVector = { x: 0, y: 0, mag: 0 };
   const taskGlow: string[] = [];
@@ -418,6 +420,7 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
     }
     self.name = mine?.name ?? self.name;
     self.color = mine?.color ?? self.color;
+    self.cosmetics = mine?.cosmetics;
     self.alive = me.alive;
     self.isRugger = me.role === 'rugger';
     self.inVent = !!me.ventId;
@@ -445,13 +448,19 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
     return view;
   }
 
-  function backdropColorsFor(snap: Snapshot | null): readonly number[] {
-    if (!snap || snap.phase !== 'lobby') return NO_COLORS;
+  /** Lobby players' colors and pill skins for the home/lobby backdrop (cached per snapshot). */
+  function syncBackdrop(snap: Snapshot | null): void {
+    if (!snap || snap.phase !== 'lobby') {
+      backdropSnap = null;
+      backdropColors = NO_COLORS;
+      backdropSkins = NO_SKINS;
+      return;
+    }
     if (snap !== backdropSnap) {
       backdropSnap = snap;
       backdropColors = snap.players.map((p) => p.color);
+      backdropSkins = snap.players.map((p) => p.cosmetics?.skin);
     }
-    return backdropColors;
   }
 
   function tick(now: number, dt: number, time: number): void {
@@ -460,7 +469,8 @@ export function createGame(canvas: HTMLCanvasElement, ctx: AppContext): GameApi 
     if (!snap || !me || snap.phase === 'lobby' || !initialized) {
       if (!snap || snap.phase === 'lobby') resetLocal();
       interactions = NO_INTERACTIONS;
-      renderer.renderBackdrop(dt, time, backdropColorsFor(snap));
+      syncBackdrop(snap);
+      renderer.renderBackdrop(dt, time, backdropColors, backdropSkins);
       snapCamera = true;
       return;
     }

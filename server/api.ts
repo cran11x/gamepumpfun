@@ -8,6 +8,11 @@
 //   POST /me/name {name} (Bearer)      -> Profile
 //   GET  /leaderboard?sort=<key>&limit=<n> -> LeaderboardEntry[]
 //   GET  /rooms                        -> { publicLobbies, playersOnline }
+//   GET  /leaderboard/ranked?week=current|previous -> RankedLeaderboard
+//   POST /me/equip {slot, itemId|null} (Bearer) -> Profile
+//   POST /burn/intent {purpose, itemId?} (Bearer) -> BurnIntent | 400/401/409/503
+//   POST /burn/confirm {intentId, signature} (Bearer) -> BurnReceipt | 202 {status:'pending'} | 400/401/403/404/409
+//   GET  /burns/stats                  -> BurnStats
 //
 // Errors are JSON `{ error: string }` with a proper status code. Responses never contain
 // anything secret beyond the caller's own session token (returned once, by /auth/verify).
@@ -15,20 +20,38 @@
 import express, { type NextFunction, type Request, type RequestHandler, type Response, type Router } from 'express';
 import type { Profile } from '../shared/protocol';
 import { AuthError, isLoginDomain, isLoginSite, issueNonce, resolveAuthToken, revokeToken, verifyLogin, type LoginSite } from './auth';
+import { BurnError, getBurnService, type BurnService } from './burns';
 import { getLoginOrigins, getPublicConfig } from './config';
 import {
   LEADERBOARD_MAX_LIMIT,
   LEADERBOARD_SORTS,
   StoreFullError,
+  equipCosmetic,
   getLeaderboard,
+  getRankedLeaderboard,
+  isCosmeticSlot,
   isLeaderboardSort,
   sanitizeProfileName,
   setProfileName,
+  type EquipError,
 } from './store';
 
 export interface ApiDeps {
   getRoomsInfo(): { publicLobbies: number; playersOnline: number };
+  /**
+   * Token burns. Defaults to the process-wide service built from the environment, which throws (so
+   * the server refuses to start) for BURN_MODE=mock with NODE_ENV=production.
+   */
+  burns?: BurnService;
 }
+
+const EQUIP_ERRORS: Record<EquipError, { status: number; message: string }> = {
+  no_profile: { status: 401, message: 'Not signed in' },
+  bad_slot: { status: 400, message: 'slot must be one of: skin, rug, name' },
+  unknown_item: { status: 400, message: 'Unknown item' },
+  wrong_slot: { status: 400, message: "That item doesn't go in this slot" },
+  not_owned: { status: 400, message: "You don't own that item" },
+};
 
 const BODY_LIMIT_BYTES = 4 * 1024;
 
@@ -181,12 +204,18 @@ function queryString(req: Request, key: string): string | undefined {
 
 export function createApiRouter(deps: ApiDeps): Router {
   const router = express.Router();
+  const burns = deps.burns ?? getBurnService();
 
   // Separate limiters per router instance (and per endpoint) keep tests and endpoints independent.
   const nonceLimiter = new RateLimiter(30, 60_000);
   const verifyLimiter = new RateLimiter(20, 60_000);
   const logoutLimiter = new RateLimiter(30, 60_000);
   const nameLimiter = new RateLimiter(12, 60_000);
+  const equipLimiter = new RateLimiter(30, 60_000);
+  const intentLimiter = new RateLimiter(20, 60_000);
+  // A confirm can long-poll ~25 s and the client retries pending ones, so allow a steady trickle.
+  const confirmLimiter = new RateLimiter(40, 60_000);
+  const publicLimiter = new RateLimiter(120, 60_000);
 
   router.use((req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
@@ -200,7 +229,7 @@ export function createApiRouter(deps: ApiDeps): Router {
 
   router.get('/config', (_req, res) => {
     res.setHeader('Cache-Control', 'public, max-age=60');
-    res.json(getPublicConfig());
+    res.json({ ...getPublicConfig(), burn: burns.publicConfig() });
   });
 
   router.get('/auth/nonce', limitBy(nonceLimiter), (req, res) => {
@@ -250,6 +279,46 @@ export function createApiRouter(deps: ApiDeps): Router {
     const profile = setProfileName((req as AuthedRequest).profile!.address, name);
     if (!profile) return fail(res, 401, 'Not signed in');
     res.json(profile);
+  });
+
+  router.post('/me/equip', limitBy(equipLimiter), requireAuth, (req, res) => {
+    const slot = bodyField(req, 'slot');
+    const itemId = bodyField(req, 'itemId');
+    if (!isCosmeticSlot(slot)) return fail(res, 400, EQUIP_ERRORS.bad_slot.message);
+    if (itemId !== null && typeof itemId !== 'string') return fail(res, 400, 'Expected { slot, itemId } (itemId null to unequip)');
+    const result = equipCosmetic((req as AuthedRequest).profile!.address, slot, itemId);
+    if (!result.ok) return fail(res, EQUIP_ERRORS[result.error].status, EQUIP_ERRORS[result.error].message);
+    res.json(result.profile);
+  });
+
+  router.post('/burn/intent', limitBy(intentLimiter), requireAuth, async (req, res) => {
+    try {
+      res.json(await burns.createIntent((req as AuthedRequest).profile!.address, req.body));
+    } catch (err) {
+      if (err instanceof BurnError) return fail(res, err.status, err.message);
+      throw err;
+    }
+  });
+
+  router.post('/burn/confirm', limitBy(confirmLimiter), requireAuth, async (req, res) => {
+    try {
+      const out = await burns.confirm((req as AuthedRequest).profile!.address, req.body);
+      if (out.status === 'pending') return void res.status(202).json({ status: 'pending' });
+      res.json(out.receipt);
+    } catch (err) {
+      if (err instanceof BurnError) return fail(res, err.status, err.message);
+      throw err;
+    }
+  });
+
+  router.get('/burns/stats', limitBy(publicLimiter), (_req, res) => {
+    res.json(burns.stats());
+  });
+
+  router.get('/leaderboard/ranked', limitBy(publicLimiter), (req, res) => {
+    const week = queryString(req, 'week') ?? 'current';
+    if (week !== 'current' && week !== 'previous') return fail(res, 400, 'week must be current or previous');
+    res.json(getRankedLeaderboard(week));
   });
 
   router.get('/leaderboard', (req, res) => {

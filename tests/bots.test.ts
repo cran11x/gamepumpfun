@@ -150,7 +150,7 @@ class Sim {
       now: T0,
       phase: init.phase ?? 'playing',
       ...(init.phaseEndsAt !== undefined ? { phaseEndsAt: init.phaseEndsAt } : {}),
-      room: { code: 'TEST', hostId: 'p_host', settings, ticker: '$RUGS' },
+      room: { code: 'TEST', hostId: 'p_host', settings, ticker: '$RUGS', ranked: false },
       players: [self, ...(init.others ?? [])].map(view),
       bodies: init.bodies ?? [],
       taskProgress: 0,

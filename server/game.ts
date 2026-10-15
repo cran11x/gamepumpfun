@@ -33,6 +33,7 @@ import {
   maxRuggersFor,
   type GameSettings,
 } from '../shared/constants';
+import { COSMETIC_SLOTS, isCosmeticForSlot } from '../shared/cosmetics';
 import { circleFree, dist, lineOfSight, moveWithCollision, type Vec } from '../shared/geometry';
 import {
   EMERGENCY_BUTTON,
@@ -53,6 +54,7 @@ import {
   type ChatChannel,
   type ChatMessage,
   type EjectionView,
+  type EquippedCosmetics,
   type ErrorCode,
   type GameEvent,
   type GameOverReason,
@@ -177,6 +179,32 @@ export interface GameResultRecordLike {
   wasRugged: boolean;
 }
 
+/** Structural twin of `RankedResultRecord` from server/store.ts. */
+export interface RankedResultRecordLike {
+  address: string;
+  role: Role;
+  won: boolean;
+  rugs: number;
+  tasksDone: number;
+  correctVotes: number;
+  /** Alive at the end. The store pays RANKED_POINTS.survived only to a holder in a game the holders won. */
+  survived: boolean;
+  /** Removed (left, or reconnect grace expired) before the game ended. Replaces everything else. */
+  leftEarly: boolean;
+}
+
+/** Structural twin of the result of `consumeRankedTickets` from server/store.ts. */
+export type ConsumeTicketsResult = { ok: true } | { ok: false; missing: string[] };
+
+/**
+ * The parts of a stored Profile (server/store.ts `getProfile`) the room reads. Every field is optional
+ * and re-validated here, because the room must never trust a malformed record.
+ */
+export interface RoomProfileLike {
+  cosmetics?: { owned?: readonly string[]; equipped?: EquippedCosmetics } | null;
+  rankedTickets?: number;
+}
+
 /** The parts of a wallet Profile the room needs. */
 export interface WalletIdentity {
   name: string;
@@ -184,6 +212,57 @@ export interface WalletIdentity {
 }
 
 export type RemoveReason = 'left' | 'kicked' | 'timeout';
+
+const NEED_WALLET_MSG = 'Ranked needs a Phantom sign-in';
+const NEED_TICKET_MSG = 'Ranked needs a ticket. Burn one to enter.';
+
+/** A profile's ranked ticket count, 0 for anything malformed. */
+export function ticketsOf(profile: RoomProfileLike | null | undefined): number {
+  const n = profile?.rankedTickets;
+  return typeof n === 'number' && Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+/**
+ * Whether a player may enter a ranked room at all (create, join or quick): signed in with a profile, and
+ * holding at least one ranked ticket. Null when allowed; otherwise the error to send.
+ */
+export function rankedEntryError(
+  wallet: WalletIdentity | null | undefined,
+  profileOf: ((address: string) => RoomProfileLike | null) | undefined,
+): { code: ErrorCode; message: string } | null {
+  if (!wallet || typeof wallet.address !== 'string' || !wallet.address) return { code: 'NEED_WALLET', message: NEED_WALLET_MSG };
+  let profile: RoomProfileLike | null = null;
+  try {
+    profile = profileOf ? profileOf(wallet.address) : null;
+  } catch {
+    profile = null;
+  }
+  if (!profile) return { code: 'NEED_WALLET', message: NEED_WALLET_MSG };
+  if (ticketsOf(profile) < 1) return { code: 'NEED_TICKET', message: NEED_TICKET_MSG };
+  return null;
+}
+
+/**
+ * Equipped cosmetics re-validated from a stored profile: each id must exist in the catalog, belong to its
+ * slot and (when the profile lists them) be owned. Undefined when nothing valid is equipped.
+ */
+export function equippedFrom(profile: RoomProfileLike | null | undefined): EquippedCosmetics | undefined {
+  const c = profile?.cosmetics;
+  if (!c || typeof c !== 'object') return undefined;
+  const equipped: unknown = c.equipped;
+  if (!equipped || typeof equipped !== 'object') return undefined;
+  const owned = Array.isArray(c.owned) ? c.owned : null;
+  const out: EquippedCosmetics = {};
+  let any = false;
+  for (const { slot } of COSMETIC_SLOTS) {
+    const id = (equipped as Record<string, unknown>)[slot];
+    if (typeof id !== 'string' || !isCosmeticForSlot(id, slot)) continue;
+    if (owned && !owned.includes(id)) continue;
+    out[slot] = id;
+    any = true;
+  }
+  return any ? out : undefined;
+}
 
 export interface RoomOptions {
   code: string;
@@ -203,6 +282,20 @@ export interface RoomOptions {
   botName?: (index: number) => string;
   /** Called once per finished game with the wallet-linked players (server/store.ts `recordGameResults`). */
   recordResults?: (records: GameResultRecordLike[]) => void;
+  /**
+   * Ranked room (SPEC "Ranked rooms"): wallet + ticket to join, one seat per wallet, no bots, settings
+   * locked to DEFAULT_SETTINGS except isPublic, tickets consumed at start, weekly results at game over.
+   */
+  ranked?: boolean;
+  /**
+   * Fresh stored profile by full wallet address (server/store.ts `getProfile`): equipped cosmetics and
+   * ranked tickets. Read when snapshots are built in the lobby, so equipping or burning shows live.
+   */
+  profileOf?: (address: string) => RoomProfileLike | null;
+  /** Ranked start: take one ticket from every address, all or nothing (server/store.ts). */
+  consumeRankedTickets?: (addresses: string[]) => ConsumeTicketsResult;
+  /** Ranked game over: weekly points (server/store.ts `recordRankedResults`). */
+  recordRankedResults?: (records: RankedResultRecordLike[]) => void;
   /** Called after a player has been removed so the socket layer can unbind them. */
   onPlayerRemoved?: (playerId: string, reason: RemoveReason) => void;
   log?: (message: string, err?: unknown) => void;
@@ -260,6 +353,11 @@ export interface PlayerState {
   emergencyLeft: number;
   lastChatAt: number;
   stats: PlayerStats;
+  /**
+   * Cosmetics frozen at game start for the whole round (lobby snapshots read the store live instead).
+   * Freezing them means nobody, a ghost included, can signal anything by re-equipping mid-game.
+   */
+  roundCosmetics: EquippedCosmetics | undefined;
 }
 
 interface ActiveSabotage {
@@ -339,6 +437,8 @@ function inWorld(x: number, y: number): boolean {
 export class Room {
   readonly code: string;
   readonly createdAt: number;
+  /** Ranked room (see RoomOptions.ranked). Fixed for the room's lifetime. */
+  readonly ranked: boolean;
 
   private readonly now: () => number;
   private readonly rng: () => number;
@@ -347,6 +447,11 @@ export class Room {
   private readonly createBotBrain?: (init: BotBrainInit) => BotBrainLike;
   private readonly botNameFn: (index: number) => string;
   private readonly recordResultsFn?: (records: GameResultRecordLike[]) => void;
+  private readonly profileOfFn?: (address: string) => RoomProfileLike | null;
+  private readonly consumeTicketsFn?: (addresses: string[]) => ConsumeTicketsResult;
+  private readonly recordRankedFn?: (records: RankedResultRecordLike[]) => void;
+  /** Profiles read during one tick's snapshots (every viewer's snapshot shows the same players). */
+  private profileCache: Map<string, RoomProfileLike | null> | null = null;
   private readonly onPlayerRemoved?: (playerId: string, reason: RemoveReason) => void;
   private readonly log: (message: string, err?: unknown) => void;
 
@@ -385,9 +490,17 @@ export class Room {
     this.createBotBrain = opts.createBotBrain;
     this.botNameFn = opts.botName ?? ((i) => `Bot ${i + 1}`);
     this.recordResultsFn = opts.recordResults;
+    this.ranked = opts.ranked === true;
+    this.profileOfFn = opts.profileOf;
+    this.consumeTicketsFn = opts.consumeRankedTickets;
+    this.recordRankedFn = opts.recordRankedResults;
     this.onPlayerRemoved = opts.onPlayerRemoved;
     this.log = opts.log ?? ((m, e) => console.error(`[room ${opts.code}] ${m}`, e ?? ''));
-    this._settings = normalizeSettings(DEFAULT_SETTINGS, opts.settings);
+    // Ranked settings are locked to the defaults; only isPublic may differ.
+    const isPublic = opts.settings?.isPublic;
+    this._settings = this.ranked
+      ? normalizeSettings(DEFAULT_SETTINGS, typeof isPublic === 'boolean' ? { isPublic } : undefined)
+      : normalizeSettings(DEFAULT_SETTINGS, opts.settings);
     this.createdAt = this.now();
   }
 
@@ -457,15 +570,39 @@ export class Room {
 
   // ---------- Membership (called by the RoomManager) ----------
 
-  /** Seat a human. `wallet` is the resolved Profile when the player signed in. */
-  addHuman(input: { name: string; wallet?: WalletIdentity | null }): JoinResult {
+  /** True when a seat in this room is already linked to this full wallet address. */
+  hasWallet(address: string): boolean {
+    for (const p of this.players.values()) if (p.address === address) return true;
+    return false;
+  }
+
+  /**
+   * Whether `wallet` could take a seat right now, without changing anything (the RoomManager asks before
+   * moving a player out of their current room). Ranked rooms also need a profile with a ticket, and allow
+   * one seat per wallet.
+   */
+  checkJoin(wallet?: WalletIdentity | null): { ok: true } | { ok: false; code: ErrorCode; message: string } {
     if (this.disposed) return { ok: false, code: 'ROOM_NOT_FOUND', message: 'Room is closed' };
     if (this._phase !== 'lobby') return { ok: false, code: 'GAME_IN_PROGRESS', message: 'That game already started' };
     if (this.isFull) return { ok: false, code: 'ROOM_FULL', message: 'Room is full' };
+    if (this.ranked) {
+      const denied = rankedEntryError(wallet, (a) => this.readProfile(a));
+      if (denied) return { ok: false, ...denied };
+      if (wallet && this.hasWallet(wallet.address)) {
+        return { ok: false, code: 'INVALID_ACTION', message: 'This wallet already has a seat in this room' };
+      }
+    }
+    return { ok: true };
+  }
+
+  /** Seat a human. `wallet` is the resolved Profile when the player signed in. */
+  addHuman(input: { name: string; wallet?: WalletIdentity | null }): JoinResult {
+    const allowed = this.checkJoin(input.wallet);
+    if (!allowed.ok) return allowed;
     const p = this.createPlayer(false, sanitizeName(input.name));
     const w = input.wallet;
-    // One seat per wallet per room: a second seat with the same wallet plays as a guest.
-    if (w && typeof w.address === 'string' && w.address && ![...this.players.values()].some((q) => q.address === w.address)) {
+    // One seat per wallet per room: a second seat with the same wallet plays as a guest (ranked refuses it above).
+    if (w && typeof w.address === 'string' && w.address && !this.hasWallet(w.address)) {
       p.name = sanitizeName(w.name || input.name);
       p.address = w.address;
       p.wallet = shortAddress(w.address);
@@ -640,6 +777,20 @@ export class Room {
 
   private onSettings(p: PlayerState, patch: Partial<GameSettings>): void {
     if (!this.requireHostInLobby(p)) return;
+    if (this.ranked) {
+      // Locked to DEFAULT_SETTINGS except isPublic. A patch that would change anything else is refused
+      // whole; one that only repeats the locked values (a client sending its full settings) is fine.
+      const clamped = clampSettings(this._settings, patch);
+      const changesLocked = (Object.keys(clamped) as Array<keyof GameSettings>).some(
+        (k) => k !== 'isPublic' && clamped[k] !== this._settings[k],
+      );
+      if (changesLocked) return this.err(p, 'RANKED_LOCKED', 'Ranked settings are locked');
+      if (clamped.isPublic !== this._settings.isPublic) {
+        this._settings = { ...this._settings, isPublic: clamped.isPublic };
+        this.dirty = true;
+      }
+      return;
+    }
     const next = clampSettings(this._settings, patch);
     if (next.emergencyMeetings !== this._settings.emergencyMeetings) {
       for (const q of this.players.values()) q.emergencyLeft = next.emergencyMeetings;
@@ -650,6 +801,7 @@ export class Room {
 
   private onAddBot(p: PlayerState): void {
     if (!this.requireHostInLobby(p)) return;
+    if (this.ranked) return this.err(p, 'RANKED_LOCKED', 'No bots in ranked');
     if (this.isFull) return this.err(p, 'ROOM_FULL', 'Room is full');
     this.addBot();
   }
@@ -688,6 +840,7 @@ export class Room {
 
   private onRemoveBot(p: PlayerState): void {
     if (!this.requireHostInLobby(p)) return;
+    if (this.ranked) return this.err(p, 'RANKED_LOCKED', 'No bots in ranked');
     let last: PlayerState | undefined;
     for (const q of this.players.values()) if (q.isBot) last = q;
     if (!last) return this.err(p, 'INVALID_ACTION', 'No bots to remove');
@@ -704,8 +857,45 @@ export class Room {
 
   private onStart(p: PlayerState): void {
     if (!this.requireHostInLobby(p)) return;
+    if (this.ranked) return this.onRankedStart(p);
     if (this.players.size < MIN_PLAYERS) {
       return this.err(p, 'NOT_ENOUGH_PLAYERS', `Need at least ${MIN_PLAYERS} players (bots count)`);
+    }
+    this.startGame();
+  }
+
+  /**
+   * Ranked start: 4+ humans, every one connected and wallet-linked, then one ticket is taken from every
+   * player at once (all or nothing). If anyone lacks a ticket nothing is consumed, nothing starts, and
+   * the host hears who.
+   */
+  private onRankedStart(host: PlayerState): void {
+    const list = [...this.players.values()];
+    if (list.length < MIN_PLAYERS) return this.err(host, 'NOT_ENOUGH_PLAYERS', `Ranked needs at least ${MIN_PLAYERS} players`);
+    // Never true (no bots, and joining needs a wallet), but a seat without a wallet can't pay a ticket.
+    const unlinked = list.filter((q) => q.isBot || !q.address);
+    if (unlinked.length > 0) {
+      return this.err(host, 'NEED_WALLET', `Not signed in: ${unlinked.map((q) => q.name).join(', ')}`);
+    }
+    // A ticket is not taken from someone who isn't here to play it.
+    const away = list.filter((q) => !q.connected);
+    if (away.length > 0) {
+      return this.err(host, 'INVALID_ACTION', `Waiting for ${away.map((q) => q.name).join(', ')} to reconnect`);
+    }
+    const addresses = list.map((q) => q.address as string);
+    let result: ConsumeTicketsResult | null = null;
+    try {
+      result = this.consumeTicketsFn ? this.consumeTicketsFn(addresses) : null;
+    } catch (err) {
+      this.log('consumeRankedTickets threw', err);
+      result = null;
+    }
+    this.dirty = true; // ticket badges may have changed either way
+    if (!result || result.ok !== true) {
+      const missing = result && result.ok === false && Array.isArray(result.missing) ? new Set(result.missing) : null;
+      const names = missing ? list.filter((q) => missing.has(q.address as string)).map((q) => q.name) : [];
+      const message = names.length > 0 ? `No ranked ticket: ${names.join(', ')}` : 'Could not check ranked tickets. Try again.';
+      return this.err(host, 'NEED_TICKET', message);
     }
     this.startGame();
   }
@@ -713,7 +903,8 @@ export class Room {
   private startGame(): void {
     const now = this.now();
     const list = [...this.players.values()];
-    const ruggerCount = Math.min(this._settings.ruggers, maxRuggersFor(list.length));
+    // Ranked always plays the full rugger count for its size; settings.ruggers is locked there anyway.
+    const ruggerCount = this.ranked ? maxRuggersFor(list.length) : Math.min(this._settings.ruggers, maxRuggersFor(list.length));
     const ruggerIds = new Set(shuffle(list.map((p) => p.id), this.rng).slice(0, ruggerCount));
     const perPlayer = this._settings.tasksPerPlayer;
     list.forEach((p, i) => {
@@ -729,6 +920,7 @@ export class Room {
       p.emergencyLeft = this._settings.emergencyMeetings;
       p.stats = freshStats();
       p.facing = 1;
+      p.roundCosmetics = this.liveCosmetics(p);
       this.placeAtSpawn(p, now);
     });
     this.bodies = [];
@@ -874,7 +1066,11 @@ export class Room {
     target.activeStationId = null;
     target.stats.wasRugged = true;
     this.dropHolds(target.id);
-    this.bodies.push({ id: target.id, color: target.color, x: round1(target.x), y: round1(target.y) });
+    const body: BodyView = { id: target.id, color: target.color, x: round1(target.x), y: round1(target.y) };
+    // The VICTIM's own rug, frozen at game start. Never the killer's: that would name the rugger.
+    const rug = target.roundCosmetics?.rug;
+    if (rug) body.rug = rug;
+    this.bodies.push(body);
     p.killReadyAt = now + this._settings.killCooldown * 1000;
     p.stats.rugs++;
     const recipients = new Map<string, PlayerState>([
@@ -1238,6 +1434,7 @@ export class Room {
       p.killReadyAt = 0;
       p.emergencyLeft = this._settings.emergencyMeetings;
       p.stats = freshStats();
+      p.roundCosmetics = undefined;
       p.slot = slot++;
       this.placeAtSpawn(p, now);
     }
@@ -1298,31 +1495,60 @@ export class Room {
   }
 
   private recordResults(winner: Winner): void {
-    if (!this.recordResultsFn) return;
+    const departed = this.departed;
+    this.departed = [];
     const records: GameResultRecordLike[] = [];
+    const ranked: RankedResultRecordLike[] = [];
     const seen = new Set<string>();
-    const add = (p: PlayerState, departed: boolean) => {
+    const add = (p: PlayerState, left: boolean) => {
       if (!p.address || seen.has(p.address)) return;
       seen.add(p.address);
       const teamWon = (winner === 'holders') === (p.role === 'holder');
       records.push({
         address: p.address,
         role: p.role,
-        won: !departed && teamWon,
+        won: !left && teamWon,
         rugs: p.stats.rugs,
         tasksDone: p.stats.tasksDone,
         correctVotes: p.stats.correctVotes,
         wasRugged: p.stats.wasRugged,
       });
+      if (!this.ranked) return;
+      // SPEC: a player removed before the end gets leftEarly instead of everything else.
+      ranked.push(
+        left
+          ? { address: p.address, role: p.role, won: false, rugs: 0, tasksDone: 0, correctVotes: 0, survived: false, leftEarly: true }
+          : {
+              address: p.address,
+              role: p.role,
+              won: teamWon,
+              rugs: p.stats.rugs,
+              tasksDone: p.stats.tasksDone,
+              correctVotes: p.stats.correctVotes,
+              survived: p.alive,
+              leftEarly: false,
+            },
+      );
     };
     for (const p of this.players.values()) add(p, false);
-    for (const p of this.departed) add(p, true);
-    this.departed = [];
-    if (records.length === 0) return;
-    try {
-      this.recordResultsFn(records);
-    } catch (err) {
-      this.log('recordGameResults failed', err);
+    for (const p of departed) add(p, true);
+    if (records.length > 0 && this.recordResultsFn) {
+      try {
+        this.recordResultsFn(records);
+      } catch (err) {
+        this.log('recordGameResults failed', err);
+      }
+    }
+    if (ranked.length > 0) {
+      if (!this.recordRankedFn) {
+        this.log('ranked game over without a recordRankedResults hook');
+        return;
+      }
+      try {
+        this.recordRankedFn(ranked);
+      } catch (err) {
+        this.log('recordRankedResults failed', err);
+      }
     }
   }
 
@@ -1394,8 +1620,14 @@ export class Room {
     } catch (err) {
       this.log('tick failed', err);
     }
-    this.tickBots(now);
-    this.broadcast(now);
+    // Every snapshot built this tick shows the same profiles: read each one from the store once.
+    this.profileCache = new Map();
+    try {
+      this.tickBots(now);
+      this.broadcast(now);
+    } finally {
+      this.profileCache = null;
+    }
   }
 
   private expireDisconnected(now: number): void {
@@ -1490,7 +1722,7 @@ export class Room {
       t: 'snap',
       now: this.now(),
       phase,
-      room: { code: this.code, hostId: this.hostId, settings: { ...this._settings }, ticker: this.ticker },
+      room: { code: this.code, hostId: this.hostId, settings: { ...this._settings }, ticker: this.ticker, ranked: this.ranked },
       players: this.visiblePlayers(viewer),
       bodies: this.bodies.map((b) => ({ ...b })),
       taskProgress: this.progressFor(viewer),
@@ -1695,7 +1927,39 @@ export class Room {
     if (isRugger) v.isRugger = true;
     if (inVent) v.inVent = true;
     if (!p.connected) v.disconnected = true;
+    // Identical for every viewer, so it carries nothing about roles or who saw what.
+    const cosmetics = this.cosmeticsOf(p);
+    if (cosmetics) v.cosmetics = { ...cosmetics };
+    if (this.ranked && this._phase === 'lobby' && p.address) v.hasTicket = ticketsOf(this.readProfile(p.address)) >= 1;
     return v;
+  }
+
+  // ---------- Profiles (cosmetics, ranked tickets) ----------
+
+  /** A stored profile by full address through the injected hook; cached for the current tick. */
+  private readProfile(address: string): RoomProfileLike | null {
+    if (!this.profileOfFn) return null;
+    const cache = this.profileCache;
+    if (cache?.has(address)) return cache.get(address) ?? null;
+    let profile: RoomProfileLike | null = null;
+    try {
+      profile = this.profileOfFn(address) ?? null;
+    } catch (err) {
+      this.log('profileOf threw', err);
+    }
+    cache?.set(address, profile);
+    return profile;
+  }
+
+  /** What the player has equipped in the store right now (signed-in humans only). */
+  private liveCosmetics(p: PlayerState): EquippedCosmetics | undefined {
+    if (p.isBot || !p.address) return undefined;
+    return equippedFrom(this.readProfile(p.address));
+  }
+
+  /** Lobby: live from the store, so equipping shows at once. In a round: frozen at game start. */
+  private cosmeticsOf(p: PlayerState): EquippedCosmetics | undefined {
+    return this._phase === 'lobby' ? this.liveCosmetics(p) : p.roundCosmetics;
   }
 
   private progressFor(viewer: PlayerState): number {
@@ -1861,6 +2125,7 @@ export class Room {
       emergencyLeft: this._settings.emergencyMeetings,
       lastChatAt: -Infinity,
       stats: freshStats(),
+      roundCosmetics: undefined,
     };
   }
 

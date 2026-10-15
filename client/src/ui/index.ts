@@ -19,6 +19,9 @@ import { createMinigameHost } from './minigame';
 import { createModalLayer, openHowTo, openLeaderboard, openManualCopy, openRename } from './modals';
 import { createToasts } from './toasts';
 import { isConnectionRefusal } from '../net';
+import { openBurnModal, openRecentBurns } from './burn';
+import { openShop } from './shop';
+import { burnModeOf, receiptToast } from './ranked';
 
 type ViewKey = 'home' | Phase;
 
@@ -34,6 +37,9 @@ const ERROR_TEXT: Record<ErrorCode, string> = {
   RATE_LIMITED: 'Slow down a sec.',
   REJOIN_FAILED: "Couldn't restore your last game.",
   INVALID_ACTION: "Can't do that right now.",
+  NEED_WALLET: 'Ranked needs a Phantom sign-in. Connect Phantom first.',
+  NEED_TICKET: 'You need a ranked ticket. Burn one to enter.',
+  RANKED_LOCKED: 'Ranked rooms use fixed settings and no bots.',
 };
 
 const SAB_START_HOLDER: Record<SabotageKind, string> = {
@@ -50,7 +56,12 @@ const SAB_FIXED: Record<SabotageKind, string> = {
 export function friendlyError(code: ErrorCode, message: string): string {
   // Server messages for game actions are already short and human; prefer them there. A rate limit says what
   // was limited (too many join attempts, too many connections) unless it is the plain chat "Slow down".
-  const own = code === 'INVALID_ACTION' || code === 'ROOM_FULL' || (code === 'RATE_LIMITED' && !/^slow down\.?$/i.test(message));
+  // Ranked start refusals name who is missing ("No ranked ticket: Bob, Ann"); keep that list.
+  const own =
+    code === 'INVALID_ACTION' ||
+    code === 'ROOM_FULL' ||
+    (code === 'RATE_LIMITED' && !/^slow down\.?$/i.test(message)) ||
+    ((code === 'NEED_TICKET' || code === 'NEED_WALLET') && /^(no ranked ticket|not signed in):/i.test(message));
   if (own && message && message.length <= 80) return message.endsWith('.') ? message : `${message}.`;
   return ERROR_TEXT[code] ?? (message || 'Something went wrong.');
 }
@@ -119,7 +130,16 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
       roster.clear();
       rosterCode = snap.room.code;
     }
-    for (const p of snap.players) roster.set(p.id, { name: p.name, color: p.color, isBot: p.isBot });
+    for (const p of snap.players) {
+      const prev = roster.get(p.id);
+      roster.set(p.id, {
+        name: p.name,
+        color: p.color,
+        isBot: p.isBot,
+        cosmetics: p.cosmetics ? { ...p.cosmetics } : snap.phase === 'lobby' ? undefined : prev?.cosmetics,
+        isRugger: !!p.isRugger || (!!prev?.isRugger && snap.phase !== 'lobby' && snap.phase !== 'roleReveal'),
+      });
+    }
   }
 
   // ----- Sound -----
@@ -129,6 +149,28 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
     } catch {
       /* audio not ready / locked */
     }
+  }
+
+  // ----- Phantom sign-in shared by home, shop and the burn modal -----
+  let signingIn: Promise<boolean> | null = null;
+  function signIn(): Promise<boolean> {
+    if (ctx.wallet.getSession()) return Promise.resolve(true);
+    if (!signingIn) {
+      signingIn = ctx.wallet
+        .login()
+        .then((s) => {
+          toasts.show(`gm ${s.profile.name}. Stats are now tracked.`, 'good');
+          return true;
+        })
+        .catch((err: unknown) => {
+          toasts.show(err instanceof Error ? err.message : "Couldn't connect Phantom.", 'bad');
+          return false;
+        })
+        .finally(() => {
+          signingIn = null;
+        });
+    }
+    return signingIn;
   }
 
   // ----- Core shared with screens -----
@@ -151,6 +193,19 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
     leaveRoom,
     openModal: (opts: ModalOpts) => modals.open(opts),
     openLeaderboard: () => openLeaderboard(core),
+    openLeaderboardAt: (tab) => openLeaderboard(core, tab),
+    burnMode: () => burnModeOf(ctx.config),
+    myColor: () => {
+      const s = store.snap;
+      const me = s?.me?.id ?? store.playerId;
+      if (!me) return 0;
+      return s?.players.find((p) => p.id === me)?.color ?? roster.get(me)?.color ?? 0;
+    },
+    signIn,
+    openBurn: (opts) => void openBurnModal(core, opts),
+    openShop: () => openShop(core),
+    openRecentBurns: () => openRecentBurns(core),
+    rankedRetry: null,
     openHowTo: () => openHowTo(core),
     openRename: () => openRename(core),
     toggleMap: (force?: boolean) => fullMap.toggle(force),
@@ -245,7 +300,7 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
       screenLayer.append(screen.el);
       mapBtn.hidden = key !== 'playing';
       if (key !== 'playing') fullMap.close();
-      if (key !== 'lobby' && key !== 'home') modals.closeTop();
+      if (key !== 'lobby' && key !== 'home') modals.closeAll();
       // A focused input may have been removed with the old screen.
       syncTextBlock();
     }
@@ -324,7 +379,11 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
         if (ev.victimId === me) {
           const k = roster.get(ev.killerId) ?? null;
           const killerView = snap?.players.find((p) => p.id === ev.killerId);
-          const killer = killerView ? { name: killerView.name, color: killerView.color } : k ? { name: k.name, color: k.color } : null;
+          const killer = killerView
+            ? { name: killerView.name, color: killerView.color, cosmetics: killerView.cosmetics ?? k?.cosmetics }
+            : k
+              ? { name: k.name, color: k.color, cosmetics: k.cosmetics }
+              : null;
           const victimColor = snap?.players.find((p) => p.id === me)?.color ?? roster.get(ev.victimId)?.color ?? 0;
           minigame.onSnapshot(snap);
           if (minigame.isOpen()) minigame.close();
@@ -388,8 +447,53 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
       route();
       return;
     }
+    if (e.code === 'NEED_TICKET' && offerTicket()) {
+      sound('error');
+      return;
+    }
     toasts.show(friendlyError(e.code, e.message), 'bad');
     sound('error');
+  });
+
+  /**
+   * NEED_TICKET about this player (joining a ranked room, or sitting in a ranked lobby without a ticket):
+   * open the burn modal for a ticket instead of a bare toast. False when it isn't ours to fix.
+   */
+  function offerTicket(): boolean {
+    if (core.burnMode() === 'off' || !ctx.wallet.getSession()) return false;
+    const snap = store.snap;
+    if (snap) {
+      const me = snap.players.find((p) => p.id === core.myId());
+      if (!snap.room.ranked || snap.phase !== 'lobby' || me?.hasTicket !== false) return false;
+    }
+    const retry = snap ? null : core.rankedRetry;
+    openBurnModal(core, {
+      request: { purpose: 'ranked' },
+      lead: snap ? 'You need a ranked ticket before the host can start.' : 'You need a ranked ticket to enter ranked rooms.',
+      doneAction: retry ? { label: 'ENTER RANKED', run: retry } : undefined,
+    });
+    return true;
+  }
+
+  // ----- Burns confirmed after the tab closed: check them once at boot, and after a sign-in -----
+  let resumedFor: string | null = null;
+  function resumeBurns(): void {
+    const s = ctx.wallet.getSession();
+    if (!s || core.burnMode() === 'off' || resumedFor === s.profile.address) return;
+    resumedFor = s.profile.address;
+    ctx.wallet
+      .resumePendingBurns()
+      .then((receipts) => {
+        for (const r of receipts) toasts.show(`Burn confirmed. ${receiptToast(r, ctx.config.ticker)}`, 'good');
+      })
+      .catch(() => {
+        /* still pending: kept for next time */
+      });
+  }
+  resumeBurns();
+  ctx.wallet.onChange(() => {
+    if (!ctx.wallet.getSession()) resumedFor = null;
+    else resumeBurns();
   });
 
   let wasDisconnected = false;

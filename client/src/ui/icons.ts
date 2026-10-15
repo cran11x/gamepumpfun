@@ -54,6 +54,11 @@ export const ICONS = {
   globe: svg('<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>'),
   lock: svg('<rect x="5" y="10.5" width="14" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/>'),
   dice: svg('<rect x="4" y="4" width="16" height="16" rx="3.5"/><circle cx="9" cy="9" r="1.3" fill="currentColor"/><circle cx="15" cy="15" r="1.3" fill="currentColor"/><circle cx="15" cy="9" r="1.3" fill="currentColor"/><circle cx="9" cy="15" r="1.3" fill="currentColor"/>'),
+  flame: svg('<path d="M12.2 2.5c.7 3.4 5.3 5.6 5.3 10.6a5.5 5.5 0 0 1-11 0c0-2.4 1.1-4.1 2.4-5.2.2 2 1.1 3.2 2.3 3.7-.3-3.3.1-6.3 1-9.1z"/>', true),
+  ticket: svg('<path d="M3.5 7.5h17v3a1.9 1.9 0 0 0 0 3.8v3.2h-17v-3.2a1.9 1.9 0 0 0 0-3.8z"/><path d="M14.5 8v1.5M14.5 11.3v1.4M14.5 14.5V16"/>'),
+  bag: svg('<path d="M5 8.5h14l-1.2 11.5H6.2z"/><path d="M9 10.5V7a3 3 0 0 1 6 0v3.5"/>'),
+  external: svg('<path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v4.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 4 18.5v-11A1.5 1.5 0 0 1 5.5 6H10"/>'),
+  sparkle: svg('<path d="M12 2.5l2.3 7.2 7.2 2.3-7.2 2.3-2.3 7.2-2.3-7.2L2.5 12l7.2-2.3z"/>', true),
 } as const;
 
 export type IconName = keyof typeof ICONS;

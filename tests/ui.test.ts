@@ -9,6 +9,28 @@ import { Store } from '../client/src/store';
 import { refusalText } from '../client/src/ui/home';
 import { friendlyError } from '../client/src/ui/index';
 import { boxesOverlap } from '../client/src/ui/toasts';
+import {
+  NAME_FX_CLASS,
+  burnCopy,
+  burnModeOf,
+  burnWhat,
+  formatTokens,
+  formatTokensShort,
+  isAllyRed,
+  isPendingBurnError,
+  itemPrice,
+  nameFxClass,
+  nextWeekStartUtc,
+  purchasePrice,
+  rankedStartGate,
+  receiptToast,
+  resetCountdown,
+  timeAgo,
+} from '../client/src/ui/ranked';
+import { expectedBurnAmount } from '../client/src/wallet';
+import { COSMETICS } from '../shared/cosmetics';
+import type { BurnConfig, PlayerView } from '../shared/protocol';
+import { readFileSync } from 'node:fs';
 
 function snapWith(ejection: EjectionView, confirmEjects: boolean): Snapshot {
   return { ejection, room: { settings: { confirmEjects } } } as unknown as Snapshot;
@@ -335,5 +357,180 @@ describe('boxesOverlap (toasts over HUD controls)', () => {
     expect(boxesOverlap(box(352, 148, 728, 209), box(644, 160, 722, 238))).toBe(true); // toast over SAB
     expect(boxesOverlap(box(0, 0, 10, 10), box(10, 0, 20, 10))).toBe(false);
     expect(boxesOverlap(box(0, 0, 100, 100), box(0, 0, 0, 0))).toBe(false);
+  });
+});
+
+// ---------- Ranked + burns UI ----------
+
+describe('ranked error copy', () => {
+  it('has friendly defaults for the ranked error codes', () => {
+    expect(friendlyError('NEED_WALLET', 'Ranked needs a Phantom sign-in')).toBe('Ranked needs a Phantom sign-in. Connect Phantom first.');
+    expect(friendlyError('NEED_TICKET', 'Ranked needs a ticket. Burn one to enter.')).toBe('You need a ranked ticket. Burn one to enter.');
+    expect(friendlyError('RANKED_LOCKED', 'No bots in ranked')).toBe('Ranked rooms use fixed settings and no bots.');
+    expect(friendlyError('RANKED_LOCKED', '')).toBe('Ranked rooms use fixed settings and no bots.');
+  });
+
+  it("keeps the server's list of who is missing a ticket or a sign-in at START", () => {
+    expect(friendlyError('NEED_TICKET', 'No ranked ticket: Bob, Ann')).toBe('No ranked ticket: Bob, Ann.');
+    expect(friendlyError('NEED_WALLET', 'Not signed in: Bob')).toBe('Not signed in: Bob.');
+  });
+});
+
+const BURN: BurnConfig = { mode: 'mock', cluster: 'mainnet-beta', mint: null, decimals: 6, rankedEntryPrice: 50_000, priceMultiplier: 1 };
+
+describe('burn prices and copy', () => {
+  it('formats whole tokens with thousands separators', () => {
+    expect(formatTokens(50_000)).toBe('50,000');
+    expect(formatTokens(1_234_567.4)).toBe('1,234,567');
+    expect(formatTokens(0)).toBe('0');
+    expect(formatTokens(Number.NaN)).toBe('0');
+    expect(formatTokensShort(12_345_678)).toBe('12.3M');
+    expect(formatTokensShort(98_765)).toBe('98,765');
+  });
+
+  it('prices cosmetics as base x multiplier, exactly like the wallet check (and the server)', () => {
+    for (const mult of [1, 0.5, 2.5, 1.37, 0.0001]) {
+      const burn = { ...BURN, priceMultiplier: mult };
+      for (const item of COSMETICS) {
+        const want = expectedBurnAmount(burn, { purpose: 'cosmetic', itemId: item.id });
+        expect(itemPrice(burn, item)).toBe(want);
+        expect(purchasePrice(burn, { purpose: 'cosmetic', itemId: item.id })).toBe(want);
+      }
+    }
+    expect(purchasePrice(BURN, { purpose: 'ranked' })).toBe(50_000);
+    expect(purchasePrice(BURN, { purpose: 'cosmetic', itemId: 'nope' })).toBeNull();
+    expect(formatTokens(itemPrice({ priceMultiplier: 2 }, COSMETICS.find((c) => c.id === 'skin_holo')!))).toBe('200,000');
+  });
+
+  it('says burned tokens are destroyed and nobody receives them, with no price or return promise', () => {
+    const t = burnCopy(50_000, '$RUGS', burnWhat({ purpose: 'ranked' }));
+    expect(t).toBe('Burn 50,000 $RUGS. Tokens are destroyed forever. Nobody receives them. You get: 1 ranked ticket.');
+    const c = burnCopy(60_000, '$RUGS', burnWhat({ purpose: 'cosmetic', itemId: 'name_fire' }));
+    expect(c).toContain('You get: On Fire (name effect).');
+    for (const line of [t, c]) expect(line).not.toMatch(/moon|pump|profit|return|reward|value|price|deflation|supply|invest/i);
+  });
+
+  it('treats only a sent-but-unconfirmed burn as pending (never offered a second burn)', () => {
+    expect(isPendingBurnError('Your burn was sent but is not confirmed yet. It will be checked again; you can also retry in a minute.')).toBe(true);
+    expect(isPendingBurnError('Session expired. Connect Phantom again to finish confirming your burn.')).toBe(true);
+    expect(isPendingBurnError('You cancelled the burn in Phantom. Nothing was burned.')).toBe(false);
+    expect(isPendingBurnError('Not enough $RUGS')).toBe(false);
+  });
+
+  it('toasts burns that confirmed later', () => {
+    expect(receiptToast({ purpose: 'ranked', amount: 50_000 }, '$RUGS')).toBe('50,000 $RUGS burned. Ranked ticket added.');
+    expect(receiptToast({ purpose: 'cosmetic', itemId: 'skin_gold', amount: 60_000 }, '$RUGS')).toBe('60,000 $RUGS burned. Gold Bag unlocked.');
+  });
+
+  it("hides every burn feature unless the server says 'live' or 'mock'", () => {
+    expect(burnModeOf({ burn: { mode: 'live' } })).toBe('live');
+    expect(burnModeOf({ burn: { mode: 'mock' } })).toBe('mock');
+    expect(burnModeOf({ burn: { mode: 'off' } })).toBe('off');
+    expect(burnModeOf({ burn: null })).toBe('off');
+    expect(burnModeOf({ burn: { mode: 'LIVE' as never } })).toBe('off');
+    expect(burnModeOf(null)).toBe('off');
+  });
+});
+
+describe('ranked lobby START gating', () => {
+  const p = (id: string, extra: Partial<PlayerView> = {}): PlayerView =>
+    ({ id, name: id.toUpperCase(), color: 0, x: 0, y: 0, facing: 1, moving: false, alive: true, isBot: false, hasTicket: true, ...extra }) as PlayerView;
+
+  it('needs four players, all with a ticket and connected', () => {
+    expect(rankedStartGate([p('a'), p('b'), p('c')])).toEqual({ canStart: false, warn: true, hint: 'need 1 more player (ranked has no bots)' });
+    expect(rankedStartGate([p('a')]).hint).toBe('need 3 more players (ranked has no bots)');
+    const noTicket = rankedStartGate([p('a'), p('b', { hasTicket: false }), p('c'), p('d', { hasTicket: false })]);
+    expect(noTicket).toEqual({ canStart: false, warn: true, hint: 'no ticket yet: B, D' });
+    const away = rankedStartGate([p('a'), p('b'), p('c'), p('d', { disconnected: true })]);
+    expect(away).toEqual({ canStart: false, warn: true, hint: 'waiting for D to reconnect' });
+    const ready = rankedStartGate([p('a'), p('b'), p('c'), p('d')]);
+    expect(ready.canStart).toBe(true);
+    expect(ready.hint).toBe('4 players ready · START uses 1 ticket each');
+  });
+
+  it('shortens long lists of names', () => {
+    const many = ['a', 'b', 'c', 'd', 'e'].map((id) => p(id, { hasTicket: false }));
+    expect(rankedStartGate(many).hint).toBe('no ticket yet: A, B, C +2');
+  });
+});
+
+describe('weekly reset countdown', () => {
+  it('finds the next Monday 00:00 UTC', () => {
+    const wed = Date.UTC(2026, 9, 14, 15, 30); // Wednesday 2026-10-14
+    expect(new Date(nextWeekStartUtc(wed)).toISOString()).toBe('2026-10-19T00:00:00.000Z');
+    const mondayMidnight = Date.UTC(2026, 9, 19);
+    expect(new Date(nextWeekStartUtc(mondayMidnight)).toISOString()).toBe('2026-10-26T00:00:00.000Z');
+    const sundayLate = Date.UTC(2026, 9, 18, 23, 59, 59);
+    expect(new Date(nextWeekStartUtc(sundayLate)).toISOString()).toBe('2026-10-19T00:00:00.000Z');
+  });
+
+  it('formats the time left', () => {
+    expect(resetCountdown(3 * 86_400_000 + 4 * 3_600_000 + 5 * 60_000)).toBe('3d 4h');
+    expect(resetCountdown(4 * 3_600_000 + 12 * 60_000)).toBe('4h 12m');
+    expect(resetCountdown(12 * 60_000 + 9_000)).toBe('12m 09s');
+    expect(resetCountdown(-5)).toBe('0m 00s');
+  });
+
+  it('says how long ago a burn was', () => {
+    expect(timeAgo(1_000, 10_000)).toBe('just now');
+    expect(timeAgo(0, 5 * 60_000)).toBe('5m ago');
+    expect(timeAgo(0, 3 * 3_600_000)).toBe('3h ago');
+    expect(timeAgo(0, 3 * 86_400_000)).toBe('3d ago');
+  });
+});
+
+describe('name effects in the DOM', () => {
+  it('maps every name-effect item to a class, and nothing else', () => {
+    const names = COSMETICS.filter((c) => c.slot === 'name').map((c) => c.id).sort();
+    expect(Object.keys(NAME_FX_CLASS).sort()).toEqual(names);
+    expect(nameFxClass({ name: 'name_gold' }, false)).toBe('nfx-gold');
+    expect(nameFxClass({ name: 'skin_gold' }, false)).toBeNull();
+    expect(nameFxClass({ name: 'name_unknown' }, false)).toBeNull();
+    expect(nameFxClass({ skin: 'skin_gold' }, false)).toBeNull();
+    expect(nameFxClass(undefined, false)).toBeNull();
+  });
+
+  it('lets the red ally styling win over any effect', () => {
+    for (const id of Object.keys(NAME_FX_CLASS)) expect(nameFxClass({ name: id }, true)).toBeNull();
+    expect(isAllyRed('rugger', true)).toBe(true);
+    expect(isAllyRed('rugger', false)).toBe(false);
+    expect(isAllyRed('holder', true)).toBe(false);
+    expect(isAllyRed(undefined, true)).toBe(false);
+  });
+
+  it('never uses a red for a name effect in styles.css', () => {
+    const css = readFileSync(new URL('../client/src/styles.css', import.meta.url), 'utf8');
+    const hue = (r: number, g: number, b: number): { h: number; s: number; l: number } => {
+      const [R, G, B] = [r / 255, g / 255, b / 255];
+      const max = Math.max(R, G, B);
+      const min = Math.min(R, G, B);
+      const l = (max + min) / 2;
+      const d = max - min;
+      if (d === 0) return { h: 0, s: 0, l };
+      const s = d / (1 - Math.abs(2 * l - 1));
+      let h = max === R ? ((G - B) / d) % 6 : max === G ? (B - R) / d + 2 : (R - G) / d + 4;
+      h *= 60;
+      if (h < 0) h += 360;
+      return { h, s, l };
+    };
+    let checked = 0;
+    for (const cls of Object.values(NAME_FX_CLASS)) {
+      const blocks = [...css.matchAll(new RegExp(`\\.${cls}[^{]*\\{([^}]*)\\}`, 'g'))].map((m) => m[1]);
+      expect(blocks.length, `${cls} has CSS`).toBeGreaterThan(0);
+      const keyframes = [...css.matchAll(/@keyframes (nfx-[a-z]+)\s*\{([\s\S]*?)\n\}/g)].filter((m) => blocks.some((b) => b.includes(m[1]))).map((m) => m[2]);
+      for (const text of [...blocks, ...keyframes]) {
+        const colors: Array<[number, number, number]> = [];
+        for (const m of text.matchAll(/#([0-9a-f]{6})\b/gi)) colors.push([0, 2, 4].map((i) => parseInt(m[1].slice(i, i + 2), 16)) as [number, number, number]);
+        for (const m of text.matchAll(/rgba?\((\d+),\s*(\d+),\s*(\d+)/g)) colors.push([Number(m[1]), Number(m[2]), Number(m[3])]);
+        for (const [r, g, b] of colors) {
+          const { h, s } = hue(r, g, b);
+          checked++;
+          const red = s > 0.3 && (h < 22 || h > 325);
+          expect(red, `${cls}: rgb(${r},${g},${b}) is in the red family`).toBe(false);
+        }
+        expect(text).not.toMatch(/var\(--red/);
+      }
+    }
+    expect(checked).toBeGreaterThan(5);
   });
 });

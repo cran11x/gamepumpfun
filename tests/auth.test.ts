@@ -7,7 +7,7 @@ import bs58 from 'bs58';
 import express from 'express';
 import nacl from 'tweetnacl';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_TICKER, GAME_NAME } from '../shared/constants';
+import { DEFAULT_RANKED_ENTRY_PRICE, DEFAULT_TICKER, GAME_NAME } from '../shared/constants';
 import { shortAddress } from '../shared/protocol';
 import { createWallet } from '../client/src/wallet';
 import { createApiRouter } from '../server/api';
@@ -266,7 +266,13 @@ describe('auth: nonce + signature login', () => {
 
 describe('config', () => {
   it('uses defaults when unset', () => {
-    expect(getPublicConfig({})).toEqual({ gameName: GAME_NAME, ticker: DEFAULT_TICKER, contractAddress: null, links: {} });
+    expect(getPublicConfig({})).toEqual({
+      gameName: GAME_NAME,
+      ticker: DEFAULT_TICKER,
+      contractAddress: null,
+      links: {},
+      burn: { mode: 'off', cluster: 'mainnet-beta', mint: null, decimals: 6, rankedEntryPrice: DEFAULT_RANKED_ENTRY_PRICE, priceMultiplier: 1 },
+    });
   });
 
   it('validates the contract address and only keeps https links', () => {
@@ -280,7 +286,9 @@ describe('config', () => {
       LINK_TELEGRAM: 'http://t.me/amongrugs',
       LINK_PUMPFUN: 'javascript:alert(1)',
     });
-    expect(cfg).toEqual({ gameName: 'AMONG RUGS 2', ticker: '$rugz', contractAddress: ca, links: { x: 'https://x.com/amongrugs' } });
+    expect(cfg).toMatchObject({ gameName: 'AMONG RUGS 2', ticker: '$rugz', contractAddress: ca, links: { x: 'https://x.com/amongrugs' } });
+    expect(cfg.links).toEqual({ x: 'https://x.com/amongrugs' });
+    expect(cfg.burn.mode).toBe('off');
     expect(getPublicConfig({ CONTRACT_ADDRESS: '0xdeadbeef' }).contractAddress).toBeNull();
     expect(getPublicConfig({ CONTRACT_ADDRESS: bs58.encode(nacl.randomBytes(24)) }).contractAddress).toBeNull();
     expect(getPublicConfig({ LINK_X: 'https://user:pass@x.com/' }).links).toEqual({});
@@ -377,7 +385,8 @@ describe('HTTP API', () => {
     const c = await get('/config');
     expect(c.status).toBe(200);
     const cfg = (await c.json()) as Record<string, unknown>;
-    expect(Object.keys(cfg).sort()).toEqual(['contractAddress', 'gameName', 'links', 'ticker']);
+    expect(Object.keys(cfg).sort()).toEqual(['burn', 'contractAddress', 'gameName', 'links', 'ticker']);
+    expect(cfg.burn).toMatchObject({ mode: 'off', mint: null });
     const r = await get('/rooms');
     expect(await r.json()).toEqual({ publicLobbies: 2, playersOnline: 7 });
   });

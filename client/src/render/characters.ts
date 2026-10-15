@@ -2,18 +2,17 @@
 // Everything is drawn in world space around the player's collision center (x, y).
 // Gradients are cached per color in local coordinates and reused with translate().
 
-import { COLORS, FONT_MONO, FONT_TEXT, playerColor, rgba } from './palette';
+import { COLORS, FONT_MONO, labelFont, playerColor, rgba } from './palette';
+import { capsulePath, EYE_SHIFT, EYE_Y, ghostPath, PILL_CY, PILL_H, PILL_R, PILL_TOP, PILL_W } from './pillGeom';
+import { skinPainter, type SkinFrame } from './skins';
 import { TAU, rrect } from './util';
+
+export { PILL_TOP } from './pillGeom';
 
 type G = CanvasRenderingContext2D;
 
-const PILL_W = 26;
-const PILL_H = 40;
-const PILL_R = PILL_W / 2;
-/** Pill center relative to the collision center. */
-const PILL_CY = -10;
-/** Top of the pill relative to the collision center (for label placement). */
-export const PILL_TOP = PILL_CY - PILL_H / 2;
+/** Reused for every skin hook call (no per-frame allocation). */
+const frame: SkinFrame = { t: 0, facing: 1, moving: false, seed: 0, ghost: false, blink: false, beamScale: 1 };
 
 interface Grads {
   body: CanvasGradient;
@@ -54,17 +53,6 @@ function grads(g: G, color: number): Grads {
   e = { body, bottom, lyingTop, lyingBottom };
   m.set(color, e);
   return e;
-}
-
-function capsulePath(g: G, cy: number, w: number, h: number): void {
-  const r = w / 2;
-  const top = cy - h / 2 + r;
-  const bot = cy + h / 2 - r;
-  g.moveTo(-r, top);
-  g.arc(0, top, r, Math.PI, 0);
-  g.lineTo(r, bot);
-  g.arc(0, bot, r, 0, Math.PI);
-  g.closePath();
 }
 
 function blinking(t: number, seed: number): boolean {
@@ -109,11 +97,17 @@ export interface PillDraw {
   walk: number;
   seed: number;
   alpha?: number;
+  /** Equipped pill skin id (shared/cosmetics.ts), if any. */
+  skin?: string;
+  /** Laser beam length multiplier for the laser skin (default 1). */
+  beamScale?: number;
 }
 
-/** A living player: capsule pill with eyes, stub legs and a shadow. */
+/** A living player: capsule pill with eyes, stub legs and a shadow (plus the equipped skin). */
 export function drawPill(g: G, p: PillDraw, t: number): void {
   const gr = grads(g, p.color);
+  const sk = skinPainter(p.skin);
+  const closed = blinking(t, p.seed);
   g.save();
   g.translate(p.x, p.y);
   if (p.alpha !== undefined && p.alpha < 1) g.globalAlpha = p.alpha;
@@ -129,7 +123,7 @@ export function drawPill(g: G, p: PillDraw, t: number): void {
   g.beginPath();
   rrect(g, -9.5 + swing * 3.2, 6 - lift1, 7, 10, 3.5);
   rrect(g, 2.5 - swing * 3.2, 6 - lift2, 7, 10, 3.5);
-  g.fillStyle = playerColor(p.color).dark;
+  g.fillStyle = sk?.legs ? sk.legs(g) : playerColor(p.color).dark;
   g.fill();
   g.strokeStyle = 'rgba(4,6,9,0.85)';
   g.lineWidth = 1.4;
@@ -160,6 +154,15 @@ export function drawPill(g: G, p: PillDraw, t: number): void {
   g.fillStyle = gr.body;
   g.fill();
   g.restore();
+  if (sk) setFrame(t, p.facing, p.moving, p.seed, false, closed, p.beamScale ?? 1);
+  if (sk?.surface) {
+    g.save();
+    g.beginPath();
+    capsulePath(g, PILL_CY, PILL_W, PILL_H);
+    g.clip();
+    sk.surface(g, frame);
+    g.restore();
+  }
   // Seam.
   g.fillStyle = 'rgba(0,0,0,0.32)';
   g.fillRect(-PILL_R + 0.6, PILL_CY - 0.7, PILL_W - 1.2, 1.4);
@@ -174,13 +177,26 @@ export function drawPill(g: G, p: PillDraw, t: number): void {
   g.beginPath();
   g.ellipse(-6.4, PILL_CY + 8, 1.6, 3.6, -0.2, 0, TAU);
   g.fill();
-  drawEyes(g, p.facing * 3.6, PILL_CY - 7, p.facing, blinking(t, p.seed));
+  drawEyes(g, p.facing * EYE_SHIFT, EYE_Y, p.facing, closed);
+  if (sk?.over) sk.over(g, frame);
   g.restore();
 }
 
-/** Ghost: translucent pill, bobbing, wavy tail instead of legs, halo. */
-export function drawGhost(g: G, x: number, y: number, color: number, facing: 1 | -1, t: number, seed: number, alpha = 0.5): void {
+function setFrame(t: number, facing: 1 | -1, moving: boolean, seed: number, ghost: boolean, blink: boolean, beamScale: number): void {
+  frame.t = t;
+  frame.facing = facing;
+  frame.moving = moving;
+  frame.seed = seed;
+  frame.ghost = ghost;
+  frame.blink = blink;
+  frame.beamScale = beamScale;
+}
+
+/** Ghost: translucent pill, bobbing, wavy tail instead of legs, halo. A skin shows faded. */
+export function drawGhost(g: G, x: number, y: number, color: number, facing: 1 | -1, t: number, seed: number, alpha = 0.5, skin?: string): void {
   const gr = grads(g, color);
+  const sk = skinPainter(skin);
+  const closed = blinking(t, seed);
   const bob = Math.sin(t * 2.4 + seed) * 3.5;
   g.save();
   g.translate(x, y);
@@ -191,45 +207,46 @@ export function drawGhost(g: G, x: number, y: number, color: number, facing: 1 |
   g.fill();
   g.translate(0, -4 + bob);
   g.globalAlpha = alpha;
-  const r = PILL_R;
-  const topC = PILL_TOP + r;
-  const bottom = 8;
-  const tail = () => {
-    g.beginPath();
-    g.moveTo(-r, topC);
-    g.arc(0, topC, r, Math.PI, 0);
-    g.lineTo(r, bottom);
-    const waves = 3;
-    for (let k = 0; k < waves; k++) {
-      const x1 = r - ((k + 0.5) * PILL_W) / waves;
-      const x2 = r - ((k + 1) * PILL_W) / waves;
-      const dip = 5 + Math.sin(t * 5 + k * 2 + seed) * 2;
-      g.quadraticCurveTo(x1, bottom + dip, x2, bottom);
-    }
-    g.closePath();
-  };
-  tail();
+  g.beginPath();
+  ghostPath(g, t, seed);
   g.fillStyle = gr.bottom;
   g.fill();
   g.save();
   g.beginPath();
-  g.rect(-r - 2, PILL_TOP - 2, PILL_W + 4, PILL_H / 2 + 2);
+  g.rect(-PILL_R - 2, PILL_TOP - 2, PILL_W + 4, PILL_H / 2 + 2);
   g.clip();
-  tail();
+  g.beginPath();
+  ghostPath(g, t, seed);
   g.fillStyle = gr.body;
   g.fill();
   g.restore();
-  tail();
+  if (sk) setFrame(t, facing, false, seed, true, closed, 1);
+  if (sk?.surface) {
+    g.save();
+    g.beginPath();
+    ghostPath(g, t, seed);
+    g.clip();
+    g.globalAlpha = alpha * 0.75;
+    sk.surface(g, frame);
+    g.restore();
+  }
+  g.beginPath();
+  ghostPath(g, t, seed);
   g.strokeStyle = 'rgba(200,225,255,0.5)';
   g.lineWidth = 1.5;
   g.stroke();
-  drawEyes(g, facing * 3.6, PILL_CY - 7, facing, blinking(t, seed));
-  // Halo.
+  drawEyes(g, facing * EYE_SHIFT, EYE_Y, facing, closed);
+  if (sk?.over) {
+    g.globalAlpha = alpha * 0.8;
+    sk.over(g, frame);
+  }
+  // Halo (floats above a crown).
+  const haloY = PILL_TOP - 6 - (sk ? sk.headroom * 0.65 : 0);
   g.globalAlpha = Math.min(1, alpha * 1.6);
   g.strokeStyle = rgba(COLORS.gold, 0.35);
   g.lineWidth = 4.5;
   g.beginPath();
-  g.ellipse(0, PILL_TOP - 6, 9.5, 3.2, 0, 0, TAU);
+  g.ellipse(0, haloY, 9.5, 3.2, 0, 0, TAU);
   g.stroke();
   g.strokeStyle = COLORS.gold;
   g.lineWidth = 1.7;
@@ -246,16 +263,23 @@ const CRACK: [number, number][] = [
   [-1, 13],
 ];
 
-/** Rugged bag: the pill snapped in half, lying sideways, X_X eyes, red "-99%" sticker. */
-export function drawBody(g: G, x: number, y: number, color: number, t: number): void {
-  const gr = grads(g, color);
-  g.save();
-  g.translate(x, y);
-  // Red glow on the floor so bags pop in the dark.
+/** Red floor glow under a rugged bag (or under its rug) so bags pop in the dark. */
+export function drawBodyGlow(g: G, x: number, y: number, t: number, rx = 34, ry = 11): void {
   g.fillStyle = rgba(COLORS.rug, 0.16 + 0.05 * Math.sin(t * 3));
   g.beginPath();
-  g.ellipse(0, 6, 34, 11, 0, 0, TAU);
+  g.ellipse(x, y + 6, rx, ry, 0, 0, TAU);
   g.fill();
+}
+
+/**
+ * Rugged bag: the pill snapped in half, lying sideways, X_X eyes, red "-99%" sticker.
+ * `onRug`: a rug pattern is already drawn under it (see drawBodyRug), so skip the floor glow.
+ */
+export function drawBody(g: G, x: number, y: number, color: number, t: number, onRug = false): void {
+  const gr = grads(g, color);
+  if (!onRug) drawBodyGlow(g, x, y, t);
+  g.save();
+  g.translate(x, y);
   g.fillStyle = 'rgba(0,0,0,0.45)';
   g.beginPath();
   g.ellipse(0, 9, 26, 6, 0, 0, TAU);
@@ -369,17 +393,6 @@ export function drawVentMarker(g: G, x: number, y: number, color: number, t: num
   g.fill();
   drawEyes(g, 0, -1, Math.sin(t * 0.8 + seed) > 0 ? 1 : -1, blinking(t, seed), 0.8);
   g.restore();
-}
-
-const labelFontCache = new Map<number, string>();
-function labelFont(size: number): string {
-  const q = Math.round(size * 2) / 2;
-  let f = labelFontCache.get(q);
-  if (!f) {
-    f = `700 ${q}px ${FONT_TEXT}`;
-    labelFontCache.set(q, f);
-  }
-  return f;
 }
 
 /** Name label centered at (x, y) baseline. */

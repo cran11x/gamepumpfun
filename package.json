@@ -13,7 +13,9 @@
     "start": "node dist/server/index.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "e2e": "node e2e/smoke.mjs"
+    "e2e": "node e2e/smoke.mjs && node e2e/ranked.mjs",
+    "e2e:smoke": "node e2e/smoke.mjs",
+    "e2e:ranked": "node e2e/ranked.mjs"
   },
   "engines": {
     "node": ">=20.19"

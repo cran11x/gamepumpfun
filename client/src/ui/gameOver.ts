@@ -5,6 +5,9 @@ import { createChat } from './chat';
 import type { Screen, UiCore } from './core';
 import { button, clear, h, setHidden, setText } from './dom';
 import { pillSvg } from './pill';
+import { applyNameFx } from './names';
+import { createPillPreview, type PillPreview } from './previews';
+import { isAllyRed } from './ranked';
 
 export const REASON_TEXT: Record<GameOverReason, string> = {
   tasks: 'The bonding curve hit 100%.',
@@ -18,6 +21,7 @@ export function createGameOver(core: UiCore): Screen {
   const { ctx } = core;
   let built = false;
   let rosterSig = '';
+  let previews: PillPreview[] = [];
   const grid = h('div', { class: 'over-grid' });
   const backBtn = button('BACK TO LOBBY', { cls: 'btn--green', icon: 'users', onClick: () => ctx.net.send({ t: 'backToLobby' }) });
   const leaveBtn = button('LEAVE', { cls: 'btn--ghost', icon: 'door', onClick: () => core.leaveRoom() });
@@ -73,6 +77,7 @@ export function createGameOver(core: UiCore): Screen {
         alive: p?.alive ?? false,
         left: !p,
         role: go.roles[id] ?? (p?.isRugger ? 'rugger' : 'holder'),
+        looks: p?.cosmetics ?? w?.cosmetics ?? null,
       };
     });
     rows.sort((a, b) => (a.role === b.role ? 0 : a.role === 'rugger' ? -1 : 1));
@@ -80,17 +85,33 @@ export function createGameOver(core: UiCore): Screen {
     if (sig === rosterSig) return;
     rosterSig = sig;
     clear(grid);
+    for (const pv of previews) pv.destroy();
+    previews = [];
     const me = snap.me?.id ?? core.myId();
+    const myRole: Role | undefined = (snap.me && go.roles[snap.me.id]) || snap.me?.role;
     for (const r of rows) {
+      const skin = r.alive ? r.looks?.skin : undefined;
+      let pill: HTMLElement;
+      if (skin) {
+        const pv = createPillPreview(48, r.color, { skin }, { cls: 'over-card-pv', h: 56, zoom: 1.3, seed: r.color * 5 + 2 });
+        previews.push(pv);
+        pill = h('span', { class: 'over-card-pill over-card-pill--pv' }, pv.el);
+      } else {
+        pill = h('span', { class: 'over-card-pill', html: pillSvg(r.color, { variant: r.alive ? 'alive' : 'dead', legs: false }) });
+      }
+      // Ruggers see their own team in rug red; red wins over any name effect.
+      const red = isAllyRed(myRole, r.role === 'rugger');
+      const name = h('span', { class: `over-card-name${red ? ' is-ally' : ''}`, text: r.name });
+      applyNameFx(name, r.looks, red);
       grid.append(
         h(
           'div',
           { class: `over-card over-card--${r.role}${r.id === me ? ' is-me' : ''}${r.left ? ' is-left' : ''}` },
-          h('span', { class: 'over-card-pill', html: pillSvg(r.color, { variant: r.alive ? 'alive' : 'dead', legs: false }) }),
+          pill,
           h(
             'span',
             { class: 'over-card-info' },
-            h('span', { class: 'over-card-name', text: r.name }),
+            name,
             h(
               'span',
               { class: 'over-card-meta' },
@@ -116,6 +137,7 @@ export function createGameOver(core: UiCore): Screen {
     },
     destroy() {
       chat.destroy();
+      for (const pv of previews) pv.destroy();
     },
   };
 }

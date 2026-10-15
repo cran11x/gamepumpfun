@@ -5,6 +5,9 @@ import type { Snapshot } from '../../../shared/protocol';
 import type { Screen, UiCore } from './core';
 import { h, plural } from './dom';
 import { pillSvg } from './pill';
+import { applyNameFx } from './names';
+import { createPillPreview } from './previews';
+import { isAllyRed } from './ranked';
 
 export function ejectionText(snap: Snapshot): { main: string; sub: string; tie: boolean } {
   const e = snap.ejection!;
@@ -21,7 +24,7 @@ export function ejectionText(snap: Snapshot): { main: string; sub: string; tie: 
   return { main, sub, tie: e.tie };
 }
 
-export function createEjection(_core: UiCore): Screen {
+export function createEjection(core: UiCore): Screen {
   const el = h('div', { class: 'screen screen--solid eject' });
   let built = false;
   const timers: number[] = [];
@@ -51,12 +54,30 @@ export function createEjection(_core: UiCore): Screen {
       chart.append(b);
     }
     const lane = h('div', { class: 'ej-lane', attrs: { 'aria-hidden': 'true' } }, h('span', { class: 'ej-wick' }), h('span', { class: 'ej-candle' }));
-    if (e.ejectedId) {
-      const pill = h('div', { class: 'ej-pill', html: pillSvg(e.ejectedColor ?? 0, { legs: true }) });
+    const ejId = e.ejectedId;
+    const who = ejId ? core.who(ejId) : null;
+    const looks = (ejId ? snap.players.find((p) => p.id === ejId)?.cosmetics : undefined) ?? who?.cosmetics;
+    const isMe = !!ejId && ejId === (snap.me?.id ?? core.myId());
+    if (ejId) {
+      // Your own rug rides along on your own ejection; everyone else only shows a skin.
+      const ride = isMe ? { ...(looks?.skin ? { skin: looks.skin } : {}), ...(looks?.rug ? { rug: looks.rug } : {}) } : looks?.skin ? { skin: looks.skin } : {};
+      const pill = h('div', { class: 'ej-pill' });
+      if (ride.skin || ride.rug) {
+        pill.classList.add('ej-pill--pv');
+        pill.append(createPillPreview(110, e.ejectedColor ?? 0, ride, { cls: 'ej-pv', h: 120, zoom: ride.rug ? 1.05 : 1.3 }).el);
+      } else {
+        pill.innerHTML = pillSvg(e.ejectedColor ?? 0, { legs: true });
+      }
       pill.style.animationDuration = `${Math.round(EJECTION_MS * 0.85)}ms`;
       lane.append(pill);
     }
     const mainEl = h('div', { class: 'ej-main', attrs: { 'aria-live': 'polite', 'aria-label': main } });
+    // The name types out inside its own span so it can carry the player's name effect (red ally wins).
+    const nameLen = ejId && e.ejectedName && main.startsWith(e.ejectedName) ? e.ejectedName.length : 0;
+    const red = isAllyRed(snap.me?.role, who?.isRugger || (e.wasRugger === true && snap.me?.role === 'rugger'));
+    const nameEl = h('span', { class: `ej-name${red ? ' is-ally' : ''}` });
+    const restEl = h('span');
+    mainEl.append(nameEl, restEl);
     const subEl = h('div', { class: 'ej-sub', text: [tie && !e.ejectedId ? 'Tie vote.' : '', sub].filter(Boolean).join(' ') });
     el.classList.add(e.wasRugger === true ? 'eject--rugger' : e.ejectedId ? 'eject--holder' : 'eject--none');
     el.append(stars, chart, lane, h('div', { class: 'ej-copy' }, mainEl, subEl));
@@ -69,7 +90,9 @@ export function createEjection(_core: UiCore): Screen {
       window.setTimeout(() => {
         const iv = window.setInterval(() => {
           i++;
-          mainEl.textContent = main.slice(0, i);
+          nameEl.textContent = main.slice(0, Math.min(i, nameLen));
+          restEl.textContent = main.slice(nameLen, Math.max(nameLen, i));
+          if (nameLen) applyNameFx(nameEl, looks, red);
           if (i >= main.length) {
             window.clearInterval(iv);
             subEl.classList.add('is-shown');

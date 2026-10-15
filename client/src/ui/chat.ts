@@ -5,6 +5,8 @@ import type { ChatChannel, ChatMessage } from '../../../shared/protocol';
 import type { UiCore } from './core';
 import { h, icon } from './dom';
 import { colorOf, pillDot } from './pill';
+import { applyNameFx } from './names';
+import { isAllyRed } from './ranked';
 
 const MAX_ROWS = 120;
 
@@ -98,7 +100,14 @@ export function createChat(core: UiCore, opts: ChatOpts): ChatPanel {
     }
     const mine = m.fromId !== null && m.fromId === core.myId();
     const name = h('span', { class: 'chat-name', text: m.fromName });
-    name.style.color = readableColor(m.color);
+    const snap = ctx.store.snap;
+    const sender = m.fromId ? snap?.players.find((p) => p.id === m.fromId) : undefined;
+    const who = m.fromId ? core.who(m.fromId) : null;
+    // A rugger sees fellow ruggers (and themself) in rug red; red wins over any name effect.
+    const red = isAllyRed(snap?.me?.role, sender?.isRugger ?? who?.isRugger);
+    applyNameFx(name, sender?.cosmetics ?? who?.cosmetics, red);
+    if (red) name.classList.add('is-ally');
+    else if (!name.dataset.nfx) name.style.color = readableColor(m.color);
     const r = h(
       'div',
       { class: `chat-msg${m.channel === 'ghost' ? ' chat-msg--ghost' : ''}${mine ? ' chat-msg--me' : ''}` },

@@ -116,7 +116,22 @@ function upgradeClientKey(app: express.Express, req: http.IncomingMessage): stri
   }
 }
 
+/**
+ * SPEC: the server refuses to start in burn mock mode when NODE_ENV=production, because mock burns
+ * accept fake signatures (free ranked tickets and cosmetics). Matched loosely so a stray space or
+ * capital can't slip past.
+ */
+function refuseMockBurnsInProduction(): void {
+  const mode = (process.env.BURN_MODE ?? '').trim().toLowerCase();
+  const env = (process.env.NODE_ENV ?? '').trim().toLowerCase();
+  if (mode === 'mock' && env === 'production') {
+    console.error('[server] BURN_MODE=mock is refused when NODE_ENV=production. Unset BURN_MODE to use real burns.');
+    process.exit(1);
+  }
+}
+
 function main(): void {
+  refuseMockBurnsInProduction();
   const manager = new RoomManager();
   const app = express();
   app.disable('x-powered-by');

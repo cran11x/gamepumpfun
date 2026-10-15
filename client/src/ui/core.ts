@@ -1,7 +1,8 @@
 // Internal UI plumbing shared by every screen (not part of the cross-module contract).
 
-import type { Snapshot } from '../../../shared/protocol';
+import type { BurnIntentRequest, BurnReceipt, EquippedCosmetics, Snapshot } from '../../../shared/protocol';
 import type { AppContext, SoundName } from '../context';
+import type { BurnMode } from './ranked';
 
 export type Tone = 'info' | 'good' | 'bad';
 
@@ -21,6 +22,10 @@ export interface RosterEntry {
   name: string;
   color: number;
   isBot: boolean;
+  /** Last equipped cosmetics seen for this player (kept after they leave the snapshot, e.g. ejected). */
+  cosmetics?: EquippedCosmetics;
+  /** Seen with isRugger this game (cleared when a new game starts). */
+  isRugger?: boolean;
 }
 
 export interface ModalHandle {
@@ -33,6 +38,19 @@ export interface ModalOpts {
   body: HTMLElement;
   cls?: string;
   onClose?: () => void;
+  /** Open on top of the current modal instead of replacing it (e.g. the burn modal over the shop). */
+  stack?: boolean;
+  /** Whether a backdrop tap closes it right now (default: always). The X button and Escape always work. */
+  dismissible?: () => boolean;
+}
+
+export interface BurnModalOpts {
+  request: BurnIntentRequest;
+  /** A line above the offer, e.g. why the modal opened ("You need a ranked ticket to enter."). */
+  lead?: string;
+  /** Primary button after a successful burn (e.g. ENTER RANKED). */
+  doneAction?: { label: string; run: () => void };
+  onDone?: (receipt: BurnReceipt) => void;
 }
 
 export interface UiCore {
@@ -60,4 +78,19 @@ export interface UiCore {
   isNarrow(): boolean;
   /** Server time the current game started (0 when unknown, e.g. after a mid-game rejoin). */
   gameStartedAt(): number;
+  /** Token burns: 'off' hides ranked and every burn feature. */
+  burnMode(): BurnMode;
+  /** The local player's pill color in the current room (0 outside a room). */
+  myColor(): number;
+  /** Connect Phantom and sign in (toasts the outcome). Resolves true when signed in. */
+  signIn(): Promise<boolean>;
+  openBurn(opts: BurnModalOpts): void;
+  openShop(): void;
+  openRecentBurns(): void;
+  openLeaderboardAt(tab: 'rankedCurrent' | 'wins'): void;
+  /**
+   * Set by the home screen while a ranked join/create/quick is in flight: re-sends it. The NEED_TICKET
+   * handler offers it as the burn modal's "ENTER RANKED" step.
+   */
+  rankedRetry: (() => void) | null;
 }
