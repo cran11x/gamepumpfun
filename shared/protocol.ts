@@ -8,6 +8,7 @@
 //   by incrementing `me.teleportSeq`, and the client must then snap to `me.x/me.y`.
 
 import type { GameSettings } from './constants';
+import type { CosmeticSlot } from './cosmetics';
 
 export type Role = 'holder' | 'rugger';
 
@@ -47,7 +48,16 @@ export interface RoomView {
   hostId: string;
   settings: GameSettings;
   ticker: string;
+  /**
+   * Ranked room: wallet sign-in and a burned ranked ticket required, no bots, settings locked to
+   * DEFAULT_SETTINGS (except isPublic; ruggers = maxRuggersFor(players)). Results count toward the
+   * weekly ranked leaderboard.
+   */
+  ranked: boolean;
 }
+
+/** Cosmetic item ids equipped per slot (see shared/cosmetics.ts). */
+export type EquippedCosmetics = Partial<Record<CosmeticSlot, string>>;
 
 export interface PlayerView {
   id: string;
@@ -69,6 +79,10 @@ export interface PlayerView {
   inVent?: boolean;
   /** True while the player's socket is disconnected (grace window). */
   disconnected?: boolean;
+  /** Equipped cosmetics of a signed-in player. Visual only; identical for every viewer. */
+  cosmetics?: EquippedCosmetics;
+  /** Ranked lobbies only: whether this player currently holds at least one ranked ticket. */
+  hasTicket?: boolean;
 }
 
 export interface BodyView {
@@ -77,6 +91,8 @@ export interface BodyView {
   color: number;
   x: number;
   y: number;
+  /** The VICTIM's own equipped rug pattern (never the killer's), drawn under the bag. */
+  rug?: string;
 }
 
 export interface TaskAssignment {
@@ -183,9 +199,9 @@ export interface Snapshot {
 // ---------- Client -> Server ----------
 
 export type C2S =
-  | { t: 'create'; name: string; authToken?: string }
+  | { t: 'create'; name: string; authToken?: string; ranked?: boolean }
   | { t: 'join'; code: string; name: string; authToken?: string }
-  | { t: 'quick'; name: string; authToken?: string }
+  | { t: 'quick'; name: string; authToken?: string; ranked?: boolean }
   | { t: 'rejoin'; code: string; playerId: string; sessionKey: string }
   | { t: 'leave' }
   | { t: 'setColor'; color: number }
@@ -256,7 +272,13 @@ export type ErrorCode =
   | 'BAD_REQUEST'
   | 'RATE_LIMITED'
   | 'REJOIN_FAILED'
-  | 'INVALID_ACTION';
+  | 'INVALID_ACTION'
+  /** Ranked rooms need a Phantom sign-in. */
+  | 'NEED_WALLET'
+  /** Ranked rooms need a burned ranked ticket (join, and again at start for everyone). */
+  | 'NEED_TICKET'
+  /** The action is not allowed in a ranked room (bots, locked settings). */
+  | 'RANKED_LOCKED';
 
 // ---------- HTTP API (same origin) ----------
 // GET  /api/config                     -> PublicConfig
@@ -266,6 +288,11 @@ export type ErrorCode =
 // POST /api/me/name {name} (Authorization: Bearer <token>) -> Profile
 // GET  /api/leaderboard?sort=wins|ruggerWins|holderWins|rugs|correctVotes -> LeaderboardEntry[]
 // GET  /api/rooms                      -> { publicLobbies: number; playersOnline: number }
+// GET  /api/leaderboard/ranked?week=current|previous -> RankedLeaderboard
+// POST /api/me/equip {slot, itemId|null} (Bearer) -> Profile   (itemId must be owned and match slot)
+// POST /api/burn/intent BurnIntentRequest (Bearer) -> BurnIntent | 400/401/409/503
+// POST /api/burn/confirm BurnConfirmRequest (Bearer) -> BurnReceipt | 202 {status:'pending'} | 400/401/409
+// GET  /api/burns/stats                 -> BurnStats
 
 export interface PublicConfig {
   gameName: string;
@@ -273,6 +300,105 @@ export interface PublicConfig {
   /** Contract address of the project's coin, if configured. Display only. */
   contractAddress: string | null;
   links: { x?: string; telegram?: string; pumpfun?: string };
+  burn: BurnConfig;
+}
+
+/**
+ * Token burns. 'off': no mint configured, burn features hidden. 'live': real SPL burns on Solana.
+ * 'mock': local testing only (refused when NODE_ENV=production); no chain, fake signatures accepted.
+ */
+export interface BurnConfig {
+  mode: 'off' | 'live' | 'mock';
+  cluster: 'mainnet-beta' | 'devnet';
+  /** SPL mint of the project's token (null when off). */
+  mint: string | null;
+  decimals: number;
+  /** Whole tokens burned for one ranked ticket. */
+  rankedEntryPrice: number;
+  /** Multiplies every COSMETICS base price. */
+  priceMultiplier: number;
+}
+
+export type BurnPurpose = 'ranked' | 'cosmetic';
+
+export interface BurnIntentRequest {
+  purpose: BurnPurpose;
+  /** Required for 'cosmetic'. */
+  itemId?: string;
+}
+
+export interface BurnIntent {
+  intentId: string;
+  purpose: BurnPurpose;
+  itemId?: string;
+  /** Whole tokens to burn. */
+  amount: number;
+  /** Raw base units (amount * 10^decimals) as a decimal string. */
+  amountRaw: string;
+  /** SPL memo the transaction carries; binds the burn to this intent. */
+  memo: string;
+  /**
+   * live: base64 of an unsigned VersionedTransaction (fee payer = the player) with a BurnChecked
+   * instruction from the player's token account plus the memo. The client deserializes it and asks
+   * Phantom to signAndSendTransaction. mock: null.
+   */
+  transaction: string | null;
+  expiresAt: number;
+}
+
+export interface BurnConfirmRequest {
+  intentId: string;
+  /** Transaction signature (base58). In mock mode any string starting with "mock_". */
+  signature: string;
+}
+
+export interface BurnReceipt {
+  status: 'confirmed';
+  signature: string;
+  amount: number;
+  purpose: BurnPurpose;
+  itemId?: string;
+  /** Solscan link (null in mock mode). */
+  explorerUrl: string | null;
+  profile: Profile;
+}
+
+export interface BurnRecord {
+  shortAddress: string;
+  name: string;
+  amount: number;
+  purpose: BurnPurpose;
+  itemId?: string;
+  signature: string;
+  explorerUrl: string | null;
+  at: number;
+}
+
+export interface BurnStats {
+  mode: BurnConfig['mode'];
+  /** Whole tokens burned through the game, all time. */
+  totalBurned: number;
+  burns: number;
+  recent: BurnRecord[];
+}
+
+export interface RankedEntry {
+  address: string;
+  shortAddress: string;
+  name: string;
+  points: number;
+  games: number;
+  wins: number;
+  rugs: number;
+  correctVotes: number;
+}
+
+export interface RankedLeaderboard {
+  /** ISO week id, e.g. "2026-W42" (weeks start Monday 00:00 UTC). */
+  weekId: string;
+  weekStart: number;
+  weekEnd: number;
+  entries: RankedEntry[];
 }
 
 export interface PlayerStats {
@@ -293,6 +419,9 @@ export interface Profile {
   name: string;
   stats: PlayerStats;
   createdAt: number;
+  cosmetics: { owned: string[]; equipped: EquippedCosmetics };
+  /** Unused ranked tickets. One is consumed per player when a ranked game starts. */
+  rankedTickets: number;
 }
 
 export interface AuthResult {

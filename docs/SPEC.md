@@ -330,3 +330,126 @@ Minigames complete only through `host.complete()`. The UI host enforces `TASK_MI
 - `npm run dev`: server on 8787 (tsx watch) plus Vite on 5173, with `/ws` and `/api` proxied.
 - `npm run build && npm start`: production on `PORT`, a single process serving the client and the WebSocket.
 - `npm test`: vitest. `npm run typecheck`: tsc.
+
+## Ranked lobbies and token burns
+
+Players burn the project's SPL token (their pump.fun coin) for two things:
+1. **Ranked tickets.** One ticket costs `BurnConfig.rankedEntryPrice` whole tokens (env `RANKED_ENTRY_PRICE`, default 50,000).
+2. **Cosmetics.** Prices come from `shared/cosmetics.ts`, multiplied by `BurnConfig.priceMultiplier` (env `COSMETIC_PRICE_MULTIPLIER`, default 1).
+
+Burned tokens are destroyed with the SPL Token `BurnChecked` instruction from the player's own token account. Nobody receives them: there is no pot and no prize paid from burns. The game is always free to play. Burns only unlock ranked play and looks.
+
+### Configuration (server env)
+| Env | Meaning |
+|---|---|
+| `TOKEN_MINT` | SPL mint. Unset means `mode: 'off'`, and the client hides every burn feature. |
+| `SOLANA_RPC_URL` | Required for live mode, e.g. a Helius URL. Default `https://api.mainnet-beta.solana.com`. |
+| `SOLANA_CLUSTER` | `mainnet-beta` (default) or `devnet`. Used for explorer links. |
+| `BURN_MODE` | `mock` enables mock mode for local testing and e2e. The server REFUSES to start in mock mode when `NODE_ENV=production`. Otherwise the mode is `live` when `TOKEN_MINT` is set and `off` when it isn't. |
+| `RANKED_ENTRY_PRICE`, `COSMETIC_PRICE_MULTIPLIER` | As above. |
+
+At startup in live mode the server reads the mint account via RPC. It records the decimals and the owning token program, either classic Token or Token-2022, and uses them for every transaction.
+
+### Burn flow (`server/solana.ts` + `server/burns.ts`, routes in `server/api.ts`)
+1. `POST /api/burn/intent {purpose, itemId?}` with a Bearer session.
+   - **Validates:**
+     - the mode is not off
+     - the purpose and item are valid
+     - a cosmetic is not already owned
+     - at most 5 open intents per wallet
+   - **Creates an intent:** a random nonce, the wallet, the purpose, the item, `amountRaw`, and a 10-minute expiry.
+   - **The memo** is exactly `AMONGRUGS <purpose>[:<itemId>] <nonce>`.
+   - **Live mode only:**
+     - finds the player's token accounts for the mint (`getTokenAccountsByOwner`) and picks one with balance ≥ `amountRaw`, else returns 409 `"Not enough $TICKER"`
+     - builds a v0 `VersionedTransaction` with fee payer = the player, a fresh blockhash, `BurnChecked(account, mint, owner=player, amountRaw, decimals)` on the mint's token program, and an SPL Memo instruction with the memo
+     - returns it unsigned, base64
+   - **Mock mode:** returns `transaction: null`.
+2. The client signs and sends with Phantom `signAndSendTransaction`. Phantom may add compute-budget instructions; verification is semantic, so that's fine.
+3. `POST /api/burn/confirm {intentId, signature}` with Bearer.
+   - **The intent must:** belong to the caller, be unexpired (or created at most 10 minutes plus a grace before), and be unused.
+   - **Signatures are single use forever.** Persist them in the store; a replay returns 409, but the same intent and the same signature again returns the original receipt (idempotent).
+   - **Live verification:**
+     - poll `getTransaction(signature, {commitment: 'confirmed', maxSupportedTransactionVersion: 0, encoding: 'jsonParsed'})` for up to about 25 s; still missing means 202 `{status: 'pending'}`
+     - the transaction must have `meta.err === null`
+     - the wallet must be a signer
+     - a memo instruction must contain the intent nonce
+     - the burned amount must be ≥ `amountRaw`, summed over parsed `burn`/`burnChecked` instructions (top level and inner) whose authority is the wallet and whose mint is `TOKEN_MINT`; for plain `burn`, resolve the mint through `meta.preTokenBalances`
+     - `blockTime` must be within the intent window
+   - **Mock verification:** the signature must match `/^mock_[A-Za-z0-9]{8,64}$/`.
+   - **On success:** grant the purchase (ticket +1, or the cosmetic added to `owned` and auto-equipped if that slot is empty), append a burn record, and return `BurnReceipt`.
+4. `GET /api/burns/stats` returns the total burned, the number of burns, and the last 20 burn records.
+
+All of this is verified server-side. The client is never trusted about amounts or success. Store the burn log, tickets, owned and equipped cosmetics, used signatures, and weekly ranked stats in the JSON store, next to the profiles.
+
+### Cosmetics
+- **`POST /api/me/equip {slot, itemId|null}`:** the item must be owned and must belong to the slot.
+- **`Profile.cosmetics`** holds `{owned, equipped}`.
+- **The room** puts `cosmetics` on `PlayerView` for signed-in players, read from the store whenever a snapshot is built, so equipping in the lobby shows up live. Each `BodyView.rug` is the victim's own equipped rug.
+- **Visual rules** (see the header of `shared/cosmetics.ts`):
+  - a skin keeps the player color recognisable
+  - name effects are never red
+  - rug patterns appear only under your own bag and on your own ejection
+- **Rendering:**
+  - the world canvas draws skins, name effects on the canvas labels, and rug patterns under bodies
+  - the DOM (lobby, meeting cards, ejection, game over, shop) shows name effects with CSS classes and pill previews that use the same drawing code
+  - `client/src/render/cosmetics.ts` exports `drawPillPreview(ctx2d, x, y, scale, color, equipped, timeMs)`, which the UI uses for shop and lobby previews
+
+### Ranked rooms (server-core)
+- **Creating:** `create {ranked: true}` or `quick {ranked: true}` makes or finds a ranked room. Quick play picks the public ranked lobby with the most players, or creates a public ranked room.
+- **Join requirements** (create, join and quick into a ranked room):
+  - a valid `authToken` with a Profile, else `NEED_WALLET`
+  - `profile.rankedTickets >= 1`, else `NEED_TICKET`
+  - one seat per wallet; a second seat for the same wallet is rejected with `INVALID_ACTION`
+- **Room rules:**
+  - no bots: `addBot` gives `RANKED_LOCKED`
+  - settings are locked to `DEFAULT_SETTINGS` (`settings` gives `RANKED_LOCKED`), except `isPublic`
+  - at start, `ruggers = maxRuggersFor(playerCount)`
+- **`PlayerView.hasTicket`** is set in ranked lobbies so the UI can show who is ready.
+- **Start** (4+ humans): consume one ticket from every player at once (`consumeRankedTickets(addresses)`, all or nothing). If anyone lacks a ticket, nothing starts and the host gets `NEED_TICKET` with their names.
+- **Game over:** `recordRankedResults(records)` adds weekly points per `RANKED_POINTS`. A player removed before the end gets `leftEarly` instead of everything else.
+- **Weeks:** ISO weeks, starting Monday 00:00 UTC.
+- **`GET /api/leaderboard/ranked?week=current|previous`:** top 50 by points, then wins.
+- **Room hooks:** the Room reads profiles, consumes tickets and records ranked results through injected hooks (like the existing results recorder), so it stays unit-testable.
+- **Store functions** (owned by the wallet/burn owner):
+
+```ts
+// server/store.ts
+export function getProfile(address: string): Profile | null;           // includes cosmetics + rankedTickets
+export function consumeRankedTickets(addresses: string[]): { ok: true } | { ok: false; missing: string[] };
+export interface RankedResultRecord {
+  address: string; role: Role; won: boolean; rugs: number; tasksDone: number;
+  correctVotes: number; survived: boolean; leftEarly: boolean;
+}
+export function recordRankedResults(records: RankedResultRecord[]): void;  // computes points with RANKED_POINTS
+export function getRankedLeaderboard(week: 'current' | 'previous', now?: number): RankedLeaderboard;
+```
+
+### Client UI (ui owner)
+- **Home:**
+  - a **RANKED** button (needs a wallet; shows the ticket count). If the player has 0 tickets, it opens the burn modal for a ticket.
+  - a **SHOP** button
+  - a live "🔥 X $TICKER burned" counter from `/api/burns/stats`, refreshed every 30 s, with a link to recent burns
+- **Burn modal:**
+  - text: "Burn N $TICKER. Tokens are destroyed forever. Nobody receives them. You get: …"
+  - stages from `wallet.burn` (preparing, then approve in Phantom, then confirming on-chain, then done with a Solscan link)
+  - friendly errors, and retry for pending confirms
+- **Mock mode:** a visible "TEST MODE: no real tokens" badge.
+- **Shop modal:**
+  - tabs per slot
+  - item cards with an animated pill preview (canvas, `drawPillPreview`), rarity color, price, and owned/equipped state
+  - BURN TO UNLOCK / EQUIP / UNEQUIP
+  - a mini profile preview of how you look
+  - requires a wallet; with burns off it shows "Shop opens when the token launches"
+- **Lobby (ranked):**
+  - a RANKED badge
+  - per-player ticket status
+  - locked settings shown read-only
+  - no bot buttons
+  - START is disabled until 4 or more players and everyone has a ticket
+- **Leaderboard modal:** a "Ranked: this week" tab (with a countdown to the reset) and a "last week" tab, next to the existing all-time tabs.
+- **Name effects** appear wherever names show.
+
+### Mock mode and e2e
+- With `BURN_MODE=mock`, the e2e test uses a fake `window.phantom.solana`. It signs login messages with a real tweetnacl keypair (exposed from Node), and its `signAndSendTransaction` is never called in mock mode.
+- The test signs in two or more players, burns tickets, plays a ranked game against humans only, and checks the weekly leaderboard.
+- It also buys and equips a cosmetic, and checks that it shows in another player's snapshot.

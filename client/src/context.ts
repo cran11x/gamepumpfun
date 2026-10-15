@@ -8,7 +8,17 @@
 //   wallet.ts (createWallet)  -> WalletApi : Phantom sign-in + profile
 //   api.ts                    -> HTTP helpers (config, leaderboard)
 
-import type { FixKind, Profile, PublicConfig, SabotageKind, Snapshot, TaskKind } from '../../shared/protocol';
+import type { CosmeticSlot } from '../../shared/cosmetics';
+import type {
+  BurnIntentRequest,
+  BurnReceipt,
+  FixKind,
+  Profile,
+  PublicConfig,
+  SabotageKind,
+  Snapshot,
+  TaskKind,
+} from '../../shared/protocol';
 import type { Net } from './net';
 import type { Store } from './store';
 
@@ -97,7 +107,22 @@ export interface WalletApi {
   setName(name: string): Promise<Profile>;
   /** Called after login/logout/profile changes. */
   onChange(cb: () => void): () => void;
+  /**
+   * Burn tokens for a ranked ticket or a cosmetic (requires a session and config.burn.mode !== 'off').
+   * live: POST /api/burn/intent, deserialize the VersionedTransaction (@solana/web3.js, loaded lazily),
+   * Phantom signAndSendTransaction, then POST /api/burn/confirm until confirmed (retrying 202s).
+   * mock: skips Phantom and confirms with a "mock_" signature. A burn whose confirm didn't finish
+   * (tab closed) is kept in localStorage and retried by resumePendingBurns().
+   * Rejects with a user-friendly Error (rejected in Phantom, not enough tokens, timeout...).
+   */
+  burn(request: BurnIntentRequest, onStage?: (stage: BurnStage) => void): Promise<BurnReceipt>;
+  /** Retry confirming burns left pending in localStorage. Resolves with the receipts that confirmed. */
+  resumePendingBurns(): Promise<BurnReceipt[]>;
+  /** POST /api/me/equip. itemId null unequips the slot. */
+  equip(slot: CosmeticSlot, itemId: string | null): Promise<Profile>;
 }
+
+export type BurnStage = 'preparing' | 'signing' | 'confirming' | 'done';
 
 /** Props passed by the UI's minigame overlay to a minigame. */
 export interface MinigameHost {

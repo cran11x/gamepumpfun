@@ -16,7 +16,13 @@ async function boot(): Promise<void> {
   const canvas = document.getElementById('game') as HTMLCanvasElement;
   const uiRoot = document.getElementById('ui') as HTMLElement;
 
-  const fallback: PublicConfig = { gameName: GAME_NAME, ticker: DEFAULT_TICKER, contractAddress: null, links: {} };
+  const fallback: PublicConfig = {
+    gameName: GAME_NAME,
+    ticker: DEFAULT_TICKER,
+    contractAddress: null,
+    links: {},
+    burn: { mode: 'off', cluster: 'mainnet-beta', mint: null, decimals: 6, rankedEntryPrice: 0, priceMultiplier: 1 },
+  };
   const config = await fetchConfig().catch(() => fallback);
 
   const net = new Net();

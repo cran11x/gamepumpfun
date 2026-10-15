@@ -122,3 +122,18 @@ export function maxRuggersFor(playerCount: number): number {
   if (playerCount >= 7) return 2;
   return 1;
 }
+
+/** Weekly ranked points per finished ranked game. */
+export const RANKED_POINTS = {
+  holderWin: 30,
+  ruggerWin: 40,
+  perRug: 5,
+  perTask: 1,
+  perCorrectVote: 5,
+  /** Holder still alive at the end of a game the holders won. */
+  survived: 5,
+  /** Left (removed after the reconnect grace) before the game ended. Replaces everything else. */
+  leftEarly: -20,
+} as const;
+
+export const DEFAULT_RANKED_ENTRY_PRICE = 50_000;
