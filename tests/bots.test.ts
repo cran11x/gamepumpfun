@@ -1062,7 +1062,7 @@ describe('BotBrain meetings', () => {
       sim.chat('p4', 'not me, I was in the Burn Room');
     });
     expect(denied).toBeLessThan(lone);
-    // The reporter said the body was in the Trading Floor: "I saw it in the Meme Lab" can't be true.
+    // The reporter said the body was in the Trading Floor: one of the two is wrong, so the claim is doubted.
     const wrongRoom = followRate((sim) => {
       sim.chat('p2', 'body in the Trading Floor');
       sim.chat('p3', 'carol rugged in Meme Lab, I saw it');
@@ -1075,6 +1075,179 @@ describe('BotBrain meetings', () => {
       sim.run(VOTE_WAIT_MS);
       expect(sim.messages('vote').map((v) => v.target), `seed ${seed}`).toEqual(['p2']);
     }
+  });
+
+  // ---------- Where the body was: claims vs the reporter's word vs what the bot saw ----------
+
+  const victim: PlayerSpec = { id: 'v', name: 'victim', color: 9, x: SPAWN_POINTS[7].x, y: SPAWN_POINTS[7].y, alive: false };
+  // Inside the Meme Lab, and in the hallway between the Launchpad (110 px north) and the Liquidity
+  // Pool (50 px south, so the body is labeled Liquidity Pool).
+  const SEEN_IN_MEME_LAB = { body: { x: 2160, y: 300 }, bot: { x: 2080, y: 300 } };
+  const SEEN_IN_HALLWAY = { body: { x: 1300, y: 590 }, bot: { x: 1240, y: 560 } };
+
+  /** The bot's votes over 40 seeds in a meeting where p2 (alice) reported the victim's body. */
+  const reportVotes = (setup: (sim: Sim) => void, opts: { seen?: { body: Vec; bot: Vec }; extraDead?: PlayerSpec[] } = {}) => {
+    const tally: Record<string, number> = {};
+    for (let seed = 1; seed <= 40; seed++) {
+      let sim: Sim;
+      if (opts.seen) {
+        // The bot walks past the body first (already there, so not a rug it watched); everyone else is far away.
+        const away = table.map((o, i) => ({ ...o, x: TRADING_FLOOR.x + 30 * i, y: TRADING_FLOOR.y + 60 }));
+        sim = new Sim({ role: 'holder', pos: opts.seen.bot, tasks: tasks('lp_snipe'), others: away, bodies: [{ id: 'v', color: 9, ...opts.seen.body }], seed });
+        sim.run(300);
+        sim.snap.phase = 'meeting';
+        sim.snap.bodies = [];
+        for (const o of table) sim.movePlayer(o.id, o.x, o.y);
+        sim.teleport(SPAWN_POINTS[0].x, SPAWN_POINTS[0].y);
+        sim.snap.players.push(view(victim, 9), ...(opts.extraDead ?? []).map(view));
+      } else {
+        sim = new Sim({ role: 'holder', phase: 'meeting', pos: SPAWN_POINTS[0], others: [...table, victim, ...(opts.extraDead ?? [])], seed });
+      }
+      sim.snap.meeting = meetingView('discussion', { reason: 'report', callerId: 'p2', bodyColor: 9 });
+      sim.snap.phaseEndsAt = sim.now + 30000;
+      setup(sim);
+      sim.run(20000);
+      sim.snap.meeting = meetingView('voting', { reason: 'report', callerId: 'p2', bodyColor: 9 });
+      sim.snap.phaseEndsAt = sim.now + 60000;
+      sim.run(VOTE_WAIT_MS);
+      const votes = sim.messages('vote').map((v) => v.target);
+      expect(votes, `seed ${seed}`).toHaveLength(1);
+      expect(sim.problems, `seed ${seed}`).toEqual([]);
+      tally[votes[0]] = (tally[votes[0]] ?? 0) + 1;
+    }
+    return tally;
+  };
+
+  it('reads the room a claim is tied to ("rugged in X", "body in the X"), not any other room in the line', () => {
+    const control = reportVotes((sim) => {
+      sim.chat('p2', 'body in the Meme Lab');
+      sim.chat('p3', 'carol rugged in the Meme Lab, I saw it');
+    });
+    expect(control.p4 ?? 0).toBeGreaterThan(5);
+    expect(control.p3 ?? 0).toBe(0);
+    // An honest eyewitness who also says where the rugger went is still an honest eyewitness.
+    const ranOff = reportVotes((sim) => {
+      sim.chat('p2', 'body in the Meme Lab');
+      sim.chat('p3', 'carol rugged in the Meme Lab, I saw it, then she ran to the Trading Floor');
+    });
+    expect(ranOff).toEqual(control);
+    const reporterRanOff = reportVotes((sim) => {
+      sim.chat('p2', 'body in Meme Lab, I came from the Trading Floor');
+      sim.chat('p3', 'carol rugged in the Meme Lab, I saw it');
+    });
+    expect(reporterRanOff).toEqual(control);
+    // "by the body in the X" is the room of a near-body claim.
+    const near = reportVotes((sim) => {
+      sim.chat('p2', 'body in the Meme Lab');
+      sim.chat('p3', 'saw carol right by the body in the Meme Lab, then she went to the Trading Floor, sus');
+    });
+    expect(near.p4 ?? 0).toBeGreaterThan(3);
+  });
+
+  it("takes the reporter's room as their word only: a claim that contradicts it makes neither a liar", () => {
+    // Either the reporter or the eyewitness is wrong (a rugger self-reporting with a fake room, or a
+    // rugger framing someone): the bot doubts both a little and votes out neither.
+    for (const accused of ['alice', 'carol']) {
+      const t = reportVotes((sim) => {
+        sim.chat('p2', 'body in the Trading Floor');
+        sim.chat('p3', `${accused} rugged in Meme Lab, I saw it`);
+      });
+      expect(t, accused).toEqual({ skip: 40 });
+    }
+    // Neighboring rooms: the body may lie in the hallway between them. Doubted, but nobody lied.
+    const neighbor = reportVotes((sim) => {
+      sim.chat('p2', 'body in the Launchpad');
+      sim.chat('p3', 'carol rugged in the Liquidity Pool, I saw it');
+    });
+    expect(neighbor.p3 ?? 0).toBe(0);
+    expect(neighbor.p2 ?? 0).toBe(0);
+  });
+
+  it('trusts its own sighting of the body: catches a lying reporter or eyewitness, and allows for hallway bodies', () => {
+    // A rugger self-reports with a fake room; the true eyewitness names the reporter.
+    const lyingReporter = reportVotes((sim) => {
+      sim.chat('p2', 'body in the Trading Floor');
+      sim.chat('p3', 'alice rugged in Meme Lab, I saw it');
+    }, { seen: SEEN_IN_MEME_LAB });
+    expect(lyingReporter.p2 ?? 0).toBeGreaterThan(25);
+    expect(lyingReporter.p3 ?? 0).toBe(0);
+    // The reporter's word doesn't outweigh what the bot saw.
+    const trueWitness = reportVotes((sim) => {
+      sim.chat('p2', 'body in the Trading Floor');
+      sim.chat('p3', 'carol rugged in Meme Lab, I saw it');
+    }, { seen: SEEN_IN_MEME_LAB });
+    expect(trueWitness.p4 ?? 0).toBeGreaterThan(5);
+    expect(trueWitness.p3 ?? 0).toBe(0);
+    // An eyewitness claim about a room the body was nowhere near is a lie.
+    const lyingWitness = reportVotes((sim) => {
+      sim.chat('p2', 'body in the Meme Lab');
+      sim.chat('p3', 'carol rugged in Trading Floor, I saw it');
+    }, { seen: SEEN_IN_MEME_LAB });
+    expect(lyingWitness.p3 ?? 0).toBeGreaterThan(10);
+    expect(lyingWitness.p4 ?? 0).toBe(0);
+    // A hallway body fits both rooms next to it.
+    const labeled = reportVotes((sim) => {
+      sim.chat('p2', 'body in the Liquidity Pool');
+      sim.chat('p3', 'carol rugged in the Liquidity Pool, I saw it');
+    }, { seen: SEEN_IN_HALLWAY });
+    const adjacent = reportVotes((sim) => {
+      sim.chat('p2', 'body in the Liquidity Pool');
+      sim.chat('p3', 'carol rugged in the Launchpad, I saw it');
+    }, { seen: SEEN_IN_HALLWAY });
+    expect(labeled.p4 ?? 0).toBeGreaterThan(5);
+    expect(adjacent).toEqual(labeled);
+  });
+
+  it('a claim that may be about another body (a second death this round, or an earlier body) is no lie', () => {
+    const wendy: PlayerSpec = { id: 'w', name: 'wendy', color: 8, x: SPAWN_POINTS[8].x, y: SPAWN_POINTS[8].y, alive: false };
+    // Wendy's body was never reported: the claim may be about her, so it is doubted, not a lie,
+    // even against what the bot saw itself.
+    for (const seen of [undefined, SEEN_IN_MEME_LAB]) {
+      const twoDead = reportVotes((sim) => {
+        sim.chat('p2', seen ? 'body in the Meme Lab' : 'body in the Trading Floor');
+        sim.chat('p3', `carol rugged in ${seen ? 'Trading Floor' : 'Meme Lab'}, I saw it`);
+      }, { seen, extraDead: [wendy] });
+      expect(twoDead.p3 ?? 0).toBe(0);
+      expect(twoDead.p2 ?? 0).toBe(0);
+    }
+
+    // The Meme Lab body was reported in the meeting before; now wendy's body is in the Trading Floor.
+    let followed = 0;
+    for (let seed = 1; seed <= 20; seed++) {
+      const sim = new Sim({ role: 'holder', phase: 'meeting', pos: SPAWN_POINTS[0], others: [...table, victim, { ...wendy, alive: true }], seed });
+      sim.snap.meeting = meetingView('discussion', { reason: 'report', callerId: 'p2', bodyColor: 9 });
+      sim.snap.phaseEndsAt = sim.now + 30000;
+      sim.chat('p2', 'body in the Meme Lab');
+      sim.run(20000);
+      sim.snap.phase = 'playing';
+      delete sim.snap.meeting;
+      delete sim.snap.phaseEndsAt;
+      // Everyone else is out of sight this round, so nobody has an alibi or was seen elsewhere.
+      sim.snap.players = sim.snap.players.filter((p) => p.alive);
+      table.forEach((o, i) => sim.movePlayer(o.id, TRADING_FLOOR.x + 30 * i, TRADING_FLOOR.y + 60));
+      sim.movePlayer('w', TRADING_FLOOR.x, TRADING_FLOOR.y);
+      sim.run(2000);
+      for (const o of table) sim.movePlayer(o.id, o.x, o.y);
+      sim.snap.phase = 'meeting';
+      sim.snap.players.push(view(victim, 9));
+      const w = sim.playerById('w');
+      if (w) w.alive = false;
+      sim.teleport(SPAWN_POINTS[0].x, SPAWN_POINTS[0].y);
+      sim.snap.meeting = meetingView('discussion', { reason: 'report', callerId: 'p2', bodyColor: 8 });
+      sim.snap.phaseEndsAt = sim.now + 30000;
+      sim.chat('p2', 'body in the Trading Floor');
+      sim.chat('p3', 'carol rugged in Meme Lab, I saw it');
+      sim.run(20000);
+      sim.snap.meeting = meetingView('voting', { reason: 'report', callerId: 'p2', bodyColor: 8 });
+      sim.snap.phaseEndsAt = sim.now + 60000;
+      sim.run(VOTE_WAIT_MS);
+      const votes = sim.messages('vote').map((v) => v.target);
+      expect(votes, `seed ${seed}`).toHaveLength(1);
+      expect(votes[0], `seed ${seed}`).not.toBe('p3');
+      if (votes[0] === 'p4') followed++;
+      expect(sim.problems, `seed ${seed}`).toEqual([]);
+    }
+    expect(followed).toBeGreaterThan(0);
   });
 
   it('ghosts banter rarely, and only where ghosts may talk', () => {

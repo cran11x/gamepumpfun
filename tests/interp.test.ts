@@ -1,8 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { INTERP_DELAY_MS } from '../shared/constants';
+import { WORLD_H, WORLD_W } from '../shared/map';
 import type { PlayerView, Snapshot } from '../shared/protocol';
 import type { TimedSnapshot } from '../client/src/store';
 import { InterpClock, RemoteInterpolator } from '../client/src/game/interp';
+import { NO_INTERACTIONS } from '../client/src/game/interactions';
+import { Renderer, type RenderPlayer, type WorldView } from '../client/src/render/index';
+import { buildStaticTiles, STATIC_TILE_PX, StaticMap } from '../client/src/render/staticMap';
 
 const SNAP_MS = 50;
 const FRAME_MS = 1000 / 60;
@@ -138,5 +142,185 @@ describe('InterpClock: remote players on a timeline anchored to snapshot arrival
     expect(clock.renderTime(50, 100)).toBe(14_950);
     clock.reset();
     expect(clock.ready).toBe(false);
+  });
+});
+
+// ---------- render/: the static layers (the render-side tests live here) ----------
+
+type DrawArgs = number[];
+
+/** A 2D context that draws nothing: methods are no-ops, drawImage calls are logged. */
+function fakeContext(drawn?: DrawArgs[]): CanvasRenderingContext2D {
+  const props: Record<string | symbol, unknown> = {};
+  const gradient = { addColorStop() {} };
+  return new Proxy(props, {
+    get(t, k) {
+      if (k in t) return t[k];
+      if (k === 'createLinearGradient' || k === 'createRadialGradient' || k === 'createPattern') return () => gradient;
+      if (k === 'measureText') return (text: string) => ({ width: String(text).length * 6 });
+      if (k === 'getImageData') return () => ({ data: new Uint8ClampedArray(4) });
+      if (k === 'drawImage') return (_img: unknown, ...a: number[]) => drawn?.push(a);
+      return () => {};
+    },
+    set(t, k, v) {
+      t[k] = v;
+      return true;
+    },
+  }) as unknown as CanvasRenderingContext2D;
+}
+
+function fakeCanvas(drawn?: DrawArgs[]): HTMLCanvasElement {
+  const g = fakeContext(drawn);
+  return { width: 300, height: 150, style: {}, clientWidth: 0, clientHeight: 0, getContext: () => g } as unknown as HTMLCanvasElement;
+}
+
+/** Just enough DOM for the renderer: canvases, a window size, Path2D, and a clock that ticks 1 ms per read. */
+function fakeDom(size: { w: number; h: number }): { now: () => number; advance: (ms: number) => void } {
+  let t = 1000;
+  vi.stubGlobal('document', { createElement: () => fakeCanvas() });
+  vi.stubGlobal('window', {
+    get innerWidth() {
+      return size.w;
+    },
+    get innerHeight() {
+      return size.h;
+    },
+    devicePixelRatio: 1,
+    setTimeout,
+    clearTimeout,
+  });
+  vi.stubGlobal(
+    'Path2D',
+    class {
+      moveTo() {}
+      lineTo() {}
+    },
+  );
+  vi.spyOn(performance, 'now').mockImplementation(() => (t += 1));
+  return { now: () => t, advance: (ms) => (t += ms) };
+}
+
+function worldView(): WorldView {
+  const self: RenderPlayer = { id: 'me', name: 'me', color: 0, x: 1280, y: 300, facing: 1, moving: false, walk: 0, alive: true, isRugger: false, inVent: false, disconnected: false, seed: 1 };
+  return {
+    phase: 'playing',
+    self,
+    selfVentId: null,
+    role: 'holder',
+    viewerDead: false,
+    noFog: false,
+    visionRadius: 300,
+    fud: false,
+    remotes: [],
+    bodies: [],
+    sabotage: null,
+    taskGlow: [],
+    interactions: NO_INTERACTIONS,
+    snapCamera: true,
+    serverNow: 0,
+  };
+}
+
+interface RendererInternals {
+  builtScale: number;
+  job: Generator<void, void, void> | null;
+  staticMap: StaticMap;
+}
+
+describe('static map rebuild', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('the tiles cover the whole world, and draw() leaves no gap between them', () => {
+    fakeDom({ w: 800, h: 600 });
+    const job = buildStaticTiles(1.75);
+    let steps = 0;
+    let r = job.next();
+    while (!r.done) {
+      steps++;
+      r = job.next();
+    }
+    // Many small steps, not one big one.
+    expect(steps).toBeGreaterThan(100);
+    const map = new StaticMap();
+    map.use(r.value);
+    for (const [x0, y0, x1, y1] of [
+      [-50, -40, 900, 700],
+      [1000.3, 610.7, 2310.9, 1371.2],
+      [WORLD_W - 700, WORLD_H - 500, WORLD_W + 60, WORLD_H + 60],
+    ]) {
+      const drawn: DrawArgs[] = [];
+      map.draw(fakeContext(drawn), x0, y0, x1, y1);
+      expect(drawn.length).toBeGreaterThan(1);
+      const dests = drawn.map(([, , , , dx, dy, dw, dh]) => ({ x0: dx, y0: dy, x1: dx + dw, y1: dy + dh }));
+      // Every point of the view inside the world is painted, boundaries between tiles included.
+      for (let y = Math.max(0, y0); y < Math.min(WORLD_H, y1); y += 7.3) {
+        for (let x = Math.max(0, x0); x < Math.min(WORLD_W, x1); x += 7.3) {
+          expect(dests.some((d) => x >= d.x0 && x < d.x1 && y >= d.y0 && y < d.y1)).toBe(true);
+        }
+      }
+      for (const b of [STATIC_TILE_PX, 2 * STATIC_TILE_PX, 3 * STATIC_TILE_PX, 4 * STATIC_TILE_PX]) {
+        if (b <= x0 || b >= x1) continue;
+        // Across a tile edge, the left tile reaches past it (no hairline seam).
+        expect(dests.some((d) => d.x0 < b - 0.5 && d.x1 > b + 0.5)).toBe(true);
+      }
+    }
+  });
+
+  it('after the window grows, the rebuild is spread over many frames and swaps in complete', () => {
+    const size = { w: 800, h: 600 };
+    const dom = fakeDom(size);
+    const r = new Renderer(fakeCanvas());
+    const inner = r as unknown as RendererInternals;
+    expect(inner.builtScale).toBe(1);
+    expect(inner.job).toBeNull();
+    size.w = 1920;
+    size.h = 1080;
+    r.skipFrame(1 / 60); // notices the new size, waits for it to settle
+    expect(inner.job).toBeNull();
+    dom.advance(500);
+    const oldMap = inner.staticMap.scale;
+    let frames = 0;
+    let maxFrameMs = 0;
+    while (inner.builtScale === 1 && frames < 1000) {
+      const t0 = dom.now();
+      r.skipFrame(1 / 60);
+      maxFrameMs = Math.max(maxFrameMs, dom.now() - t0);
+      frames++;
+      if (inner.builtScale === 1) expect(inner.staticMap.scale).toBe(oldMap); // the old map stays meanwhile
+    }
+    expect(inner.builtScale).toBe(1.5);
+    expect(inner.staticMap.scale).toBe(1.5);
+    expect(inner.job).toBeNull();
+    expect(frames).toBeGreaterThan(20);
+    // The fake clock ticks once per read: the frame budget holds a handful of steps.
+    expect(maxFrameMs).toBeLessThanOrEqual(12);
+  });
+
+  it('a pending rebuild never advances on frames that draw the world', () => {
+    const size = { w: 800, h: 600 };
+    const dom = fakeDom(size);
+    const r = new Renderer(fakeCanvas());
+    const inner = r as unknown as RendererInternals;
+    size.w = 1920;
+    size.h = 1080;
+    r.skipFrame(1 / 60);
+    dom.advance(500);
+    r.skipFrame(1 / 60); // starts it
+    const job = inner.job;
+    expect(job).not.toBeNull();
+    let steps = 0;
+    const next = job!.next.bind(job);
+    job!.next = () => {
+      steps++;
+      return next();
+    };
+    for (let i = 0; i < 30; i++) r.renderWorld(worldView(), 1 / 60, i / 60);
+    expect(steps).toBe(0);
+    expect(inner.builtScale).toBe(1);
+    r.skipFrame(1 / 60);
+    expect(steps).toBeGreaterThan(0);
   });
 });

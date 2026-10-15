@@ -18,6 +18,7 @@ import { createFullMap } from './fullMap';
 import { createMinigameHost } from './minigame';
 import { createModalLayer, openHowTo, openLeaderboard, openManualCopy, openRename } from './modals';
 import { createToasts } from './toasts';
+import { isConnectionRefusal } from '../net';
 
 type ViewKey = 'home' | Phase;
 
@@ -47,8 +48,10 @@ const SAB_FIXED: Record<SabotageKind, string> = {
 };
 
 export function friendlyError(code: ErrorCode, message: string): string {
-  // Server messages for game actions are already short and human; prefer them there.
-  if ((code === 'INVALID_ACTION' || code === 'ROOM_FULL') && message && message.length <= 80) return message.endsWith('.') ? message : `${message}.`;
+  // Server messages for game actions are already short and human; prefer them there. A rate limit says what
+  // was limited (too many join attempts, too many connections) unless it is the plain chat "Slow down".
+  const own = code === 'INVALID_ACTION' || code === 'ROOM_FULL' || (code === 'RATE_LIMITED' && !/^slow down\.?$/i.test(message));
+  if (own && message && message.length <= 80) return message.endsWith('.') ? message : `${message}.`;
   return ERROR_TEXT[code] ?? (message || 'Something went wrong.');
 }
 
@@ -60,7 +63,8 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
   // ----- Layers (bottom to top) -----
   const screenLayer = h('div', { class: 'ui-layer ui-screens' });
   const cornerLayer = h('div', { class: 'ui-corner' });
-  const statusChip = h('div', { class: 'ui-status', attrs: { role: 'status' } }, h('span', { class: 'spinner' }), h('span', { text: 'RECONNECTING…' }));
+  const statusText = h('span', { text: 'RECONNECTING…' });
+  const statusChip = h('div', { class: 'ui-status', attrs: { role: 'status' } }, h('span', { class: 'spinner' }), statusText);
   statusChip.hidden = true;
   const overlayLayer = h('div', { class: 'ui-layer ui-overlays' });
   const cutLayer = h('div', { class: 'ui-layer ui-cut' });
@@ -370,6 +374,14 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
   }
 
   store.onError((e) => {
+    // The server is turning this network away: say so once per streak; the status line keeps showing it.
+    if (isConnectionRefusal({ t: 'error', ...e })) {
+      if (!ctx.net.refusal) {
+        toasts.show(friendlyError(e.code, e.message), 'bad');
+        sound('error');
+      }
+      return;
+    }
     minigame.onError();
     if (e.code === 'REJOIN_FAILED') {
       toasts.show(e.message === 'Your seat was opened somewhere else' ? 'You opened this game in another tab.' : ERROR_TEXT.REJOIN_FAILED, 'info');
@@ -384,6 +396,7 @@ export function createUi(root: HTMLElement, ctx: AppContext): UiApi {
   store.onStatus((connected) => {
     minigame.onConnection(connected);
     const inRoom = store.inRoom;
+    statusText.textContent = !connected && ctx.net.refusal ? 'TOO MANY CONNECTIONS. RETRYING…' : 'RECONNECTING…';
     statusChip.hidden = connected || !inRoom;
     if (!connected && inRoom) wasDisconnected = true;
     if (connected && wasDisconnected) {

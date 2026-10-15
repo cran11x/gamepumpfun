@@ -30,11 +30,13 @@ const TERMINATE_BUFFER = 4 * 1024 * 1024;
 const MAX_PAYLOAD = 4096;
 /**
  * Concurrent sockets per client IP (IPv6 grouped by /64). A socket holds at most one seat, so this also
- * bounds the rooms one IP can keep open. Override with MAX_SOCKETS_PER_IP (e.g. for load tests).
+ * bounds the rooms one IP can keep open. The default leaves room for a LAN party, a school or a mobile
+ * CGNAT pool (extra tabs and sockets lingering until the heartbeat count too). Override with
+ * MAX_SOCKETS_PER_IP (e.g. for load tests).
  */
 const MAX_SOCKETS_PER_IP = (() => {
   const n = Number(process.env.MAX_SOCKETS_PER_IP);
-  return Number.isInteger(n) && n > 0 ? n : 20;
+  return Number.isInteger(n) && n > 0 ? n : 64;
 })();
 
 class SocketConn implements Conn {
@@ -171,6 +173,13 @@ function main(): void {
     const open = socketsPerIp.get(ip) ?? 0;
     if (open >= MAX_SOCKETS_PER_IP) {
       ws.on('error', () => {});
+      // Say why before closing, so the client can show it instead of silently retrying.
+      const refusal: S2C = { t: 'error', code: 'RATE_LIMITED', message: 'Too many connections from your network' };
+      try {
+        ws.send(JSON.stringify(refusal));
+      } catch {
+        /* closing */
+      }
       ws.close(1008, 'too many connections');
       // Don't wait the full closing handshake on a client that never answers it.
       setTimeout(() => ws.terminate(), 2000).unref();

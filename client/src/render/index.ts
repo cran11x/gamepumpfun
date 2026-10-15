@@ -12,8 +12,8 @@ import { drawBody, drawGhost, drawLabel, drawPill, drawTag, drawVentMarker, PILL
 import { Effects } from './effects';
 import { Fog } from './fog';
 import { COLORS, FONT_MONO, rgba } from './palette';
-import { buildPropSprites, drawPoolWater, type PropAnimState, type PropSprite } from './props';
-import { StaticMap } from './staticMap';
+import { drawPoolWater, propSpriteSteps, type PropAnimState, type PropSprite } from './props';
+import { buildStaticTiles, StaticMap } from './staticMap';
 import { clamp, damp, get2d, hash01, rrect, TAU } from './util';
 
 export { Effects } from './effects';
@@ -101,11 +101,18 @@ function ourFontsLoaded(): boolean {
 }
 
 /**
- * Max resolution of the pre-rendered map. 1.75 keeps the 2560x1760 world under ~14M px
- * (below Safari's 16.7M px canvas limit); touch devices stay at 1.5 to save memory.
+ * Max resolution of the pre-rendered map. At 1.75 the 2560x1760 world takes ~14.5M px (~58 MB, in
+ * tiles of ~0.33M px each); touch devices stay at 1.5 to save memory.
  */
 const MAX_STATIC_SCALE_DESKTOP = 1.75;
 const MAX_STATIC_SCALE_TOUCH = 1.5;
+/**
+ * Time (ms) a frame may spend on a pending static-layer rebuild: more under an opaque meeting / ejection /
+ * game over screen (nothing else is drawn), less while the home/lobby backdrop is drawn. Steps are a few
+ * ms each, and a frame always runs at least one.
+ */
+const REBUILD_BUDGET_COVERED_MS = 7;
+const REBUILD_BUDGET_BACKDROP_MS = 4;
 
 export class Renderer {
   readonly effects = new Effects();
@@ -126,13 +133,16 @@ export class Renderer {
   private builtFontEpoch = 0;
   private fontTimer: number | null = null;
   private builtHadFonts = false;
-  /** A font arrived while rebuilding had to wait (see deferRescale). */
-  private fontRebuildPending = false;
   /**
-   * Rebuilding the static layers takes a few hundred ms for the whole world, so it never runs
-   * while playing: it waits for a meeting, ejection, game over or the lobby backdrop.
+   * A static-layer rebuild in progress (see rebuildSteps), its scale and the font state it started with.
+   * It costs a few hundred ms in all, spread over frames, and only advances on frames that don't draw the
+   * world (under a meeting, ejection or game over screen, or behind the home/lobby UI), so it never slows
+   * down play. The current layers stay in use meanwhile.
    */
-  private deferRescale = false;
+  private job: Generator<void, void, void> | null = null;
+  private jobScale = 0;
+  private jobFontEpoch = 0;
+  private jobHadFonts = false;
   /** The canvas was resized (and so cleared) since the last frame was drawn. */
   private resized = true;
   /** Lowered if a big static layer ever fails to allocate. */
@@ -160,7 +170,8 @@ export class Renderer {
     this.g = get2d(canvas, { alpha: false });
     this.isTouch = typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
     this.resizeIfNeeded();
-    this.rebuild(this.wantScale);
+    // Nothing to show before the first build, so that one runs in one go.
+    this.rebuild(this.wantScale, true);
     this.watchFonts();
   }
 
@@ -179,9 +190,9 @@ export class Renderer {
       if (this.fontTimer !== null) window.clearTimeout(this.fontTimer);
       this.fontTimer = window.setTimeout(() => {
         this.fontTimer = null;
-        if (this.builtFontEpoch === this.fontEpoch || this.builtHadFonts) return;
-        if (this.deferRescale) this.fontRebuildPending = true;
-        else this.rebuild(this.builtScale || this.wantScale);
+        // Restart (or start) a rebuild unless the one in progress, or else the last one, has these fonts.
+        const fresh = this.job ? this.jobFontEpoch === this.fontEpoch || this.jobHadFonts : this.builtFontEpoch === this.fontEpoch || this.builtHadFonts;
+        if (!fresh) this.rebuild(this.job ? this.jobScale : this.builtScale || this.wantScale);
       }, 200);
     };
     try {
@@ -207,19 +218,58 @@ export class Renderer {
     return Math.min(this.scaleCap, this.isTouch ? MAX_STATIC_SCALE_TOUCH : MAX_STATIC_SCALE_DESKTOP);
   }
 
-  private rebuild(scale: number): void {
+  /**
+   * The static layers (map tiles, then prop sprites) for scale `s`, built in small steps. The current
+   * ones stay on screen until the last step swaps the whole new set in.
+   */
+  private *rebuildSteps(s: number, fontEpoch: number, hadFonts: boolean): Generator<void, void, void> {
+    const tiles = yield* buildStaticTiles(s);
+    const props = yield* propSpriteSteps(s);
+    this.staticMap.use(tiles);
+    this.props = props;
+    this.builtScale = s;
+    this.builtFontEpoch = fontEpoch;
+    this.builtHadFonts = hadFonts;
+  }
+
+  /** Starts rebuilding the static layers (see pumpRebuild); `now` finishes it before returning. */
+  private rebuild(scale: number, now = false): void {
     const s = clamp(scale || 1, 1, this.maxStaticScale);
+    this.jobScale = s;
+    this.jobFontEpoch = this.fontEpoch;
+    this.jobHadFonts = ourFontsLoaded();
+    this.job = this.rebuildSteps(s, this.jobFontEpoch, this.jobHadFonts);
+    if (now) this.pumpRebuild(Infinity);
+  }
+
+  /**
+   * Advances a pending rebuild by whole steps within `budgetMs` (always at least one step; another only
+   * if one more like the last still fits). A step is one layer of one map tile or one prop sprite, a few
+   * ms, so a rebuild costs frames a little time each instead of one stall of a few hundred ms.
+   */
+  private pumpRebuild(budgetMs: number): void {
+    const job = this.job;
+    if (!job) return;
+    const start = performance.now();
+    const s = this.jobScale;
     try {
-      this.builtFontEpoch = this.fontEpoch;
-      this.builtHadFonts = ourFontsLoaded();
-      this.staticMap.render(s);
-      this.props = buildPropSprites(s);
-      this.builtScale = s;
+      let now = start;
+      let step = 0;
+      do {
+        const t = now;
+        if (job.next().done) {
+          this.job = null;
+          return;
+        }
+        now = performance.now();
+        step = now - t;
+      } while (now - start + step <= budgetMs);
     } catch (err) {
       // Out of canvas memory on a constrained device: never try this size again, fall back to 1x.
       console.warn('[render] static layer build failed at scale', s, err);
+      this.job = null;
       this.scaleCap = Math.max(1, s - 0.25);
-      if (s > 1) this.rebuild(1);
+      if (s > 1) this.rebuild(1, budgetMs === Infinity || !this.staticMap.ready);
     }
   }
 
@@ -249,19 +299,14 @@ export class Renderer {
   }
 
   /**
-   * Re-render the static layers at a higher resolution once a resize has settled. Never
-   * downscales: a smaller window (e.g. a mobile keyboard opening) would only cost a rebuild.
+   * Re-render the static layers at a higher resolution once a resize has settled, and advance any
+   * pending rebuild by about `budgetMs`. Never downscales: a smaller window (e.g. a mobile keyboard
+   * opening) would only cost a rebuild.
    */
-  private maybeRescale(): void {
-    if (this.deferRescale) return;
+  private maybeRescale(budgetMs: number): void {
     const target = Math.min(this.wantScale, this.maxStaticScale);
-    const grow = target > this.builtScale && performance.now() - this.wantScaleSince >= 450;
-    if (this.fontRebuildPending) {
-      this.fontRebuildPending = false;
-      if (grow || (this.builtFontEpoch !== this.fontEpoch && !this.builtHadFonts)) this.rebuild(grow ? target : this.builtScale || this.wantScale);
-      return;
-    }
-    if (grow) this.rebuild(target);
+    if (target > (this.job ? this.jobScale : this.builtScale) && performance.now() - this.wantScaleSince >= 450) this.rebuild(target);
+    this.pumpRebuild(budgetMs);
   }
 
   private vignettes(): void {
@@ -325,20 +370,20 @@ export class Renderer {
   /**
    * A frame under an opaque DOM screen (meeting, ejection, game over): draw nothing, the last
    * world frame stays on the canvas. Effects keep aging so none replay afterwards, and a pending
-   * static-layer rebuild may run since nobody is moving.
+   * static-layer rebuild advances a few ms per frame since nothing else is drawn.
    */
   skipFrame(dt: number): void {
-    this.deferRescale = false;
     this.resizeIfNeeded();
-    this.maybeRescale();
+    this.maybeRescale(REBUILD_BUDGET_COVERED_MS);
     this.effects.update(dt, false);
   }
 
   // ---------- frame helpers ----------
 
-  private beginFrame(): void {
+  /** `rebuildBudgetMs`: time for a pending static-layer rebuild this frame (0: none). */
+  private beginFrame(rebuildBudgetMs: number): void {
     this.resizeIfNeeded();
-    this.maybeRescale();
+    if (rebuildBudgetMs > 0) this.maybeRescale(rebuildBudgetMs);
     this.resized = false;
     this.vignettes();
     const g = this.g;
@@ -349,7 +394,7 @@ export class Renderer {
 
   /** Clears to the background only when the (opaque) static map won't cover the whole view. */
   private clearOutsideWorld(vr: { x0: number; y0: number; x1: number; y1: number }): void {
-    if (vr.x0 >= 0 && vr.y0 >= 0 && vr.x1 <= WORLD_W && vr.y1 <= WORLD_H && this.staticMap.canvas) return;
+    if (vr.x0 >= 0 && vr.y0 >= 0 && vr.x1 <= WORLD_W && vr.y1 <= WORLD_H && this.staticMap.ready) return;
     const g = this.g;
     g.save();
     g.setTransform(1, 0, 0, 1, 0, 0);
@@ -419,8 +464,7 @@ export class Renderer {
   // ---------- world ----------
 
   renderWorld(view: WorldView, dt: number, t: number): void {
-    this.deferRescale = view.phase === 'playing';
-    this.beginFrame();
+    this.beginFrame(0);
     const g = this.g;
     const self = view.self;
     const entering = this.mode !== 'world';
@@ -782,8 +826,7 @@ export class Renderer {
   // ---------- home / lobby backdrop ----------
 
   renderBackdrop(dt: number, t: number, colors: readonly number[]): void {
-    this.deferRescale = false;
-    this.beginFrame();
+    this.beginFrame(REBUILD_BUDGET_BACKDROP_MS);
     const g = this.g;
     const entering = this.mode !== 'backdrop';
     this.mode = 'backdrop';

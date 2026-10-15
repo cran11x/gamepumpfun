@@ -3,7 +3,7 @@
 import { MAX_NAME_LENGTH, ROOM_CODE_LENGTH } from '../../../shared/constants';
 import type { C2S } from '../../../shared/protocol';
 import { fetchRoomsInfo } from '../api';
-import { Net } from '../net';
+import { Net, type Refusal } from '../net';
 import type { Screen, UiCore } from './core';
 import { button, h, icon, lsGet, lsSet, shortCa } from './dom';
 import { pillSvg } from './pill';
@@ -21,6 +21,13 @@ export function sanitizeCode(raw: string): string {
     .slice(0, ROOM_CODE_LENGTH);
 }
 
+/** Home status while the server refuses this network: the reason plus a countdown to the next retry. */
+export function refusalText(r: Refusal, now: number): string {
+  const why = r.message.replace(/[.\s]+$/, '') || 'Too many connections from your network';
+  const secs = Math.ceil((r.retryAt - now) / 1000);
+  return r.retryAt > 0 && secs > 0 ? `${why}. Retrying in ${secs}s…` : `${why}. Retrying…`;
+}
+
 export function createHome(core: UiCore): Screen {
   const { ctx } = core;
   const cfg = ctx.config;
@@ -28,6 +35,7 @@ export function createHome(core: UiCore): Screen {
   let pendingTimer: number | null = null;
   let loginBusy = false;
   let infoTimer: number | null = null;
+  let refusalTimer: number | null = null;
   const offs: Array<() => void> = [];
 
   // ----- Brand -----
@@ -226,6 +234,9 @@ export function createHome(core: UiCore): Screen {
   if (Net.loadSession()) setStatus('Rejoining your last game…', true);
 
   function setStatus(text: string, spin = false): void {
+    if (refusalTimer !== null) window.clearInterval(refusalTimer);
+    refusalTimer = null;
+    status.classList.remove('is-bad');
     status.textContent = '';
     if (!text) return;
     if (spin) status.append(h('span', { class: 'spinner' }));
@@ -277,6 +288,24 @@ export function createHome(core: UiCore): Screen {
     setPending(kind);
   }
 
+  /** Disconnected: say why when the server is refusing this network, and count down to the next retry. */
+  function showOffline(): void {
+    const r = ctx.net.refusal;
+    if (!r) {
+      setStatus('Connecting to the trenches…', true);
+      return;
+    }
+    const render = () => {
+      const cur = ctx.net.refusal;
+      const line = status.querySelector('.home-status-text');
+      if (cur && line) line.textContent = refusalText(cur, Date.now());
+    };
+    setStatus(refusalText(r, Date.now()));
+    status.classList.add('is-bad');
+    status.lastElementChild?.classList.add('home-status-text');
+    refusalTimer = window.setInterval(render, 1000);
+  }
+
   offs.push(
     ctx.store.onError((e) => {
       if (pending) setPending(null);
@@ -285,13 +314,15 @@ export function createHome(core: UiCore): Screen {
   );
   offs.push(
     ctx.store.onStatus((c) => {
-      if (!c && !pending) setStatus('Connecting to the trenches…', true);
-      else if (c && !pending && !Net.loadSession()) setStatus('');
+      if (pending) return;
+      if (!c) showOffline();
+      else if (Net.loadSession()) setStatus('Rejoining your last game…', true);
+      else setStatus('');
     }),
   );
   // Show "connecting" only if the first connection takes a moment.
   const connectHint = window.setTimeout(() => {
-    if (!ctx.store.connected && !pending) setStatus('Connecting to the trenches…', true);
+    if (!ctx.store.connected && !pending) showOffline();
   }, 1500);
 
   function refreshInfo(): void {
@@ -321,6 +352,7 @@ export function createHome(core: UiCore): Screen {
       for (const off of offs) off();
       if (pendingTimer !== null) window.clearTimeout(pendingTimer);
       if (infoTimer !== null) window.clearInterval(infoTimer);
+      if (refusalTimer !== null) window.clearInterval(refusalTimer);
       window.clearTimeout(connectHint);
     },
   };

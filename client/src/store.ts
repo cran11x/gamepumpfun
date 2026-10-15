@@ -57,6 +57,8 @@ export class Store {
         break;
       }
       case 'chat':
+        // On rejoin the server replays its chat log; lines we already have come back identical.
+        if (this.hasChat(m)) break;
         this.chat.push(m);
         if (this.chat.length > 200) this.chat.splice(0, this.chat.length - 200);
         this.chatL.forEach((l) => l(m));
@@ -73,6 +75,15 @@ export class Store {
       case 'pong':
         break;
     }
+  }
+
+  /** A line with the same (ts, fromId, channel, text) is already in the log. Newest first: replays overlap the tail. */
+  private hasChat(m: ChatMessage): boolean {
+    for (let i = this.chat.length - 1; i >= 0; i--) {
+      const c = this.chat[i];
+      if (c.ts === m.ts && c.fromId === m.fromId && c.channel === m.channel && c.text === m.text) return true;
+    }
+    return false;
   }
 
   /** Forget the room (after leaving, being kicked, or a failed rejoin). */

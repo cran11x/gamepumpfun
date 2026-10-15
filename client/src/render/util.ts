@@ -96,3 +96,19 @@ export function supportsCanvasFilter(g: CanvasRenderingContext2D): boolean {
     return false;
   }
 }
+
+let sink: CanvasRenderingContext2D | null = null;
+
+/**
+ * Makes `c` carry out the drawing recorded on it so far (browsers may defer it until the canvas is first
+ * drawn somewhere), by copying one of its pixels to a scratch canvas. Pre-rendering code calls this so
+ * the cost lands in its own (time-sliced) step instead of the frame that first shows the result.
+ */
+export function flushCanvas(c: HTMLCanvasElement): void {
+  try {
+    sink ??= get2d(createCanvas(1, 1));
+    sink.drawImage(c, 0, 0, 1, 1, 0, 0, 1, 1);
+  } catch {
+    /* best effort */
+  }
+}

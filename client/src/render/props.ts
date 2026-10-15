@@ -6,7 +6,7 @@
 import { TILE } from '../../../shared/constants';
 import { PROPS, roomAt, type PropDef, type PropKind } from '../../../shared/map';
 import { COLORS, FONT_MONO, FONT_TITLE, mixHex, rgba } from './palette';
-import { clamp, createCanvas, fillRR, get2d, hash01, mulberry32, rrect, strokeRR, TAU } from './util';
+import { clamp, createCanvas, fillRR, flushCanvas, get2d, hash01, mulberry32, rrect, strokeRR, TAU } from './util';
 
 type G = CanvasRenderingContext2D;
 
@@ -1062,10 +1062,12 @@ function couchColor(x: number, y: number): string {
   return '#5f22b3';
 }
 
-export function buildPropSprites(scale: number): PropSprite[] {
+/** Pre-renders every prop sprite, yielding after each one (see buildStaticTiles); returns the whole list. */
+export function* propSpriteSteps(scale: number): Generator<void, PropSprite[], void> {
   const out: PropSprite[] = [];
-  PROPS.forEach((def, idx) => {
-    if (def.kind === 'pool') return;
+  for (let idx = 0; idx < PROPS.length; idx++) {
+    const def = PROPS[idx];
+    if (def.kind === 'pool') continue;
     const over = OVERHANG[def.kind];
     const fw = def.rect.w * TILE;
     const fh = def.rect.h * TILE;
@@ -1137,7 +1139,9 @@ export function buildPropSprites(scale: number): PropSprite[] {
         break;
     }
     out.push({ def, kind: def.kind, canvas, x: fx - PAD, y: fy - over - PAD, w, h, sortY: fy + fh, anim });
-  });
+    flushCanvas(canvas);
+    yield;
+  }
   return out;
 }
 

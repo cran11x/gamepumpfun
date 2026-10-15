@@ -50,6 +50,7 @@ import type {
   C2S,
   ChatMessage,
   GameEvent,
+  MeetingView,
   MeView,
   Phase,
   PlayerView,
@@ -199,6 +200,23 @@ const VOUCH_MULT = 0.7;
 const ROOM_MATCH_MULT = 1.1;
 /** A near-body claim about a different room than the reported body. */
 const ROOM_MISMATCH_MULT = 0.5;
+/**
+ * Only this bot's own sighting of the body is ground truth. An eyewitness claim whose room doesn't
+ * fit the body as far as we know it, but that can't be shown false either, counts for this much.
+ */
+const ROOM_DOUBT_MULT = 0.1;
+/**
+ * When the claim contradicts nothing but the reporter's word, one of the two is wrong and there
+ * is no telling which: each of them gets this much suspicion.
+ */
+const ROOM_CONFLICT_WEIGHT = 0.75;
+/**
+ * A room at most this much farther from where we saw the body than the room it lay in still fits
+ * (a body in a hallway sits between two rooms).
+ */
+const ROOM_FIT_PX = 3 * TILE;
+/** Rooms this close share a hallway, and a body in it could be said to be in either. */
+const ROOM_NEIGHBOR_PX = 7 * TILE;
 /** This bot saw the accused far from the claimed room right before the meeting. */
 const ELSEWHERE_MULT = 0.5;
 const ELSEWHERE_WINDOW_MS = 6000;
@@ -208,6 +226,11 @@ const REPORTER_EVIDENCE_MULT = 0.3;
 const REPORTER_SAW_MULT = 0.7;
 /** Extra suspicion on someone caught lying (a claim that can't be true). */
 const LIAR_WEIGHT = 3.5;
+/**
+ * A reporter who names the wrong room for a body we saw ourselves: suspect, but people misname
+ * rooms, and a believable eyewitness claim should still lead.
+ */
+const REPORTER_LIE_WEIGHT = 2;
 /** Chance a holder bot who saw the accused elsewhere speaks up for them. */
 const VOUCH_CHANCE = 0.6;
 
@@ -293,7 +316,12 @@ const DENIAL_RE = /\b(not me|why me|wasn'?t me|trust me|lying|liar|deflecting|i'
 /** Saying who they vote for. */
 const VOTE_RE = /\bvot(e|ing)\b/;
 /** The reporter saying where the body was. */
-const BODY_ROOM_RE = /^(?:body in the|found a rugged bag in the)\s+(.+?)\s*$/;
+const BODY_ROOM_RE = /^(?:body in(?: the)?|found a rugged bag in(?: the)?)\s+(.+?)\s*$/;
+/** A room named right after the crime or the body is where the claim happened ("rugged in X", "body in the X"). */
+const CRIME_ROOM_RE =
+  /\b(?:rug|rugs|rugged|rugging|kill|killed|killing|vent|vents|vented|venting|bridge|bridged|body|bag)(?:\s+\S+){0,2}?\s+(?:in|at|inside|near|by|around)\s+(?:the\s+)?$/;
+/** Next best: a room named as a place ("near X", "at X", "in the X"), unlike "then ran to the X". */
+const PLACE_ROOM_RE = /\b(?:in|at|inside|near|by|around)\s+(?:the\s+)?$/;
 
 const BASIC_COLOR_WORDS = new Set([
   'green', 'red', 'purple', 'blue', 'orange', 'lime', 'cyan', 'pink', 'gold', 'white', 'black', 'brown',
@@ -412,11 +440,41 @@ const ROOM_LABELS: { label: string; room: RoomDef }[] = ROOMS.map((r) => ({ labe
   (a, b) => b.label.length - a.label.length,
 );
 
-/** The (lowercase) room named in a chat line, if any. */
-function roomInText(text: string): string | null {
+/** Every room named in a (lowercase) line, in order. A longer label wins over one inside it. */
+function roomMentions(t: string): { label: string; at: number }[] {
+  const found: { label: string; at: number }[] = [];
+  for (const { label } of ROOM_LABELS) {
+    for (let at = t.indexOf(label); at >= 0; at = t.indexOf(label, at + label.length)) {
+      if (!found.some((f) => at < f.at + f.label.length && f.at < at + label.length)) found.push({ label, at });
+    }
+  }
+  return found.sort((a, b) => a.at - b.at);
+}
+
+/**
+ * The (lowercase) room a chat line ties its claim to: the one named right after the crime or the
+ * body ("rugged in X", "body in the X"), else one named as a place ("near X", "at X"), else the
+ * first one named. "X rugged in the Meme Lab, then ran to the Trading Floor" is about the Meme Lab.
+ */
+function claimRoomInText(text: string): string | null {
   const t = text.toLowerCase();
-  for (const r of ROOM_LABELS) if (t.includes(r.label)) return r.label;
-  return null;
+  let best: { label: string; score: number } | null = null;
+  for (const m of roomMentions(t)) {
+    const before = t.slice(0, m.at);
+    const score = CRIME_ROOM_RE.test(before) ? 2 : PLACE_ROOM_RE.test(before) ? 1 : 0;
+    if (!best || score > best.score) best = { label: m.label, score };
+  }
+  return best?.label ?? null;
+}
+
+/** Px between the walls of two rooms given by lowercase label (Infinity if either is unknown). */
+function roomGap(a: string, b: string): number {
+  const ra = ROOM_LABELS.find((x) => x.label === a)?.room.rect;
+  const rb = ROOM_LABELS.find((x) => x.label === b)?.room.rect;
+  if (!ra || !rb) return Infinity;
+  const dx = Math.max(ra.x - (rb.x + rb.w), rb.x - (ra.x + ra.w), 0);
+  const dy = Math.max(ra.y - (rb.y + rb.h), rb.y - (ra.y + ra.h), 0);
+  return Math.hypot(dx, dy) * TILE;
 }
 
 /** Straight-line px from `p` to the room with this lowercase label (0 inside, Infinity if unknown). */
@@ -797,6 +855,10 @@ class GameMemory {
    */
   readonly roster = new Set<string>();
   readonly gone = new Set<string>();
+  /** `gone` as of the start of this round: anyone dead in a meeting but not in here died this round. */
+  goneAtRoundStart = new Set<string>();
+  /** Rooms of the bodies reported in earlier meetings (lowercase). */
+  readonly pastBodyRooms = new Set<string>();
   /** playerId -> who stood near them the last time this bot saw them. */
   readonly seenWith = new Map<string, SeenWithInfo>();
   /** This bot's position on the previous playing snapshot (bridge watching). */
@@ -974,6 +1036,16 @@ interface MeetingState {
   committed: string | null;
   /** Lowercase room of the reported body: seen by this bot, or said by the reporter. */
   bodyRoom: string | null;
+  /** bodyRoom comes from this bot's own sighting (ground truth), not from the reporter's word. */
+  bodyRoomSeen: boolean;
+  /** Where this bot saw the reported body. */
+  bodySeenAt: Vec | null;
+  /** The room the reporter said the body was in. */
+  reporterRoom: string | null;
+  /** Rooms of other bodies this game: a claim naming one of them may be about that body. */
+  otherBodyRooms: Set<string>;
+  /** Someone else died this round too, so a claim may be about a body nobody reported. */
+  otherDeaths: boolean;
   /** Someone already said where the body was. */
   bodyRoomHeard: boolean;
   /** Lowercase meeting lines already said by anyone (no repeats). */
@@ -1219,6 +1291,8 @@ export class BotBrain {
         for (const b of snap.bodies) this.mem.knownBodies.add(b.id);
         this.mem.bodyBaseline = true;
         this.mem.prevHere = null;
+        this.mem.goneAtRoundStart = new Set(this.mem.gone);
+        if (this.meeting?.bodyRoom) this.mem.pastBodyRooms.add(this.meeting.bodyRoom);
         this.meeting = null;
         this.pendingMeetingChat = [];
         this.roundStartPending = true;
@@ -2378,6 +2452,11 @@ export class BotBrain {
     const seenBefore = new Map<string, SeenInfo>();
     for (const [id, s] of this.mem.lastSeen) seenBefore.set(id, { ...s });
     const bodyRoom = this.reportedBodyRoom(snap, me);
+    const bodyColor = snap.meeting?.bodyColor;
+    const seenBody = bodyColor === undefined ? undefined : [...this.mem.seenBodies.values()].find((b) => b.color === bodyColor);
+    const otherBodyRooms = new Set(this.mem.pastBodyRooms);
+    for (const b of this.mem.seenBodies.values()) if (b.color !== bodyColor) otherBodyRooms.add(b.room.toLowerCase());
+    const otherDeaths = snap.players.some((p) => !p.alive && p.color !== bodyColor && !this.mem.goneAtRoundStart.has(p.id));
     this.meeting = {
       startedAt: now,
       votingSeenAt: null,
@@ -2399,6 +2478,11 @@ export class BotBrain {
       announceAt: null,
       committed: null,
       bodyRoom: bodyRoom ? bodyRoom.toLowerCase() : null,
+      bodyRoomSeen: bodyRoom !== null,
+      bodySeenAt: bodyRoom !== null && seenBody ? { x: seenBody.x, y: seenBody.y } : null,
+      reporterRoom: null,
+      otherBodyRooms,
+      otherDeaths,
       bodyRoomHeard: false,
       heard: new Set(),
       seenBefore,
@@ -2538,11 +2622,17 @@ export class BotBrain {
     const m = snap.meeting;
     const report = m?.reason === 'report';
     const own = this.ownEvidence(snap, me);
-    // Someone whose eyewitness claim can't fit the reported body is lying.
+    // Someone whose eyewitness claim (or report) can't fit the body we saw ourselves is lying. A
+    // claim that only contradicts the reporter's word makes both of them a little suspect.
     const liars = new Set(st.liars);
+    const conflicted = new Set<string>();
     for (const c of st.claims) {
-      if (c.kind === 'saw' && c.rug && c.room && report && st.bodyRoom && c.room !== st.bodyRoom) liars.add(c.from);
+      const fit = this.roomFit(c, st, m);
+      if (fit === 'lie') liars.add(c.from);
+      else if (fit === 'conflict') conflicted.add(c.from);
     }
+    const lyingReporter = report && m && !liars.has(m.callerId) && this.reporterLied(st) ? m.callerId : null;
+    if (lyingReporter) liars.add(lyingReporter);
     // Each accuser's best claim per target (saying it twice adds nothing).
     const best = new Map<string, { claim: Claim; w: number }>();
     for (const c of st.claims) {
@@ -2583,8 +2673,46 @@ export class BotBrain {
       if (vouchers > 0) claimed *= VOUCH_MULT ** Math.min(2, vouchers);
       out.set(id, ownW + claimed);
     }
-    for (const id of liars) out.set(id, (out.get(id) ?? 0) + LIAR_WEIGHT);
+    for (const id of liars) out.set(id, (out.get(id) ?? 0) + (id === lyingReporter ? REPORTER_LIE_WEIGHT : LIAR_WEIGHT));
+    if (m && conflicted.size > 0) {
+      for (const id of conflicted) if (!liars.has(id)) out.set(id, (out.get(id) ?? 0) + ROOM_CONFLICT_WEIGHT);
+      // Several eyewitnesses who all contradict the reporter count against them a bit more.
+      if (!liars.has(m.callerId)) out.set(m.callerId, (out.get(m.callerId) ?? 0) + ROOM_CONFLICT_WEIGHT * Math.min(2, conflicted.size));
+    }
     return out;
+  }
+
+  /**
+   * How the room of an eyewitness rug claim fits the reported body. Only this bot's own sighting
+   * is ground truth: a claim that contradicts it is a lie. One that only contradicts the
+   * reporter's word is a conflict between two unverified accounts. One that doesn't fit but
+   * could still be true (another body, a hallway body) is doubted.
+   */
+  private roomFit(c: Claim, st: MeetingState, m: MeetingView | undefined): 'match' | 'unknown' | 'doubt' | 'conflict' | 'lie' {
+    if (!m || m.reason !== 'report' || c.kind !== 'saw' || !c.rug || !c.room || !st.bodyRoom) return 'unknown';
+    if (c.room === st.bodyRoom || this.fitsSeenBody(st, c.room)) return 'match';
+    // About a body we know of from earlier.
+    if (st.otherBodyRooms.has(c.room)) return 'unknown';
+    // It may be about a body that turned up this round but wasn't reported.
+    if (st.otherDeaths) return 'doubt';
+    if (st.bodyRoomSeen) return 'lie';
+    // The body may lie in the hallway between the two rooms; and contradicting their own report
+    // line is no second account.
+    if (roomGap(c.room, st.bodyRoom) <= ROOM_NEIGHBOR_PX || c.from === m.callerId) return 'doubt';
+    return 'conflict';
+  }
+
+  /** A room that also fits where we saw the body (a hallway body sits between two rooms). */
+  private fitsSeenBody(st: MeetingState, room: string): boolean {
+    const at = st.bodySeenAt;
+    if (!at || !st.bodyRoom) return false;
+    return distanceToRoom(at, room) <= distanceToRoom(at, st.bodyRoom) + ROOM_FIT_PX;
+  }
+
+  /** We saw the reported body ourselves, and the reporter named a room it wasn't in. */
+  private reporterLied(st: MeetingState): boolean {
+    const said = st.reporterRoom;
+    return st.bodyRoomSeen && said !== null && st.bodyRoom !== null && said !== st.bodyRoom && !this.fitsSeenBody(st, said);
   }
 
   /** How many more rugs give the ruggers parity, as far as a holder can tell. */
@@ -2601,8 +2729,10 @@ export class BotBrain {
     const m = snap.meeting;
     const report = m?.reason === 'report';
     if (report && st.bodyRoom && c.room) {
-      if (c.kind === 'saw' && c.rug && c.room === st.bodyRoom) w *= ROOM_MATCH_MULT;
-      if ((c.kind === 'near' || c.kind === 'evidence') && c.room !== st.bodyRoom) w *= ROOM_MISMATCH_MULT;
+      const fit = this.roomFit(c, st, m);
+      if (fit === 'match') w *= ROOM_MATCH_MULT;
+      else if (fit === 'doubt' || fit === 'conflict') w *= ROOM_DOUBT_MULT;
+      if ((c.kind === 'near' || c.kind === 'evidence') && c.room !== st.bodyRoom && !this.fitsSeenBody(st, c.room)) w *= ROOM_MISMATCH_MULT;
     }
     if (c.kind === 'saw' && c.rug && c.room) {
       // We saw them somewhere else entirely right before the meeting.
@@ -2837,8 +2967,12 @@ export class BotBrain {
     const bodyLine = BODY_ROOM_RE.exec(text);
     if (bodyLine) {
       st.bodyRoomHeard = true;
-      const room = roomInText(bodyLine[1]);
-      if (room && !st.bodyRoom && m?.reason === 'report' && fromId === m.callerId) st.bodyRoom = room;
+      const room = claimRoomInText(text);
+      if (room && !st.reporterRoom && m?.reason === 'report' && fromId === m.callerId) {
+        // Their word, not ground truth: see roomFit.
+        st.reporterRoom = room;
+        if (!st.bodyRoom) st.bodyRoom = room;
+      }
     }
     if (DENIAL_RE.test(text)) st.contested.add(fromId);
     const { ids, bare } = this.parseMentions(text, fromId, snap);
@@ -2859,7 +2993,7 @@ export class BotBrain {
     const evidence = !eyewitness && (crime || EVIDENCE_RE.test(text));
     const nearBody = evidence && NEAR_BODY_RE.test(text);
     const rug = eyewitness && RUG_CRIME_RE.test(text);
-    const room = roomInText(text);
+    const room = claimRoomInText(text);
     for (const id of ids) {
       const acc = st.accusations.get(id) ?? { score: 0, accusers: new Set<string>(), eyewitnesses: new Set<string>(), echoes: new Set<string>() };
       // Repeating an accusation someone else already made is agreeing, not a new source.

@@ -688,6 +688,12 @@ textarea {
   animation: toast-out 0.25s ease both;
 }
 
+/* Over the joystick or an action button (see toasts.ts) a toast lets touches through instead. */
+.toast.is-passthrough {
+  pointer-events: none;
+  cursor: default;
+}
+
 /* ---------- Home ---------- */
 
 .home {
@@ -958,6 +964,13 @@ textarea {
 
 .home-status:empty {
   display: none;
+}
+
+/* The server is refusing this network (too many connections): a reason, not a spinner. */
+.home-status.is-bad {
+  color: #ff8a9e;
+  text-align: center;
+  text-wrap: balance;
 }
 
 .home.is-pending .home-card {
@@ -2832,10 +2845,6 @@ textarea {
     height: 84px;
   }
 
-  .hud-left {
-    max-height: calc(100vh - 140px);
-  }
-
   /* Open beside the action cluster, bottom-aligned, so the menu never runs off the top of the screen. */
   .sab-menu {
     bottom: 0;
@@ -2852,12 +2861,13 @@ textarea {
   }
 }
 
-/* Landscape phones: the left column fills the height left under the curve/banner, and on touch it
-   stops above the joystick's resting spot (base top = 168px from the bottom) unless ghost chat is open. */
-@media (max-width: 900px) and (max-height: 520px) {
+/* Short screens (landscape phones of any width, Pixel 7 915x412 and Pro Max 932x430 included): the left
+   column fills the height left in the HUD head, and on touch the head stops above the joystick's resting
+   spot (base top = 168px from the bottom) unless ghost chat is open. */
+@media (max-height: 520px) {
   .hud-head {
     bottom: calc(12px + var(--safe-b));
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
   }
 
   .is-touch .hud:not(.is-gchat) .hud-head {
@@ -2882,32 +2892,6 @@ textarea {
 
   .hud-tasks.is-collapsed {
     flex-shrink: 0;
-  }
-
-  /* DEV DUMP banner on one line (title, timer, wall chips); the start toast carries the instruction. */
-  .hud-banner--devDump {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px 12px;
-    padding: 6px 12px;
-  }
-
-  .hud-banner--devDump .hb-row {
-    flex: 1 1 auto;
-  }
-
-  .hud-banner--devDump .hb-detail {
-    display: none;
-  }
-
-  /* Toasts go below a sabotage banner instead of over it, and never block the joystick or buttons. */
-  #ui[data-view='playing']:has(.hud-banner:not([hidden])) .ui-toasts {
-    top: calc(148px + var(--safe-t));
-  }
-
-  #ui.is-touch[data-view='playing'] .toast {
-    pointer-events: none;
   }
 
   .hud-gchat-wrap {
@@ -2935,6 +2919,61 @@ textarea {
 
   .hud-gchat .chat-list {
     min-height: 48px;
+  }
+
+  /* Toasts sit right of the task column and of the joystick zone (46% wide), under the top HUD, so they
+     cover neither the task panel header nor the joystick and stay tappable to dismiss. Where one still
+     lands on an action button, toasts.ts lets touches through it. */
+  #ui[data-view='playing'] .ui-toasts {
+    top: calc(30% + var(--safe-t));
+    bottom: auto;
+    left: max(calc(46% + 12px), calc(316px + var(--safe-l)));
+    right: calc(12px + var(--safe-r));
+    width: auto;
+    transform: none;
+  }
+}
+
+/* Short and wide (Pixel 7 / Pro Max landscape): the curve and banner fill the middle column, so toasts
+   stack in the empty right column (290px), under the map and mute buttons and above the action buttons. */
+@media (min-width: 901px) and (max-height: 520px) {
+  #ui[data-view='playing'] .ui-toasts {
+    top: calc(64px + var(--safe-t));
+    left: calc(100% - 302px - var(--safe-r));
+  }
+}
+
+/* Landscape phones up to 900px wide: the curve and banner span the top row and the left column sits under them. */
+@media (max-width: 900px) and (max-height: 520px) {
+  .hud-head {
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  /* DEV DUMP banner on one line (title, timer, wall chips); the start toast carries the instruction. */
+  .hud-banner--devDump {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+    padding: 6px 12px;
+  }
+
+  .hud-banner--devDump .hb-row {
+    flex: 1 1 auto;
+  }
+
+  .hud-banner--devDump .hb-detail {
+    display: none;
+  }
+
+  /* Toasts start at the left of their strip, away from the action cluster on the right edge. */
+  #ui[data-view='playing'] .ui-toasts {
+    align-items: flex-start;
+  }
+
+  /* Toasts go below a sabotage banner instead of over it. */
+  #ui[data-view='playing']:has(.hud-banner:not([hidden])) .ui-toasts {
+    top: calc(148px + var(--safe-t));
   }
 
   /* In-bridge panel: top right under the room chip, clear of the curve, task column and joystick. */

@@ -18,8 +18,10 @@ const MAX_ROOMS = 5000;
 /** Minimum spacing between create / join / quick from one connection. */
 const JOIN_COOLDOWN_MS = 250;
 /**
- * Failed room lookups (a join to a code with no room, any failed rejoin) allowed per client IP per window.
- * Past that, join and rejoin answer RATE_LIMITED until the window ends, so private codes can't be swept.
+ * Failed joins (a code with no room) allowed per client IP per window. Past that, join answers
+ * RATE_LIMITED until the window ends, so private codes can't be swept. Rejoin is not limited: every
+ * failed rejoin gets the same REJOIN_FAILED, so it reveals nothing, and the client must hear that
+ * answer to drop its stale session.
  */
 const LOOKUP_FAIL_LIMIT = 30;
 const LOOKUP_FAIL_WINDOW_MS = 60_000;
@@ -71,6 +73,11 @@ export class RoomManager {
   /** Failed room lookups per client IP, and IPs blocked from lookups until a time. */
   private readonly lookupFails: RateLimiter;
   private readonly lookupBlockedUntil = new Map<string, number>();
+  /**
+   * The seat whose chat backlog a connection already got. A client only rejoins on a fresh socket, so a
+   * repeat on the same one (a join or rejoin loop) gets no second ~100-line replay.
+   */
+  private readonly backlogSent = new WeakMap<Conn, string>();
 
   constructor(opts: RoomManagerOptions = {}) {
     this.now = opts.now ?? Date.now;
@@ -220,17 +227,14 @@ export class RoomManager {
   }
 
   private rejoin(conn: Conn, rawCode: string, playerId: string, sessionKey: string): void {
-    // A missing room and a wrong seat/key must look the same (same error, same side effects), or
-    // rejoin becomes an oracle for private room codes. A valid seat key still works when blocked:
-    // only its owner can have it, so success reveals nothing to a prober.
-    const blocked = this.lookupBlocked(conn);
+    // A missing room and a wrong seat/key must look the same (same error, no side effects), or rejoin
+    // becomes an oracle for private room codes. That holds for a blocked IP too, so a failed rejoin is
+    // always REJOIN_FAILED (the client then forgets the stale session), and a valid seat key always
+    // works: only its owner can have it, so success reveals nothing to a prober.
     const code = normalizeRoomCode(rawCode);
     const room = code ? this.rooms.get(code) : undefined;
     const player = room ? room.rejoin(playerId, sessionKey) : null;
-    if (!room || !player) {
-      if (blocked || this.lookupFailed(conn)) return this.error(conn, 'RATE_LIMITED', LOOKUP_BLOCKED_MSG);
-      return this.error(conn, 'REJOIN_FAILED', REJOIN_FAILED_MSG);
-    }
+    if (!room || !player) return this.error(conn, 'REJOIN_FAILED', REJOIN_FAILED_MSG);
     const b = conn.binding;
     if (b && (b.code !== room.code || b.playerId !== playerId)) this.leave(conn);
     const key = seatKey(room.code, playerId);
@@ -238,6 +242,7 @@ export class RoomManager {
     if (previous && previous !== conn) {
       // Another tab/socket held this seat: hand it over and tell the old one to forget the session.
       previous.binding = null;
+      this.backlogSent.delete(previous);
       try {
         previous.send({ t: 'error', code: 'REJOIN_FAILED', message: 'Your seat was opened somewhere else' });
       } catch {
@@ -253,6 +258,7 @@ export class RoomManager {
     const b = conn.binding;
     if (!b) return;
     conn.binding = null;
+    this.backlogSent.delete(conn);
     const key = seatKey(b.code, b.playerId);
     if (this.seats.get(key) !== conn) return;
     this.seats.delete(key);
@@ -277,8 +283,13 @@ export class RoomManager {
     const p = room.getPlayer(playerId);
     if (!p) return;
     conn.send({ t: 'welcome', playerId, sessionKey: p.sessionKey, code: room.code });
+    // The visible chat backlog goes before the first snapshot, so the screen that snapshot opens has it.
+    const key = seatKey(room.code, playerId);
+    if (this.backlogSent.get(conn) !== key) {
+      this.backlogSent.set(conn, key);
+      room.sendChatBacklogTo(playerId);
+    }
     room.sendSnapshotTo(playerId);
-    room.sendMissedChatTo(playerId);
   }
 
   // ---------- Internals ----------
@@ -326,6 +337,7 @@ export class RoomManager {
     const conn = this.seats.get(key);
     if (!conn) return;
     this.seats.delete(key);
+    this.backlogSent.delete(conn);
     if (conn.binding && conn.binding.code === code && conn.binding.playerId === playerId) conn.binding = null;
   }
 

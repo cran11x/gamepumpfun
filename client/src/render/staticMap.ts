@@ -26,7 +26,7 @@ import {
 } from '../../../shared/map';
 import { drawBridgeGlyph, drawFixIcon, drawTaskIcon } from './icons';
 import { COLORS, FONT_MONO, FONT_TITLE, rgba } from './palette';
-import { createCanvas, fillRR, get2d, hash01, mulberry32, rrect, strokeRR, TAU } from './util';
+import { createCanvas, fillRR, flushCanvas, get2d, hash01, mulberry32, rrect, strokeRR, TAU } from './util';
 
 type G = CanvasRenderingContext2D;
 
@@ -67,51 +67,150 @@ function wallAccent(tx: number, ty: number): string {
   return COLORS.hallNeon;
 }
 
+/**
+ * The map is pre-rendered as a grid of tiles of this many world px (8 map cells), so a rebuild can be
+ * spread over many frames (each tile is a few small steps) instead of one long main-thread stall.
+ */
+export const STATIC_TILE_PX = 320;
+/**
+ * Every tile also renders this much of its neighbors' area around it (world px). Times any quarter-step
+ * scale it is a whole number of pixels, so all tiles share one pixel grid, and draw() lets each tile overlap
+ * the next by SEAM_PX so no hairline seam shows where they meet.
+ */
+const TILE_PAD_PX = 4;
+const SEAM_PX = 1;
+
+/** A world-space rectangle being rendered: layers skip whatever lies entirely outside it. */
+interface Area {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+function touches(a: Area, x: number, y: number, w: number, h: number, margin = 0): boolean {
+  return x - margin < a.x1 && y - margin < a.y1 && x + w + margin > a.x0 && y + h + margin > a.y0;
+}
+
+/** Map cells (inclusive) overlapping `a`, grown by `grow` cells, clamped to the map. */
+function cellSpan(a: Area, grow: number): { tx0: number; ty0: number; tx1: number; ty1: number } {
+  return {
+    tx0: Math.max(0, Math.floor(a.x0 / TILE) - grow),
+    ty0: Math.max(0, Math.floor(a.y0 / TILE) - grow),
+    tx1: Math.min(MAP_W - 1, Math.ceil(a.x1 / TILE) - 1 + grow),
+    ty1: Math.min(MAP_H - 1, Math.ceil(a.y1 / TILE) - 1 + grow),
+  };
+}
+
+interface MapTile {
+  /** The world area this tile stands for. */
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** Covers the area plus TILE_PAD_PX all around. */
+  canvas: HTMLCanvasElement;
+}
+
+/** A complete set of map tiles at one resolution. */
+export interface StaticTiles {
+  scale: number;
+  tiles: MapTile[];
+}
+
+/**
+ * Renders the map tile by tile, yielding after every small step (one layer of one tile) so the caller
+ * can spread the work over frames. Nothing is shown until the generator returns the finished set.
+ */
+export function* buildStaticTiles(scale: number): Generator<void, StaticTiles, void> {
+  const tiles: MapTile[] = [];
+  for (let y = 0; y < WORLD_H; y += STATIC_TILE_PX) {
+    for (let x = 0; x < WORLD_W; x += STATIC_TILE_PX) {
+      const w = Math.min(STATIC_TILE_PX, WORLD_W - x);
+      const h = Math.min(STATIC_TILE_PX, WORLD_H - y);
+      const a: Area = { x0: x - TILE_PAD_PX, y0: y - TILE_PAD_PX, x1: x + w + TILE_PAD_PX, y1: y + h + TILE_PAD_PX };
+      const canvas = createCanvas((a.x1 - a.x0) * scale, (a.y1 - a.y0) * scale);
+      const g = get2d(canvas, { alpha: false });
+      g.setTransform(scale, 0, 0, scale, -a.x0 * scale, -a.y0 * scale);
+      // Each step ends with a flush, so its drawing happens now and not in the frame that first shows the tile.
+      drawVoid(g, a);
+      flushCanvas(canvas);
+      yield;
+      drawFloors(g, a);
+      flushCanvas(canvas);
+      yield;
+      drawRoomDecor(g, a);
+      drawPoolBasins(g, a);
+      flushCanvas(canvas);
+      yield;
+      drawAmbientOcclusion(g, a);
+      const neon = drawWallBlocks(g, a);
+      flushCanvas(canvas);
+      yield;
+      drawWallNeon(g, neon);
+      flushCanvas(canvas);
+      yield;
+      drawRoomLabels(g, a);
+      for (const v of VENTS) if (touches(a, v.x, v.y, 0, 0, 40)) drawVentHatch(g, v.x, v.y);
+      drawTaskConsoles(g, a);
+      drawSabotageConsoles(g, a);
+      flushCanvas(canvas);
+      tiles.push({ x, y, w, h, canvas });
+      yield;
+    }
+  }
+  return { scale, tiles };
+}
+
 export class StaticMap {
-  canvas: HTMLCanvasElement | null = null;
+  private tiles: readonly MapTile[] = [];
   scale = 1;
 
-  render(scale: number): void {
-    const c = createCanvas(WORLD_W * scale, WORLD_H * scale);
-    const g = get2d(c, { alpha: false });
-    g.setTransform(scale, 0, 0, scale, 0, 0);
-    drawVoid(g);
-    drawFloors(g);
-    drawRoomDecor(g);
-    drawPoolBasins(g);
-    drawAmbientOcclusion(g);
-    drawWalls(g);
-    drawRoomLabels(g);
-    for (const v of VENTS) drawVentHatch(g, v.x, v.y);
-    drawTaskConsoles(g);
-    drawSabotageConsoles(g);
-    this.canvas = c;
-    this.scale = scale;
+  /** A map has been built (until then draw() draws nothing). */
+  get ready(): boolean {
+    return this.tiles.length > 0;
+  }
+
+  /** Swaps in a finished set of tiles (see buildStaticTiles). */
+  use(set: StaticTiles): void {
+    this.tiles = set.tiles;
+    this.scale = set.scale;
   }
 
   /** Draws the visible part of the map. `g` must already have the world transform. */
   draw(g: G, x0: number, y0: number, x1: number, y1: number): void {
-    const c = this.canvas;
-    if (!c) return;
     const s = this.scale;
-    const sx0 = Math.max(0, Math.floor(x0 * s));
-    const sy0 = Math.max(0, Math.floor(y0 * s));
-    const sx1 = Math.min(c.width, Math.ceil(x1 * s));
-    const sy1 = Math.min(c.height, Math.ceil(y1 * s));
-    if (sx1 <= sx0 || sy1 <= sy0) return;
-    g.drawImage(c, sx0, sy0, sx1 - sx0, sy1 - sy0, sx0 / s, sy0 / s, (sx1 - sx0) / s, (sy1 - sy0) / s);
+    for (const t of this.tiles) {
+      // The tile's own area, plus a sliver of its padding right and below, overlapped by the next tile.
+      const ax0 = Math.max(x0, t.x);
+      const ay0 = Math.max(y0, t.y);
+      const ax1 = Math.min(x1, t.x + t.w + SEAM_PX);
+      const ay1 = Math.min(y1, t.y + t.h + SEAM_PX);
+      if (ax1 <= ax0 || ay1 <= ay0) continue;
+      const ox = t.x - TILE_PAD_PX;
+      const oy = t.y - TILE_PAD_PX;
+      const c = t.canvas;
+      const sx0 = Math.max(0, Math.floor((ax0 - ox) * s));
+      const sy0 = Math.max(0, Math.floor((ay0 - oy) * s));
+      const sx1 = Math.min(c.width, Math.ceil((ax1 - ox) * s));
+      const sy1 = Math.min(c.height, Math.ceil((ay1 - oy) * s));
+      if (sx1 <= sx0 || sy1 <= sy0) continue;
+      g.drawImage(c, sx0, sy0, sx1 - sx0, sy1 - sy0, ox + sx0 / s, oy + sy0 / s, (sx1 - sx0) / s, (sy1 - sy0) / s);
+    }
   }
 }
 
 // ---------- layers ----------
 
-function drawVoid(g: G): void {
+function drawVoid(g: G, a: Area): void {
   g.fillStyle = COLORS.bg;
-  g.fillRect(0, 0, WORLD_W, WORLD_H);
+  g.fillRect(a.x0, a.y0, a.x1 - a.x0, a.y1 - a.y0);
   // Faint terminal dot grid outside the station.
   g.fillStyle = 'rgba(120,150,190,0.05)';
-  for (let y = 10; y < WORLD_H; y += 20) {
-    for (let x = 10; x < WORLD_W; x += 20) g.fillRect(x, y, 1.2, 1.2);
+  const gx0 = 10 + Math.max(0, Math.floor((a.x0 - 10) / 20)) * 20;
+  const gy0 = 10 + Math.max(0, Math.floor((a.y0 - 10) / 20)) * 20;
+  for (let y = gy0; y < WORLD_H && y < a.y1; y += 20) {
+    for (let x = gx0; x < WORLD_W && x < a.x1; x += 20) g.fillRect(x, y, 1.2, 1.2);
   }
   // Occasional brighter "data" specks.
   const rnd = mulberry32(77);
@@ -123,14 +222,15 @@ function drawVoid(g: G): void {
   }
 }
 
-function drawFloors(g: G): void {
+function drawFloors(g: G, a: Area): void {
   g.fillStyle = COLORS.floor;
   for (const r of ROOMS) g.fillRect(r.rect.x * TILE, r.rect.y * TILE, r.rect.w * TILE, r.rect.h * TILE);
   for (const h of HALLS) g.fillRect(h.x * TILE, h.y * TILE, h.w * TILE, h.h * TILE);
 
   // Per-tile variation for texture.
-  for (let ty = 0; ty < MAP_H; ty++) {
-    for (let tx = 0; tx < MAP_W; tx++) {
+  const span = cellSpan(a, 0);
+  for (let ty = span.ty0; ty <= span.ty1; ty++) {
+    for (let tx = span.tx0; tx <= span.tx1; tx++) {
       if (!isFloorish(tx, ty)) continue;
       const h = hash01(ty * 997 + tx * 31 + 5);
       if (h < 0.14) {
@@ -149,6 +249,7 @@ function drawFloors(g: G): void {
     const y = r.rect.y * TILE;
     const w = r.rect.w * TILE;
     const h = r.rect.h * TILE;
+    if (!touches(a, x, y, w, h)) continue;
     g.fillStyle = rgba(r.accent, 0.035);
     g.fillRect(x, y, w, h);
     g.save();
@@ -169,6 +270,7 @@ function drawFloors(g: G): void {
   // Tile grid lines.
   const gridRects = [...ROOMS.map((r) => ({ ...r.rect, accent: r.accent })), ...HALLS.map((h) => ({ ...h, accent: COLORS.hallNeon }))];
   for (const r of gridRects) {
+    if (!touches(a, r.x * TILE, r.y * TILE, r.w * TILE, r.h * TILE, 4)) continue;
     g.beginPath();
     for (let tx = r.x; tx <= r.x + r.w; tx++) {
       g.moveTo(tx * TILE + 0.5, r.y * TILE);
@@ -232,9 +334,14 @@ function withClip(g: G, r: { x: number; y: number; w: number; h: number }, fn: (
   g.restore();
 }
 
-function drawRoomDecor(g: G): void {
+function drawRoomDecor(g: G, a: Area): void {
+  // Each piece is skipped when it can't reach `a` (rooms: their rect plus a margin for strokes and glows).
+  const inRoom = (id: RoomId) => {
+    const r = roomRectPx(id);
+    return touches(a, r.x, r.y, r.w, r.h, 48);
+  };
   // Launchpad: spawn ring around the SPACES table.
-  {
+  if (touches(a, EMERGENCY_BUTTON.x - 200, EMERGENCY_BUTTON.y - 150, 400, 300, 8)) {
     const cx = EMERGENCY_BUTTON.x;
     const cy = EMERGENCY_BUTTON.y;
     const glow = g.createRadialGradient(cx, cy, 20, cx, cy, 200);
@@ -264,7 +371,7 @@ function drawRoomDecor(g: G): void {
   }
 
   // Trading floor: a giant painted candle chart between the desk rows.
-  {
+  if (inRoom('tradingFloor')) {
     const r = roomRectPx('tradingFloor');
     const rnd = mulberry32(11);
     let price = 4;
@@ -291,7 +398,7 @@ function drawRoomDecor(g: G): void {
   }
 
   // Meme lab: polka dots.
-  withClip(g, roomRectPx('memeLab'), () => {
+  if (inRoom('memeLab')) withClip(g, roomRectPx('memeLab'), () => {
     const r = roomRectPx('memeLab');
     g.fillStyle = rgba(r.accent, 0.035);
     for (let y = r.y + 20; y < r.y + r.h; y += 40) {
@@ -304,7 +411,7 @@ function drawRoomDecor(g: G): void {
   });
 
   // RPC node: floor cables between racks and consoles.
-  {
+  if (inRoom('rpcNode')) {
     const cables: [number, number][][] = [
       [
         [4.5, 21],
@@ -340,9 +447,14 @@ function drawRoomDecor(g: G): void {
     }
   }
 
+  // The cables leave round caps and joins set, and everything after them is drawn that way: keep it so
+  // for tiles without cables too.
+  g.lineCap = 'round';
+  g.lineJoin = 'round';
+
   // Liquidity pool: wet tiles around the basin.
   for (const p of PROPS) {
-    if (p.kind !== 'pool') continue;
+    if (p.kind !== 'pool' || !touches(a, p.rect.x * TILE, p.rect.y * TILE, p.rect.w * TILE, p.rect.h * TILE, 64)) continue;
     const x = p.rect.x * TILE;
     const y = p.rect.y * TILE;
     const w = p.rect.w * TILE;
@@ -365,7 +477,7 @@ function drawRoomDecor(g: G): void {
   }
 
   // Dev vault: gold diamond plate.
-  withClip(g, roomRectPx('devVault'), () => {
+  if (inRoom('devVault')) withClip(g, roomRectPx('devVault'), () => {
     const r = roomRectPx('devVault');
     g.strokeStyle = rgba(r.accent, 0.04);
     g.lineWidth = 1.5;
@@ -380,7 +492,7 @@ function drawRoomDecor(g: G): void {
   });
 
   // Telegram HQ: a rug under the couch and faint paper planes.
-  {
+  if (inRoom('telegramHq')) {
     const r = roomRectPx('telegramHq');
     fillRR(g, 4.4 * TILE, 35.6 * TILE, 5.2 * TILE, 2.9 * TILE, 14, rgba(r.accent, 0.08));
     strokeRR(g, 4.4 * TILE, 35.6 * TILE, 5.2 * TILE, 2.9 * TILE, 14, rgba(r.accent, 0.14), 1.5);
@@ -406,7 +518,7 @@ function drawRoomDecor(g: G): void {
   }
 
   // KOL studio: stage spotlight and a carpet under the couches.
-  {
+  if (inRoom('kolStudio')) {
     const r = roomRectPx('kolStudio');
     fillRR(g, 26.6 * TILE, 37.4 * TILE, 10.8 * TILE, 2.3 * TILE, 18, rgba(r.accent, 0.06));
     const cx = 32 * TILE;
@@ -438,6 +550,9 @@ function drawRoomDecor(g: G): void {
     const h = p.rect.h * TILE;
     const cx = x + w / 2;
     const cy = y + h;
+    const bx0 = Math.min(cx - 160, x - 12);
+    const by0 = Math.min(cy - 160, y - 12);
+    if (!touches(a, bx0, by0, Math.max(cx + 160, x + w + 12) - bx0, Math.max(cy + 160, y + h + 12) - by0, 4)) continue;
     const scorch = g.createRadialGradient(cx, cy, 10, cx, cy, 140);
     scorch.addColorStop(0, 'rgba(255,120,30,0.10)');
     scorch.addColorStop(0.5, 'rgba(0,0,0,0.18)');
@@ -468,9 +583,9 @@ function drawRoomDecor(g: G): void {
   }
 }
 
-function drawPoolBasins(g: G): void {
+function drawPoolBasins(g: G, a: Area): void {
   for (const p of PROPS) {
-    if (p.kind !== 'pool') continue;
+    if (p.kind !== 'pool' || !touches(a, p.rect.x * TILE, p.rect.y * TILE, p.rect.w * TILE, p.rect.h * TILE, 48)) continue;
     const x = p.rect.x * TILE;
     const y = p.rect.y * TILE;
     const w = p.rect.w * TILE;
@@ -527,7 +642,7 @@ function drawPoolBasins(g: G): void {
   }
 }
 
-function drawAmbientOcclusion(g: G): void {
+function drawAmbientOcclusion(g: G, a: Area): void {
   const north = g.createLinearGradient(0, 0, 0, 18);
   north.addColorStop(0, 'rgba(0,0,0,0.42)');
   north.addColorStop(1, 'rgba(0,0,0,0)');
@@ -541,8 +656,9 @@ function drawAmbientOcclusion(g: G): void {
   east.addColorStop(0, 'rgba(0,0,0,0.3)');
   east.addColorStop(1, 'rgba(0,0,0,0)');
   const solid = (tx: number, ty: number) => !isFloorish(tx, ty);
-  for (let ty = 0; ty < MAP_H; ty++) {
-    for (let tx = 0; tx < MAP_W; tx++) {
+  const span = cellSpan(a, 0);
+  for (let ty = span.ty0; ty <= span.ty1; ty++) {
+    for (let tx = span.tx0; tx <= span.tx1; tx++) {
       if (!isFloorish(tx, ty)) continue;
       const n = solid(tx, ty - 1);
       const s = solid(tx, ty + 1);
@@ -572,7 +688,11 @@ function drawAmbientOcclusion(g: G): void {
   }
 }
 
-function drawWalls(g: G): void {
+/**
+ * Wall blocks for the cells overlapping `a`. Returns the neon edge paths for drawWallNeon, which also
+ * take in the walls one cell around `a`, whose glow reaches into it.
+ */
+function drawWallBlocks(g: G, a: Area): Map<string, Path2D> {
   const neon = new Map<string, Path2D>();
   const addSeg = (accent: string, x0: number, y0: number, x1: number, y1: number) => {
     let p = neon.get(accent);
@@ -590,8 +710,10 @@ function drawWalls(g: G): void {
   capGrad.addColorStop(0, '#222c3b');
   capGrad.addColorStop(1, COLORS.wall);
 
-  for (let ty = 0; ty < MAP_H; ty++) {
-    for (let tx = 0; tx < MAP_W; tx++) {
+  const inner = cellSpan(a, 0);
+  const span = cellSpan(a, 1);
+  for (let ty = span.ty0; ty <= span.ty1; ty++) {
+    for (let tx = span.tx0; tx <= span.tx1; tx++) {
       if (cellAt(tx, ty) !== CELL_WALL) continue;
       const x = tx * TILE;
       const y = ty * TILE;
@@ -600,6 +722,12 @@ function drawWalls(g: G): void {
       const floorN = isFloorish(tx, ty - 1);
       const floorE = isFloorish(tx + 1, ty);
       const floorW = isFloorish(tx - 1, ty);
+      const faceTop = floorS ? y + TILE - WALL_FACE : y + TILE;
+      if (floorS) addSeg(accent, x, faceTop, x + TILE, faceTop);
+      if (floorN) addSeg(accent, x, y + 0.5, x + TILE, y + 0.5);
+      if (floorE) addSeg(accent, x + TILE - 0.5, y, x + TILE - 0.5, faceTop);
+      if (floorW) addSeg(accent, x + 0.5, y, x + 0.5, faceTop);
+      if (tx < inner.tx0 || tx > inner.tx1 || ty < inner.ty0 || ty > inner.ty1) continue;
       g.save();
       g.translate(x, y);
       g.fillStyle = capGrad;
@@ -628,14 +756,33 @@ function drawWalls(g: G): void {
         }
       }
       g.restore();
-      const faceTop = floorS ? y + TILE - WALL_FACE : y + TILE;
-      if (floorS) addSeg(accent, x, faceTop, x + TILE, faceTop);
-      if (floorN) addSeg(accent, x, y + 0.5, x + TILE, y + 0.5);
-      if (floorE) addSeg(accent, x + TILE - 0.5, y, x + TILE - 0.5, faceTop);
-      if (floorW) addSeg(accent, x + 0.5, y, x + 0.5, faceTop);
     }
   }
-  // Neon edges: glow pass then crisp pass, one stroke per accent color.
+  return neon;
+}
+
+let neonOrder: Map<string, number> | null = null;
+
+/** Order in which the neon colors are stroked: the same for every tile, so overlapping glows blend alike. */
+function neonRank(accent: string): number {
+  if (!neonOrder) {
+    const order = new Map<string, number>();
+    for (let ty = 0; ty < MAP_H; ty++) {
+      for (let tx = 0; tx < MAP_W; tx++) {
+        if (cellAt(tx, ty) !== CELL_WALL) continue;
+        if (!isFloorish(tx, ty + 1) && !isFloorish(tx, ty - 1) && !isFloorish(tx + 1, ty) && !isFloorish(tx - 1, ty)) continue;
+        const c = wallAccent(tx, ty);
+        if (!order.has(c)) order.set(c, order.size);
+      }
+    }
+    neonOrder = order;
+  }
+  return neonOrder.get(accent) ?? neonOrder.size;
+}
+
+/** Neon wall edges: glow pass then crisp pass, one stroke per accent color. */
+function drawWallNeon(g: G, paths: Map<string, Path2D>): void {
+  const neon = [...paths].sort((p, q) => neonRank(p[0]) - neonRank(q[0]));
   g.save();
   g.lineCap = 'square';
   for (const [accent, path] of neon) {
@@ -657,11 +804,12 @@ function drawWalls(g: G): void {
   g.restore();
 }
 
-function drawRoomLabels(g: G): void {
+function drawRoomLabels(g: G, a: Area): void {
   g.save();
   g.textAlign = 'center';
   g.textBaseline = 'middle';
   for (const r of ROOMS) {
+    if (!touches(a, r.rect.x * TILE, r.rect.y * TILE, r.rect.w * TILE, r.rect.h * TILE, 40)) continue;
     const cx = (r.rect.x + r.rect.w / 2) * TILE;
     const cy = (r.rect.y + r.rect.h - 0.55) * TILE;
     const size = r.rect.w >= 14 ? 26 : 22;
@@ -714,8 +862,9 @@ export function drawVentHatch(g: G, x: number, y: number): void {
   g.restore();
 }
 
-function drawTaskConsoles(g: G): void {
+function drawTaskConsoles(g: G, a: Area): void {
   for (const s of TASK_STATIONS) {
+    if (!touches(a, s.x, s.y, 0, 0, 40)) continue;
     const accent = roomAccent(s.room);
     g.save();
     g.translate(s.x, s.y);
@@ -745,8 +894,9 @@ function drawTaskConsoles(g: G): void {
   }
 }
 
-function drawSabotageConsoles(g: G): void {
+function drawSabotageConsoles(g: G, a: Area): void {
   for (const s of SABOTAGE_STATIONS) {
+    if (!touches(a, s.x, s.y, 0, 0, 60)) continue;
     g.save();
     g.translate(s.x, s.y);
     g.save();
