@@ -1,0 +1,72 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Bungee&family=JetBrains+Mono:wght@400;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<style>html,body{margin:0;background:#07090d;overflow:hidden}svg{display:block}</style>
+<script src="brand.js"></script></head><body>
+<svg id="s" xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630"></svg>
+<script>
+// Open Graph / link preview image, 1200x630. Keeps everything inside y 30-600 (2:1 center crops) and x 40-1160.
+(async () => {
+  await B.fontsReady();
+  const INK = B.INK;
+  const o = [];
+  o.push(`<defs>${B.defs()}${B.glowDef('wm-glow', 17)}
+<pattern id="ht-bg" width="14" height="14" patternUnits="userSpaceOnUse" patternTransform="rotate(30)"><circle cx="7" cy="7" r="2.6" fill="#18202d"/></pattern>
+<pattern id="ht-gold" width="11" height="11" patternUnits="userSpaceOnUse" patternTransform="rotate(30)"><circle cx="5.5" cy="5.5" r="2.8" fill="#ff9f1c"/></pattern>
+<linearGradient id="fadeL" x1="0" x2="1"><stop offset="0" stop-color="#fff"/><stop offset=".55" stop-color="#fff" stop-opacity="0"/></linearGradient>
+<mask id="mL"><rect width="1200" height="630" fill="url(#fadeL)"/></mask>
+<radialGradient id="panelFade" cx="50%" cy="58%" r="62%"><stop offset=".25" stop-color="#fff" stop-opacity="0"/><stop offset="1" stop-color="#fff"/></radialGradient>
+<mask id="mP"><rect x="620" y="0" width="580" height="630" fill="url(#panelFade)"/></mask>
+<radialGradient id="redGlow" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#ff3b5c" stop-opacity=".42"/><stop offset="1" stop-color="#ff3b5c" stop-opacity="0"/></radialGradient>
+<clipPath id="panelClip"><path d="M654 70L1150 58L1156 568L646 578Z"/></clipPath>
+</defs>`);
+  o.push(`<rect width="1200" height="630" fill="#07090d"/>`);
+  o.push(B.rays(900, 330, 36, 1600, '#0e141d'));
+  o.push(`<rect width="1200" height="630" fill="url(#ht-bg)" mask="url(#mL)"/>`);
+  o.push(`<ellipse cx="330" cy="300" rx="330" ry="190" fill="url(#redGlow)"/>`);
+
+  // ---------- comic panel (right) ----------
+  const PANEL = 'M654 70L1150 58L1156 568L646 578Z';
+  o.push(`<path d="${PANEL}" fill="#fff" stroke="#fff" stroke-width="22" stroke-linejoin="round"/>`);
+  o.push(`<g clip-path="url(#panelClip)">`);
+  o.push(`<rect x="620" y="40" width="560" height="560" fill="#ffd400"/>`);
+  o.push(B.rays(902, 400, 28, 900, '#ffc400'));
+  o.push(`<rect x="620" y="40" width="560" height="560" fill="url(#ht-gold)" mask="url(#mP)"/>`);
+  const pills = [];
+  pills.push(B.dev({ x: 900, y: 382, s: 2.9, rot: -2, sw: 2.3, lookX: -2.5, lookY: 1.9, extra: B.sweat(),
+    armL: { x: -27, y: -31, cx: -27, cy: -3, hand: 'open' },
+    armR: { x: 27, y: -31, cx: 27, cy: -3, hand: 'open' } }));
+  pills.push(B.pill({ color: 'green', x: 718, y: 402, s: 2.7, rot: 5, sw: 2.3, eyes: 'angry', mouth: 'shout', lookX: 2.4, lookY: 0.4, shadow: false,
+    armR: { x: 31, y: -10, cx: 27, cy: 6, hand: 'point', dir: -12 } }));
+  pills.push(B.pill({ color: 'cyan', x: 1078, y: 402, s: 2.65, rot: -5, sw: 2.3, eyes: 'angry', mouth: 'shout', lookX: -2.4, lookY: 0.4, shadow: false,
+    armL: { x: -31, y: -10, cx: -27, cy: 6, hand: 'point', dir: 192 } }));
+  o.push(pills.join(''));
+  o.push(B.anger(690, 300, -10, 1.1));
+  o.push(B.anger(1112, 300, 40, 1.1));
+  o.push(B.table(902, 538, 300, 66));
+  o.push(B.rug({ x: 1018, y: 528, w: 190, h: 44, skew: -26, curl: true, a: 36, b: 26 }));
+  o.push(B.bag({ x: 984, y: 520, s: 1.85, rot: 3, color: 'pink' }));
+  o.push(B.mic(884, 508, 1.1));
+  o.push(`</g>`);
+  o.push(`<path d="${PANEL}" fill="none" stroke="${INK}" stroke-width="7" stroke-linejoin="round"/>`);
+  o.push(B.tape(1144, 70, 38));
+  o.push(B.tape(652, 570, 32));
+  o.push(B.bubble({ x: 772, y: 214, w: 210, h: 60, text: 'DEV IS SUS', size: 27, tail: [722, 290], rot: -5 }));
+  o.push(B.bubble({ x: 960, y: 140, w: 250, h: 60, text: 'TRUST ME BRO', size: 26, tail: [912, 262], rot: 3 }));
+
+  // ---------- left column ----------
+  const X = 64;
+  o.push(B.chip({ x: X, y: 92, text: 'X SPACES IS LIVE', size: 24, fill: '#ffd400', dot: '#ff3b5c', padX: 16, rot: -3 }).svg);
+  o.push(B.wordmark({ x: X, y: 262, size: 124, stickerAt: [474, 108], stickerScale: 1.0 }));
+  o.push(`<text x="${X}" y="458" font-family="Space Grotesk" font-weight="700" font-size="33" fill="#f2f5f8">One of you is about to <tspan fill="#ff3b5c">rug.</tspan></text>`);
+  o.push(`<text x="${X}" y="496" font-family="Space Grotesk" font-weight="500" font-size="25" fill="#a7b2c1">Free social deduction for the trenches.</text>`);
+  const row = B.chipRow(X, 522, [
+    { text: 'FREE TO PLAY', size: 20, fill: '#2bff88', padX: 14 },
+    { text: 'IN BROWSER', size: 20, fill: '#22e5ff', padX: 14 },
+    { text: '4-10 PLAYERS', size: 20, fill: '#ffd400', padX: 14 },
+  ], 10);
+  o.push(row.svg);
+  console.log('chip row ends at', X + row.w);
+  document.getElementById('s').innerHTML = o.join('');
+  window.READY = true;
+})();
+</script></body></html>

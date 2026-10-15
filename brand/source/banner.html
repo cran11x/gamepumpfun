@@ -1,0 +1,125 @@
+<!doctype html><html><head><meta charset="utf-8">
+<link href="https://fonts.googleapis.com/css2?family=Bungee&family=JetBrains+Mono:wght@400;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<style>html,body{margin:0;background:#07090d;overflow:hidden}svg{display:block}</style>
+<script src="brand.js"></script></head><body>
+<svg id="s" xmlns="http://www.w3.org/2000/svg" width="1500" height="500" viewBox="0 0 1500 500"></svg>
+<script>
+// X header banner, 1500x500. Safe zones: avatar covers ~x0-400 / y330-500, mobile crops ~60px top+bottom.
+// #guides overlays the safe zones.
+(async () => {
+  await B.fontsReady();
+  const GUIDES = location.hash.includes('guides');
+  const INK = B.INK, OFF = B.OFF;
+  const o = [];
+  o.push(`<defs>${B.defs()}${B.glowDef('wm-glow', 15)}
+<pattern id="ht-bg" width="13" height="13" patternUnits="userSpaceOnUse" patternTransform="rotate(30)"><circle cx="6.5" cy="6.5" r="2.4" fill="#18202d"/></pattern>
+<pattern id="ht-gold" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(30)"><circle cx="5" cy="5" r="2.6" fill="#ff9f1c"/></pattern>
+<pattern id="stripes" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="4" height="8" fill="#ff3b5c"/><rect x="4" width="4" height="8" fill="#7a1426"/></pattern>
+<linearGradient id="fadeL" x1="0" x2="1"><stop offset="0" stop-color="#fff"/><stop offset=".6" stop-color="#fff" stop-opacity="0"/></linearGradient>
+<mask id="mL"><rect width="1500" height="500" fill="url(#fadeL)"/></mask>
+<radialGradient id="panelFade" cx="50%" cy="58%" r="62%"><stop offset=".25" stop-color="#fff" stop-opacity="0"/><stop offset="1" stop-color="#fff"/></radialGradient>
+<mask id="mP"><rect x="900" y="0" width="600" height="500" fill="url(#panelFade)"/></mask>
+<radialGradient id="redGlow" cx="50%" cy="50%" r="50%"><stop offset="0" stop-color="#ff3b5c" stop-opacity=".42"/><stop offset="1" stop-color="#ff3b5c" stop-opacity="0"/></radialGradient>
+<clipPath id="panelClip"><path d="M946 50L1478 38L1484 458L940 468Z"/></clipPath>
+</defs>`);
+
+  // ---------- background ----------
+  o.push(`<rect width="1500" height="500" fill="#07090d"/>`);
+  let rays = '';
+  const RC = [1200, 300];
+  for (let i = 0; i < 36; i++) {
+    const a0 = (i / 36) * Math.PI * 2, a1 = a0 + Math.PI / 36;
+    rays += `<path d="M${RC[0]} ${RC[1]}L${RC[0] + Math.cos(a0) * 1800} ${RC[1] + Math.sin(a0) * 1800}L${RC[0] + Math.cos(a1) * 1800} ${RC[1] + Math.sin(a1) * 1800}Z" fill="#0e141d"/>`;
+  }
+  o.push(rays);
+  o.push(`<rect width="1500" height="500" fill="url(#ht-bg)" mask="url(#mL)"/>`);
+  o.push(`<ellipse cx="660" cy="232" rx="330" ry="165" fill="url(#redGlow)"/>`);
+
+  // ---------- left zone (above the avatar): ejection text + bonding curve HUD ----------
+  o.push(`<g stroke="#2a3444" stroke-width="7" stroke-linecap="round">
+    <path d="M40 180L156 112"/><path d="M28 136L120 82"/><path d="M92 198L186 144"/></g>`);
+  o.push(B.pill({ color: 'blue', x: 230, y: 96, s: 1.9, rot: 52, sw: 2.3, eyes: 'worried', mouth: 'o', lookX: -1.4, lookY: -1.4, shadow: false, legs: true }));
+  o.push(`<g fill="#f2f5f8" stroke="${INK}" stroke-width="3" stroke-linejoin="round"><path d="M318 60l6 12 13 2-10 8 3 13-12-7-11 6 3-12-10-9 13-1z"/><path d="M104 70l3.5 7 7.5 1-5.6 4.8 1.6 7.4-7-4-6.6 3.6 1.6-7-5.8-5.2 7.6-.8z"/></g>`);
+  o.push(`<text x="206" y="196" font-family="JetBrains Mono" font-weight="700" font-size="22" fill="#a7b2c1" text-anchor="middle">anon was <tspan fill="#ff3b5c">blacklisted.</tspan></text>`);
+  o.push(`<text x="206" y="225" font-family="JetBrains Mono" font-weight="700" font-size="22" fill="#a7b2c1" text-anchor="middle">he was a <tspan fill="#2bff88">HOLDER.</tspan></text>`);
+  // bonding curve HUD: 99% green, the last 1% is the rug
+  const BX = 56, BY = 260, BW = 300, BH = 20;
+  o.push(`<text x="${BX}" y="${BY - 8}" font-family="JetBrains Mono" font-weight="700" font-size="14" fill="#6f7c8f" letter-spacing="1">BONDING CURVE</text>`);
+  o.push(`<text x="${BX + BW}" y="${BY - 8}" font-family="JetBrains Mono" font-weight="700" font-size="14" fill="#2bff88" text-anchor="end">99%</text>`);
+  o.push(`<rect x="${BX}" y="${BY}" width="${BW}" height="${BH}" rx="${BH / 2}" fill="#10151d" stroke="${INK}" stroke-width="4"/>`);
+  o.push(`<clipPath id="barClip"><rect x="${BX}" y="${BY}" width="${BW}" height="${BH}" rx="${BH / 2}"/></clipPath>`);
+  o.push(`<g clip-path="url(#barClip)"><rect x="${BX}" y="${BY}" width="${BW - 14}" height="${BH}" fill="#2bff88"/><rect x="${BX}" y="${BY + 3}" width="${BW - 20}" height="4" fill="#fff" opacity=".35"/>
+    <rect x="${BX + BW - 14}" y="${BY}" width="14" height="${BH}" fill="url(#stripes)"/></g>`);
+  o.push(`<rect x="${BX}" y="${BY}" width="${BW}" height="${BH}" rx="${BH / 2}" fill="none" stroke="${INK}" stroke-width="4"/>`);
+
+  // ---------- comic panel ----------
+  const PANEL = 'M946 50L1478 38L1484 458L940 468Z';
+  o.push(`<path d="${PANEL}" fill="#fff" stroke="#fff" stroke-width="22" stroke-linejoin="round"/>`);
+  o.push(`<g clip-path="url(#panelClip)">`);
+  o.push(`<rect x="900" y="20" width="600" height="470" fill="#ffd400"/>`);
+  let prays = '';
+  const PC = [1205, 330];
+  for (let i = 0; i < 28; i++) {
+    const a0 = (i / 28) * Math.PI * 2, a1 = a0 + Math.PI / 28;
+    prays += `<path d="M${PC[0]} ${PC[1]}L${PC[0] + Math.cos(a0) * 900} ${PC[1] + Math.sin(a0) * 900}L${PC[0] + Math.cos(a1) * 900} ${PC[1] + Math.sin(a1) * 900}Z" fill="#ffc400"/>`;
+  }
+  o.push(prays);
+  o.push(`<rect x="900" y="20" width="600" height="470" fill="url(#ht-gold)" mask="url(#mP)"/>`);
+
+  const T = { cx: 1212, cy: 422, rx: 282, ry: 60 };
+  const pills = [];
+  const sweat = B.sweat();
+  // the dev in the middle: hands up, trust me bro
+  pills.push(B.dev({ x: 1172, y: 292, s: 2.4, rot: -2, sw: 2.3, lookX: -2.5, lookY: 1.9, extra: sweat,
+    armL: { x: -27, y: -31, cx: -27, cy: -3, hand: 'open' },
+    armR: { x: 27, y: -31, cx: 27, cy: -3, hand: 'open' } }));
+  // bored orange: SKIP (face inside the panel, body leaning off the edge)
+  pills.push(B.pill({ color: 'orange', x: 1434, y: 322, s: 2.05, rot: -9, sw: 2.3, eyes: 'bored', mouth: 'flat', lookX: -1.6, lookY: 1, shadow: false }));
+  // accusers, fingers aimed at the dev
+  pills.push(B.pill({ color: 'green', x: 1002, y: 306, s: 2.28, rot: 4, sw: 2.3, eyes: 'angry', mouth: 'shout', lookX: 2.4, lookY: 0.4, shadow: false,
+    armR: { x: 31, y: -10, cx: 27, cy: 6, hand: 'point', dir: -12 } }));
+  pills.push(B.pill({ color: 'cyan', x: 1334, y: 306, s: 2.22, rot: -4, sw: 2.3, eyes: 'angry', mouth: 'shout', lookX: -2.4, lookY: 0.4, shadow: false,
+    armL: { x: -31, y: -10, cx: -27, cy: 6, hand: 'point', dir: 192 } }));
+  o.push(pills.join(''));
+  o.push(B.anger(972, 222, -10));
+  o.push(B.anger(1370, 222, 40));
+
+  // table
+  o.push(B.table(T.cx, T.cy, T.rx, T.ry));
+  // the rug on the table, corner curling, with the body lying on it
+  o.push(B.rug({ x: 1334, y: 413, w: 184, h: 42, skew: -26, curl: true, a: 36, b: 26 }));
+  o.push(B.bag({ x: 1300, y: 404, s: 1.7, rot: 3, color: 'pink' }));
+  o.push(B.mic(1196, 396));
+  o.push(`</g>`); // end panel clip
+  o.push(`<path d="${PANEL}" fill="none" stroke="${INK}" stroke-width="7" stroke-linejoin="round"/>`);
+  o.push(B.tape(1470, 52, 38));
+  o.push(B.tape(944, 462, 32));
+
+  // speech bubbles
+  o.push(B.bubble({ x: 1050, y: 158, w: 196, h: 56, text: 'DEV IS SUS', size: 25, tail: [1000, 222], rot: -5 }));
+  o.push(B.bubble({ x: 1226, y: 98, w: 232, h: 56, text: 'TRUST ME BRO', size: 24, tail: [1182, 198], rot: 2 }));
+  o.push(B.bubble({ x: 1418, y: 168, w: 106, h: 52, text: 'SKIP', size: 25, tail: [1440, 246], rot: 6 }));
+
+  // ---------- wordmark column ----------
+  const WX = 452;
+  const live = B.chip({ x: WX, y: 74, text: 'X SPACES IS LIVE', size: 21, fill: '#ffd400', dot: '#ff3b5c', padX: 14, rot: -3 });
+  o.push(live.svg);
+  o.push(B.wordmark({ x: WX, y: 196, size: 104, stickerAt: [386, 106], stickerScale: 1.0 }));
+  o.push(`<text x="${WX}" y="362" font-family="Space Grotesk" font-weight="700" font-size="26" fill="#f2f5f8">Social deduction for the trenches.</text>`);
+  const row = B.chipRow(WX, 380, [
+    { text: '$RUGS', size: 20, fill: '#ffd400', padX: 13 },
+    { text: 'FREE TO PLAY', size: 20, fill: '#2bff88', padX: 13 },
+    { text: '4-10 DEGENS', size: 20, fill: '#22e5ff', padX: 13 },
+  ], 10);
+  o.push(row.svg);
+  console.log('chip row width', row.w, 'ends at', WX + row.w);
+
+  if (GUIDES) {
+    o.push(`<rect x="0" y="330" width="400" height="170" fill="#f0f" opacity=".25"/>`);
+    o.push(`<rect x="0" y="0" width="1500" height="60" fill="#0ff" opacity=".18"/><rect x="0" y="440" width="1500" height="60" fill="#0ff" opacity=".18"/>`);
+    o.push(`<path d="M420 0V500" stroke="#0ff" stroke-width="2" stroke-dasharray="6 6"/>`);
+  }
+  document.getElementById('s').innerHTML = o.join('');
+  window.READY = true;
+})();
+</script></body></html>
