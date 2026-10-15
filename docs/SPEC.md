@@ -453,3 +453,4 @@ export function getRankedLeaderboard(week: 'current' | 'previous', now?: number)
 - With `BURN_MODE=mock`, the e2e test uses a fake `window.phantom.solana`. It signs login messages with a real tweetnacl keypair (exposed from Node), and its `signAndSendTransaction` is never called in mock mode.
 - The test signs in two or more players, burns tickets, plays a ranked game against humans only, and checks the weekly leaderboard.
 - It also buys and equips a cosmetic, and checks that it shows in another player's snapshot.
+- Implemented in `e2e/ranked.mjs`; `npm run e2e` runs `e2e/smoke.mjs` and then it (shared harness: `e2e/lib.mjs`).

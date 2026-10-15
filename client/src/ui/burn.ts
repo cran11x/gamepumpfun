@@ -93,6 +93,8 @@ export function openBurnModal(core: UiCore, opts: BurnModalOpts): ModalHandle | 
       h: 108,
       label: item.slot === 'name' ? (session?.profile.name ?? 'degen') : null,
       moving: item.slot === 'skin',
+      // Headroom above the name label, so tall effects (On Fire's flames) aren't cut by the canvas edge.
+      ...(item.slot === 'name' ? { zoom: 0.9, shiftY: 0.04 } : {}),
     });
     visual = h('div', { class: `burn-visual${wide ? ' burn-visual--wide' : ''}` }, pv.el);
     visual.style.setProperty('--rar', RARITY_COLORS[item.rarity]);

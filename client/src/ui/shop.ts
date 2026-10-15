@@ -30,7 +30,8 @@ export function openShop(core: UiCore): void {
   const meName = h('div', { class: 'shop-me-name' });
   const meLook = h('ul', { class: 'shop-me-look' });
   const meHint = h('div', { class: 'shop-me-hint' });
-  const mePv = createPillPreview(156, core.myColor(), null, { cls: 'shop-me-pv', h: 112, label: null });
+  // zoom/shiftY: headroom above the name label for tall effects (On Fire's flames).
+  const mePv = createPillPreview(156, core.myColor(), null, { cls: 'shop-me-pv', h: 112, label: null, zoom: 0.9, shiftY: 0.04 });
   const meBox = h(
     'div',
     { class: 'shop-me' },

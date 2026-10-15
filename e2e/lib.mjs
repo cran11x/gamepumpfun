@@ -308,6 +308,11 @@ export class Player {
     ).catch(() => {});
   }
 
+  /** Best effort, for clean screenshots: waits until every toast has timed out. */
+  async noToasts(timeout = 7000) {
+    await until(`${this.label} toasts to clear`, () => this.page.evaluate(() => !document.querySelector('.toast')), { timeout, interval: 100 }).catch(() => {});
+  }
+
   async shot(name, { fullPage = false, dir = this.shotsDir } = {}) {
     try {
       await this.page.screenshot({ path: path.join(dir, `${name}-${this.label}.png`), fullPage });

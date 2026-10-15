@@ -4,7 +4,8 @@ A social deduction game from the trenches, played in the browser. 4 to 10 player
 
 - Multiplayer in real time from one link (`/?room=CODE`), with an authoritative Node server.
 - Bots fill empty seats, so you can play solo or with 2 friends.
-- Optional **Phantom** sign-in. It only signs a message and never requests a transaction. The wallet is linked to a public leaderboard: Most Honest Devs, Top Ruggers and others.
+- Optional **Phantom** sign-in. Signing in only signs a message, never a transaction. The wallet is linked to a public leaderboard: Most Honest Devs, Top Ruggers and others.
+- **Ranked** and the **Shop** (when `TOKEN_MINT` is set): players burn the project's SPL token for a ranked ticket (default 50,000 per game) or for looks (pill skins, rug patterns, name effects). Burned tokens are destroyed with SPL `BurnChecked`; nobody receives them and there is no pot. Ranked rooms are humans only with standard settings, and feed a weekly leaderboard (resets Monday 00:00 UTC). Cosmetics are looks only. Playing stays free.
 - Works on desktop and mobile, with a touch joystick on phones.
 
 ## Gameplay
@@ -39,8 +40,11 @@ Checks:
 
 ```bash
 npm run typecheck
-npm test             # vitest: rules, bots, auth, store, map
-npm run build && npm run e2e   # Playwright smoke test: 3 browsers + bots play a full game (~1-2 min)
+npm test             # vitest: rules, bots, auth, store, map, burns (live mode against mocked RPC)
+npm run build && npm run e2e   # Playwright: e2e/smoke.mjs (3 browsers + bots play a full game) then
+                               # e2e/ranked.mjs (BURN_MODE=mock: 4 wallets burn for looks and tickets,
+                               # play a ranked game, check the weekly board). About 3-4 min in total.
+npm run e2e:smoke / npm run e2e:ranked   # one suite
 ```
 
 ## Configuration (env)
@@ -55,7 +59,13 @@ npm run build && npm run e2e   # Playwright smoke test: 3 browsers + bots play a
 | `LINK_X`, `LINK_TELEGRAM`, `LINK_PUMPFUN` | unset | Links on the home screen (https only) |
 | `PUBLIC_ORIGIN` | unset | Public origin (e.g. `https://amongrugs.fun`) that the Phantom login message is bound to. A comma-separated list allows several (e.g. `https://amongrugs.fun,https://www.amongrugs.fun`). Set it in production: unset, the message follows the request's Host header |
 | `TRUST_PROXY` | unset | Set it when the server runs behind a reverse proxy, so the per-IP limits use the real client IP |
-| `MAX_SOCKETS_PER_IP` | `20` | Concurrent WebSocket connections allowed per client IP |
+| `MAX_SOCKETS_PER_IP` | `64` | Concurrent WebSocket connections allowed per client IP |
+| `TOKEN_MINT` | unset | SPL mint of your coin. Unset: burns are off and Ranked and the Shop are hidden |
+| `SOLANA_RPC_URL` | `https://api.mainnet-beta.solana.com` | RPC for live burns (use a dedicated one, e.g. Helius). Never sent to clients or logged |
+| `SOLANA_CLUSTER` | `mainnet-beta` | `mainnet-beta` or `devnet` (explorer links) |
+| `BURN_MODE` | unset | `mock` fakes burns for local testing and e2e (the server refuses to start with it when `NODE_ENV=production`); `off` disables burns |
+| `RANKED_ENTRY_PRICE` | `50000` | Whole tokens burned for one ranked ticket |
+| `COSMETIC_PRICE_MULTIPLIER` | `1` | Multiplies every shop price |
 
 ## Deploy
 
@@ -75,11 +85,11 @@ shared/      protocol (wire types), constants, map + geometry (shared by client 
 server/      express + ws server, room state machine, bots, Phantom auth, JSON store
 client/      Vite app: canvas renderer (client/src/render), game loop (game), DOM UI (ui), minigames (tasks)
 tests/       vitest unit tests
-e2e/         Playwright multiplayer smoke test
+e2e/         Playwright suites: smoke.mjs (a full game with bots), ranked.mjs (burns, shop, ranked), lib.mjs (shared harness)
 docs/SPEC.md rules and module contract
 ```
 
 ## Notes
 
 - "AMONG RUGS" is a parody working title. Before a public launch, consider whether you want a name further from the game it parodies. Change `GAME_NAME` in `shared/constants.ts` (or the env var) to rebrand.
-- No real money moves through the game. Rewards from creator fees, if you add them later, should not require paying to enter.
+- No money is paid to anyone through the game. Burns only destroy tokens (no pot, no prizes from burns), and the server verifies every burn on-chain itself; the client is never trusted about amounts. The only transaction the app ever asks Phantom to sign is the BurnChecked + Memo the server built, and the client checks it before Phantom opens. Rewards from creator fees, if you add them later, should not require paying to enter.

@@ -5,7 +5,8 @@
 //   node e2e/ranked.mjs                 (this suite only)
 //
 // The production server from dist/ runs with BURN_MODE=mock and RANKED_ENTRY_PRICE=50000 on a free port
-// with a throwaway DATA_DIR. (First it checks that BURN_MODE=mock with NODE_ENV=production refuses to start.)
+// with a throwaway DATA_DIR. First it checks that the main client bundle has no @solana/web3.js (a lazy
+// chunk, which mock mode must never fetch) and that BURN_MODE=mock with NODE_ENV=production refuses to start.
 // Four Chromium contexts (three desktop, one iPhone-sized touch device) each get a fake
 // window.phantom.solana backed by a real tweetnacl ed25519 keypair held in Node (page.exposeFunction):
 // connect() returns the public key, signMessage() really signs, and signAndSendTransaction() records the
@@ -40,6 +41,8 @@ const ENTRY_PRICE = 50_000;
 const SERVER_ENV = { BURN_MODE: 'mock', RANKED_ENTRY_PRICE: String(ENTRY_PRICE), NODE_ENV: undefined, TOKEN_MINT: undefined, COSMETIC_PRICE_MULTIPLIER: undefined };
 
 const fmt = (n) => n.toLocaleString('en-US');
+/** File name of the lazy @solana/web3.js chunk (checkBundleSplit). Mock mode must never fetch it. */
+let WEB3_CHUNK = null;
 
 // ---------------------------------------------------------------- fake Phantom
 
@@ -94,6 +97,7 @@ class RankedPlayer extends Player {
     this.wallet = wallet;
     this.address = wallet.address;
     this.token = null;
+    this.web3Loads = 0;
   }
 
   /** The app's stored session token (localStorage 'amongrugs.wallet'). */
@@ -198,6 +202,9 @@ async function main(G, server) {
       await stubFonts(context, 'e2e/ranked.mjs');
       const page = await context.newPage();
       const p = new RankedPlayer(label, name, context, page, touch, SHOTS, wallet);
+      page.on('request', (r) => {
+        if (WEB3_CHUNK && r.url().endsWith(`/${WEB3_CHUNK}`)) p.web3Loads++;
+      });
       players.push(p);
       return p;
     };
@@ -250,7 +257,7 @@ async function main(G, server) {
     });
 
     // ---------- SHOP: burn for cosmetics
-    /** Opens the shop (home or lobby button), burns for `itemId` through the burn modal, closes both. */
+    /** Opens the shop (home or lobby button) and burns for `itemId` through the burn modal; the shop stays open. */
     const burnCosmetic = async (p, itemId, { opener = '#btn-shop', shots = false } = {}) => {
       const item = G.cosmeticById(itemId);
       await p.press(opener);
@@ -261,6 +268,7 @@ async function main(G, server) {
       const price = await p.text(`${card} .shop-price-n`);
       check(price === fmt(priceOf(itemId)), `${p.label}: ${itemId} card price "${price}", expected ${fmt(priceOf(itemId))}`);
       if (shots) {
+        await p.noToasts();
         await p.settle();
         await p.shot('10-shop');
       }
@@ -308,7 +316,6 @@ async function main(G, server) {
     log('phone: SHOP -> burn for On Fire (name effect)');
     prof = await burnCosmetic(phone, 'name_fire', { shots: true });
     check(prof.cosmetics.equipped.name === 'name_fire', 'phone: name effect should auto-equip');
-    // A second item in the same slot is owned but not equipped: EQUIP it, then go back to On Fire.
     await phone.press('.modal--shop .modal-x');
     await until('phone shop to close', async () => !(await phone.page.$('#shop-modal')));
 
@@ -483,10 +490,27 @@ async function main(G, server) {
 
     await until('host START enabled', async () => !(await alpha.page.isDisabled('#btn-start')));
     check((await alpha.text('.lobby-start-hint')) === '4 players ready · START uses 1 ticket each', `start hint "${await alpha.text('.lobby-start-hint')}"`);
-    await all((p) => p.settle());
+    await all(async (p) => {
+      await p.noToasts();
+      await p.settle();
+    });
     await alpha.shot('20-ranked-lobby');
     await phone.shot('20-ranked-lobby');
-    await phone.shot('20-ranked-lobby-full', { fullPage: true });
+    // The phone lobby scrolls inside its screen: also shoot its bottom (settings, START area).
+    await phone.page
+      .evaluate(() => {
+        for (let el = document.querySelector('.lobby-panel--settings'); el; el = el.parentElement) {
+          const oy = getComputedStyle(el).overflowY;
+          if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight) {
+            el.scrollTop = el.scrollHeight;
+            return true;
+          }
+        }
+        return false;
+      })
+      .catch(() => false);
+    await sleep(250);
+    await phone.shot('21-ranked-lobby-bottom');
 
     // ---------- START: tickets are consumed
     log('host: START (one ticket each)');
@@ -627,7 +651,8 @@ async function main(G, server) {
       await alpha.press('.modal--burn .modal-x');
       await until('host ticket offer to close', async () => !(await alpha.page.$('#burn-modal')));
     }
-    await all((p) => p.settle());
+    await alpha.noToasts();
+    await alpha.settle();
     await alpha.shot('41-lobby-no-tickets');
 
     // ---------- Leaderboard modal (home -> THIS WEEK)
@@ -645,6 +670,7 @@ async function main(G, server) {
         check(JSON.stringify(vals) === JSON.stringify(board.entries.map((e) => e.points)), `${p.label}: leaderboard modal shows ${vals}`);
         check((await p.page.locator('.lb-row--me').count()) === 1, `${p.label}: own row not highlighted`);
         check((await p.text('.lb-week-reset'))?.startsWith('Resets in '), `${p.label}: no reset countdown`);
+        await p.noToasts();
         await p.settle();
         await p.shot('50-leaderboard');
         await p.press('.lb-tab[data-tab="rankedPrevious"]');
@@ -664,6 +690,7 @@ async function main(G, server) {
     for (const p of humans) {
       check(p.wallet.txCalls.length === 0, `${p.label}: Phantom was asked for a transaction in mock mode: ${p.wallet.txCalls.join(', ')}`);
       check(p.wallet.signed.length === 1, `${p.label}: signMessage called ${p.wallet.signed.length} times (only the login should sign)`);
+      check(p.web3Loads === 0, `${p.label}: mock mode loaded the @solana/web3.js chunk`);
     }
     const problems = humans.flatMap((p) => p.problems.map((x) => `${p.label}: ${x}`));
     check(problems.length === 0, `page/console errors:\n  ${problems.join('\n  ')}`);
@@ -682,6 +709,26 @@ async function main(G, server) {
   }
 }
 
+/**
+ * The main client bundle must not contain @solana/web3.js: it is a separate chunk that only the live burn
+ * path loads with import(). Returns the lazy chunk's file name.
+ */
+function checkBundleSplit() {
+  const dir = path.join(ROOT, 'dist', 'client');
+  const html = fs.readFileSync(path.join(dir, 'index.html'), 'utf8');
+  const entry = /<script[^>]+type="module"[^>]+src="\/?([^"]+)"/.exec(html)?.[1];
+  check(entry, 'no module entry script in dist/client/index.html');
+  const main = fs.readFileSync(path.join(dir, entry), 'utf8');
+  // An error string from inside @solana/web3.js's VersionedTransaction code.
+  const MARKER = 'VersionedMessage.deserialize';
+  check(!main.includes(MARKER), `the main bundle ${entry} contains @solana/web3.js`);
+  const lazy = [...main.matchAll(/import\(\s*[`'"]\.\/([\w.-]+\.js)[`'"]\s*\)/g)].map((m) => m[1]);
+  const web3 = lazy.find((f) => fs.readFileSync(path.join(dir, path.dirname(entry), f), 'utf8').includes(MARKER));
+  check(web3, `no lazily imported chunk holds @solana/web3.js (dynamic imports: ${lazy.join(', ') || 'none'})`);
+  log(`bundle: ${entry} (${Math.round(main.length / 1024)} KB) loads @solana/web3.js lazily from ${web3}`);
+  return web3;
+}
+
 /** BURN_MODE=mock must never run in production: the server refuses to start. */
 async function checkMockRefusedInProduction() {
   let started = null;
@@ -698,6 +745,7 @@ async function checkMockRefusedInProduction() {
 async function run() {
   requireDist();
   const G = await loadShared();
+  WEB3_CHUNK = checkBundleSplit();
   await checkMockRefusedInProduction();
   log('BURN_MODE=mock + NODE_ENV=production: refused to start (ok)');
   const server = await startServer({ env: SERVER_ENV });
